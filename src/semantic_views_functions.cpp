@@ -12,7 +12,16 @@
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/expression/constant_expression.hpp"
+#include "duckdb/parser/expression/function_expression.hpp"
+#include "duckdb/parser/expression/subquery_expression.hpp"
+#include "duckdb/parser/parsed_expression_iterator.hpp"
+#include "duckdb/parser/query_node/select_node.hpp"
+#include "duckdb/parser/query_node/set_operation_node.hpp"
+#include "duckdb/parser/statement/select_statement.hpp"
+#include "duckdb/parser/tableref/joinref.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
+#include "duckdb/parser/tableref/table_function_ref.hpp"
 #include "semantic_query_compiler.hpp"
 #include "semantic_view_registry.hpp"
 #include "semantic_views_parser.hpp"
@@ -411,13 +420,17 @@ static unique_ptr<FunctionData> SemanticShowBind(ClientContext &context, TableFu
 // __semantic_view_query(catalog, schema, name, items, where) - SEMANTIC_VIEW(...)
 //===--------------------------------------------------------------------===//
 static unique_ptr<SelectStatement> CompileSemanticQuery(ClientContext &context, SemanticViewsState &state,
-                                                        TableFunctionBindInput &input, string &view_name) {
-	auto model = state.registry.GetOrThrow(context, NameArgs(input, 0));
+                                                        const vector<Value> &args, string &view_name) {
+	QualifiedName name;
+	name.catalog = args[0].IsNull() ? string() : StringValue::Get(args[0]);
+	name.schema = args[1].IsNull() ? string() : StringValue::Get(args[1]);
+	name.name = args[2].IsNull() ? string() : StringValue::Get(args[2]);
+	auto model = state.registry.GetOrThrow(context, name);
 	view_name = model->name.name;
-	auto items = ParsedSemanticQuery::ItemsFromValue(input.inputs[3]);
+	auto items = ParsedSemanticQuery::ItemsFromValue(args[3]);
 	unique_ptr<ParsedExpression> where;
-	if (!input.inputs[4].IsNull() && !StringValue::Get(input.inputs[4]).empty()) {
-		auto expressions = Parser::ParseExpressionList(StringValue::Get(input.inputs[4]));
+	if (!args[4].IsNull() && !StringValue::Get(args[4]).empty()) {
+		auto expressions = Parser::ParseExpressionList(StringValue::Get(args[4]));
 		if (expressions.size() != 1) {
 			throw InternalException("semantic view WHERE clause did not round-trip");
 		}
@@ -430,8 +443,117 @@ static unique_ptr<SelectStatement> CompileSemanticQuery(ClientContext &context, 
 
 static unique_ptr<TableRef> SemanticQueryBindReplace(ClientContext &context, TableFunctionBindInput &input) {
 	string view_name;
-	auto select = CompileSemanticQuery(context, GetState(input), input, view_name);
+	auto select = CompileSemanticQuery(context, GetState(input), input.inputs, view_name);
 	return make_uniq<SubqueryRef>(std::move(select), view_name);
+}
+
+//===--------------------------------------------------------------------===//
+// semantic_view_sql(query) - the SQL a statement compiles to
+//===--------------------------------------------------------------------===//
+class SemanticQueryExpander {
+public:
+	SemanticQueryExpander(ClientContext &context, SemanticViewsState &state) : context(context), state(state) {
+	}
+
+	void Node(QueryNode &node) {
+		for (auto &cte : node.cte_map.map) {
+			Node(*cte.second->query->node);
+		}
+		switch (node.type) {
+		case QueryNodeType::SELECT_NODE: {
+			auto &select = node.Cast<SelectNode>();
+			if (select.from_table) {
+				Ref(select.from_table);
+			}
+			for (auto &expr : select.select_list) {
+				Expr(expr);
+			}
+			if (select.where_clause) {
+				Expr(select.where_clause);
+			}
+			if (select.having) {
+				Expr(select.having);
+			}
+			if (select.qualify) {
+				Expr(select.qualify);
+			}
+			break;
+		}
+		case QueryNodeType::SET_OPERATION_NODE:
+			for (auto &child : node.Cast<SetOperationNode>().children) {
+				Node(*child);
+			}
+			break;
+		default:
+			break;
+		}
+	}
+
+private:
+	void Ref(unique_ptr<TableRef> &ref) {
+		switch (ref->type) {
+		case TableReferenceType::TABLE_FUNCTION: {
+			auto &function_ref = ref->Cast<TableFunctionRef>();
+			auto &function = function_ref.function->Cast<FunctionExpression>();
+			if (!StringUtil::CIEquals(function.function_name, SEMANTIC_VIEW_QUERY_FUNCTION)) {
+				break;
+			}
+			vector<Value> args;
+			for (auto &child : function.children) {
+				args.push_back(child->Cast<ConstantExpression>().value);
+			}
+			string view_name;
+			auto select = CompileSemanticQuery(context, state, args, view_name);
+			auto replacement = make_uniq<SubqueryRef>(std::move(select), ref->alias.empty() ? view_name : ref->alias);
+			replacement->column_name_alias = function_ref.column_name_alias;
+			ref = std::move(replacement);
+			break;
+		}
+		case TableReferenceType::JOIN: {
+			auto &join = ref->Cast<JoinRef>();
+			Ref(join.left);
+			Ref(join.right);
+			if (join.condition) {
+				Expr(join.condition);
+			}
+			break;
+		}
+		case TableReferenceType::SUBQUERY:
+			Node(*ref->Cast<SubqueryRef>().subquery->node);
+			break;
+		default:
+			break;
+		}
+	}
+
+	void Expr(unique_ptr<ParsedExpression> &expr) {
+		if (expr->GetExpressionClass() == ExpressionClass::SUBQUERY) {
+			Node(*expr->Cast<SubqueryExpression>().subquery->node);
+		}
+		ParsedExpressionIterator::EnumerateChildren(*expr, [&](unique_ptr<ParsedExpression> &child) { Expr(child); });
+	}
+
+	ClientContext &context;
+	SemanticViewsState &state;
+};
+
+static unique_ptr<FunctionData> SemanticViewSqlBind(ClientContext &context, TableFunctionBindInput &input,
+                                                    vector<LogicalType> &return_types, vector<string> &names) {
+	names.emplace_back("sql");
+	return_types.emplace_back(LogicalType::VARCHAR);
+	if (input.inputs[0].IsNull()) {
+		throw BinderException("semantic_view_sql: the query cannot be NULL");
+	}
+	auto statements = SemanticViewsRewriter::Parse(StringValue::Get(input.inputs[0]), context.GetParserOptions());
+	SemanticQueryExpander expander(context, GetState(input));
+	auto result = make_uniq<RowsFunctionData>();
+	for (auto &statement : statements) {
+		if (statement->type == StatementType::SELECT_STATEMENT) {
+			expander.Node(*statement->Cast<SelectStatement>().node);
+		}
+		result->rows.push_back({Value(statement->ToString())});
+	}
+	return std::move(result);
 }
 
 //===--------------------------------------------------------------------===//
@@ -454,6 +576,11 @@ void RegisterSemanticViewsFunctions(ExtensionLoader &loader, shared_ptr<Semantic
 	query.bind_replace = SemanticQueryBindReplace;
 	query.function_info = make_shared_ptr<SemanticViewsFunctionInfo>(state);
 	loader.RegisterFunction(query);
+
+	TableFunction sql("semantic_view_sql", {LogicalType::VARCHAR}, RowsFunctionScan, SemanticViewSqlBind,
+	                  RowsFunctionInit);
+	sql.function_info = make_shared_ptr<SemanticViewsFunctionInfo>(state);
+	loader.RegisterFunction(sql);
 
 	TableFunction show(SEMANTIC_VIEW_SHOW_FUNCTION, six_varchars, RowsFunctionScan, SemanticShowBind,
 	                   RowsFunctionInit);
