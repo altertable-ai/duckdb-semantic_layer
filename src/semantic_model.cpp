@@ -79,6 +79,9 @@ shared_ptr<SemanticModel> SemanticModel::Copy() const {
 		copy.type = member.type;
 		copy.parsed = member.parsed.Copy();
 		copy.using_relationships = member.using_relationships;
+		for (auto &entry : member.non_additive) {
+			copy.non_additive.push_back(SemanticNonAdditive {entry.resolved->Copy(), entry.type, entry.null_order});
+		}
 		result->members.push_back(std::move(copy));
 	}
 	result->edges = edges;

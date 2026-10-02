@@ -11,6 +11,7 @@
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/expression/subquery_expression.hpp"
+#include "duckdb/parser/expression/window_expression.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/query_node/set_operation_node.hpp"
@@ -255,6 +256,99 @@ private:
 //===--------------------------------------------------------------------===//
 // Compiler
 //===--------------------------------------------------------------------===//
+static unique_ptr<ParsedExpression> ColumnRef(const string &name) {
+	return make_uniq<ColumnRefExpression>(name);
+}
+
+//! Semi-additive block: rank the rows of every group (of query dimension values) by the
+//! NON ADDITIVE BY dimensions, keep the last snapshot (rank 1 in reversed order), then aggregate.
+static unique_ptr<SelectNode> BuildNonAdditiveBlock(ExpressionCompiler &compiler, SemanticJoinScope &scope,
+                                                    const SemanticMember &metric,
+                                                    const vector<const SemanticQueryItem *> &dimensions,
+                                                    const vector<SemanticAtom> &atoms, const vector<idx_t> &owned_atoms,
+                                                    optional_idx pad_block, optional_ptr<ParsedExpression> where) {
+	auto inner = make_uniq<SelectNode>();
+	auto outer = make_uniq<SelectNode>();
+	auto rank = make_uniq<WindowExpression>(ExpressionType::WINDOW_RANK, INVALID_CATALOG, INVALID_SCHEMA, "rank");
+	rank->start = WindowBoundary::UNBOUNDED_PRECEDING;
+	rank->end = WindowBoundary::CURRENT_ROW_RANGE;
+	for (idx_t d = 0; d < dimensions.size(); d++) {
+		auto expr = compiler.Row(*dimensions[d]->resolved, scope, DConstants::INVALID_INDEX, "Invalid dimension");
+		// every group picks its own last snapshot; when a non-additive dimension is itself grouped on, all rows
+		// of a group share its value and the aggregation is a plain one
+		rank->partitions.push_back(expr->Copy());
+		expr->alias = DimensionColumn(d);
+		inner->select_list.push_back(std::move(expr));
+		outer->select_list.push_back(ColumnRef(DimensionColumn(d)));
+		outer->groups.group_expressions.push_back(ColumnRef(DimensionColumn(d)));
+	}
+	idx_t extracted = 0;
+	auto extract = [&](unique_ptr<ParsedExpression> &expr) {
+		auto name = "__sv_x" + to_string(extracted++);
+		expr->alias = name;
+		inner->select_list.push_back(std::move(expr));
+		expr = ColumnRef(name);
+	};
+	for (idx_t a = 0; a < atoms.size(); a++) {
+		bool owned = std::find(owned_atoms.begin(), owned_atoms.end(), a) != owned_atoms.end();
+		if (!owned && !pad_block.IsValid()) {
+			continue;
+		}
+		unique_ptr<ParsedExpression> expr;
+		if (owned) {
+			expr = compiler.Aggregate(atoms[a], scope, "Invalid metric");
+			auto &aggregate = expr->Cast<FunctionExpression>();
+			for (auto &child : aggregate.children) {
+				extract(child);
+			}
+			if (aggregate.filter) {
+				extract(aggregate.filter);
+			}
+			if (aggregate.order_bys) {
+				for (auto &order : aggregate.order_bys->orders) {
+					extract(order.expression);
+				}
+			}
+		} else {
+			expr = make_uniq<ConstantExpression>(Value());
+		}
+		expr->alias = AtomColumn(a);
+		outer->select_list.push_back(std::move(expr));
+	}
+	for (auto &entry : metric.non_additive) {
+		// the last row in the requested order is the first one in the reversed order
+		auto type = entry.type == OrderType::ASCENDING ? OrderType::DESCENDING : OrderType::ASCENDING;
+		auto nulls = entry.null_order == OrderByNullType::NULLS_LAST ? OrderByNullType::NULLS_FIRST
+		                                                             : OrderByNullType::NULLS_LAST;
+		rank->orders.emplace_back(type, nulls,
+		                          compiler.Row(*entry.resolved, scope, DConstants::INVALID_INDEX, "NON ADDITIVE BY"));
+	}
+	rank->alias = "__sv_rank";
+	inner->select_list.push_back(std::move(rank));
+	if (where) {
+		inner->where_clause = compiler.Row(*where, scope, DConstants::INVALID_INDEX, "Invalid WHERE clause");
+	}
+	inner->from_table = scope.BuildFrom();
+	if (pad_block.IsValid()) {
+		auto tag = make_uniq<ConstantExpression>(Value::BIGINT(NumericCast<int64_t>(pad_block.GetIndex())));
+		tag->alias = BLOCK_COLUMN;
+		outer->select_list.push_back(std::move(tag));
+	}
+	if (!outer->groups.group_expressions.empty()) {
+		GroupingSet set;
+		for (idx_t i = 0; i < outer->groups.group_expressions.size(); i++) {
+			set.insert(i);
+		}
+		outer->groups.grouping_sets.push_back(std::move(set));
+	}
+	outer->where_clause = make_uniq<ComparisonExpression>(ExpressionType::COMPARE_EQUAL, ColumnRef("__sv_rank"),
+	                                                      make_uniq<ConstantExpression>(Value::BIGINT(1)));
+	auto inner_statement = make_uniq<SelectStatement>();
+	inner_statement->node = std::move(inner);
+	outer->from_table = make_uniq<SubqueryRef>(std::move(inner_statement), "__sv_snapshot");
+	return outer;
+}
+
 SemanticQueryCompiler::SemanticQueryCompiler(const SemanticModel &model, ClientContext &context)
     : model(model), context(context), analyzer(model, context) {
 }
@@ -428,16 +522,18 @@ unique_ptr<SelectStatement> SemanticQueryCompiler::Compile(const SemanticQuerySp
 	for (auto *item : metrics) {
 		posts.push_back(analyzer.Decompose(*item->resolved, DConstants::INVALID_INDEX, atoms, ItemWhat(*item)));
 	}
-	// one block per (home table, USING relationships)
+	// one block per (home table, USING relationships, NON ADDITIVE BY metric)
 	vector<idx_t> block_homes;
 	vector<vector<idx_t>> block_using;
+	vector<idx_t> block_non_additive;
 	vector<vector<idx_t>> block_atoms;
 	for (idx_t a = 0; a < atoms.size(); a++) {
 		auto using_key = atoms[a].using_relationships;
 		std::sort(using_key.begin(), using_key.end());
 		idx_t block = DConstants::INVALID_INDEX;
 		for (idx_t b = 0; b < block_homes.size(); b++) {
-			if (block_homes[b] == atoms[a].home && block_using[b] == using_key) {
+			if (block_homes[b] == atoms[a].home && block_using[b] == using_key &&
+			    block_non_additive[b] == atoms[a].non_additive_member) {
 				block = b;
 			}
 		}
@@ -445,6 +541,7 @@ unique_ptr<SelectStatement> SemanticQueryCompiler::Compile(const SemanticQuerySp
 			block = block_homes.size();
 			block_homes.push_back(atoms[a].home);
 			block_using.push_back(using_key);
+			block_non_additive.push_back(atoms[a].non_additive_member);
 			block_atoms.emplace_back();
 		}
 		block_atoms[block].push_back(a);
@@ -461,6 +558,11 @@ unique_ptr<SelectStatement> SemanticQueryCompiler::Compile(const SemanticQuerySp
 			}
 		}
 		SemanticJoinScope scope(model, home, "", block_using[block]);
+		if (block_non_additive[block] != DConstants::INVALID_INDEX) {
+			return BuildNonAdditiveBlock(compiler, scope, model.members[block_non_additive[block]], dimensions, atoms,
+			                             block_atoms[block], pad ? optional_idx(block) : optional_idx(),
+			                             spec.where.get());
+		}
 		auto node = make_uniq<SelectNode>();
 		for (idx_t d = 0; d < dimensions.size(); d++) {
 			auto expr =

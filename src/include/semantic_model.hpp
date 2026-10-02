@@ -72,6 +72,15 @@ struct SemanticEdge {
 	idx_t target;
 };
 
+//! One entry of NON ADDITIVE BY (...)
+struct SemanticNonAdditive {
+	//! Resolved row-level expression (normally a dimension reference)
+	unique_ptr<ParsedExpression> resolved;
+	//! Explicit sort order (ASC / DESC with NULLS FIRST / LAST resolved)
+	OrderType type;
+	OrderByNullType null_order;
+};
+
 struct SemanticMember {
 	SemanticMemberKind kind;
 	//! Owning logical table, DConstants::INVALID_INDEX for derived metrics
@@ -88,6 +97,8 @@ struct SemanticMember {
 	ParsedSemanticMember parsed;
 	//! Relationships pinned with USING (...) (metrics only)
 	vector<idx_t> using_relationships;
+	//! NON ADDITIVE BY (...) (metrics only)
+	vector<SemanticNonAdditive> non_additive;
 
 	bool IsDerived() const {
 		return table == DConstants::INVALID_INDEX;

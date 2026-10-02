@@ -332,8 +332,8 @@ private:
 				}
 				member.using_relationships.push_back(found);
 			}
-			if (!parsed.non_additive_by.empty()) {
-				throw NotImplementedException("NON ADDITIVE BY is not supported yet");
+			if (!parsed.non_additive_by.empty() && member.kind != SemanticMemberKind::METRIC) {
+				Fail("NON ADDITIVE BY is only allowed on metrics (\"%s\")", parsed.FullName());
 			}
 			model->members.push_back(std::move(member));
 		}
@@ -362,6 +362,19 @@ private:
 			resolve_context.self_member = m;
 			resolve_context.what = What(m);
 			member.resolved = model->Resolve(*member.expression, resolve_context);
+			for (auto &order : member.parsed.non_additive_by) {
+				SemanticNonAdditive entry;
+				resolve_context.self_member = DConstants::INVALID_INDEX;
+				entry.resolved = model->Resolve(*order.expression, resolve_context);
+				entry.type = order.type == OrderType::DESCENDING ? OrderType::DESCENDING : OrderType::ASCENDING;
+				entry.null_order = order.null_order;
+				if (entry.null_order == OrderByNullType::ORDER_DEFAULT) {
+					// Snowflake defaults: ASC NULLS LAST, DESC NULLS FIRST
+					entry.null_order =
+					    entry.type == OrderType::ASCENDING ? OrderByNullType::NULLS_LAST : OrderByNullType::NULLS_FIRST;
+				}
+				member.non_additive.push_back(std::move(entry));
+			}
 		}
 	}
 
@@ -465,6 +478,16 @@ private:
 			}
 			if (!analyzer.ContainsAggregateOrMetric(*member.resolved)) {
 				Fail("%s must use an aggregate function", what);
+			}
+			for (auto &entry : member.non_additive) {
+				set<idx_t> tables;
+				analyzer.RowTables(*entry.resolved, DConstants::INVALID_INDEX, tables, what + " NON ADDITIVE BY");
+				for (auto table : tables) {
+					if (member.IsDerived() || !model->Reaches(member.table, table)) {
+						Fail("%s: NON ADDITIVE BY dimensions must belong to its logical table or tables it references",
+						     what);
+					}
+				}
 			}
 			vector<SemanticAtom> atoms;
 			analyzer.Decompose(*member.resolved, member.table, atoms, what, member.using_relationships);

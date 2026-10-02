@@ -27,6 +27,8 @@ struct SemanticAtom {
 	idx_t context_table;
 	//! Relationships pinned by the metric the atom comes from (USING)
 	vector<idx_t> using_relationships;
+	//! Metric whose NON ADDITIVE BY applies to this atom, or INVALID_INDEX
+	idx_t non_additive_member = DConstants::INVALID_INDEX;
 };
 
 class SemanticAnalyzer {
@@ -52,7 +54,8 @@ public:
 	//! Metric references are inlined recursively. Throws when row-level values appear outside aggregates.
 	unique_ptr<ParsedExpression> Decompose(const ParsedExpression &expr, idx_t context_table,
 	                                       vector<SemanticAtom> &atoms, const string &what,
-	                                       const vector<idx_t> &using_relationships = {});
+	                                       const vector<idx_t> &using_relationships = {},
+	                                       idx_t non_additive_member = DConstants::INVALID_INDEX);
 
 	static unique_ptr<ParsedExpression> MakeAtomRef(idx_t atom);
 	static bool IsAtomRef(const ParsedExpression &expr, idx_t &atom);

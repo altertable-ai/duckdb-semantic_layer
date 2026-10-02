@@ -352,11 +352,11 @@ facts must all live on the same logical table (Snowflake rule).
 - **USING.** A metric's `USING (rel, ...)` pins the relationship edges used to reach the tables those
   relationships point to; its atoms form their own block keyed by the USING set. Dimensions on the
   role-played table are joined through the pinned edges in that block.
-- **NON ADDITIVE BY.** Atoms of a semi-additive metric get their own block. With query dimensions
-  `Q` and non-additive dimensions `N`: keep only rows of the block's join whose `N` tuple is the last
-  in the specified order within each `Q \ N` group, then aggregate. Single `N` column: compute the
-  per-group `max`/`min` with a hash aggregate and semi-join back; multiple columns:
-  `QUALIFY rank() OVER (PARTITION BY Q\N ORDER BY N <reversed>) = 1`.
+- **NON ADDITIVE BY.** Atoms of a semi-additive metric get their own block. With query dimensions `Q` and
+  non-additive dimensions `N`: rank the block's rows with
+  `rank() OVER (PARTITION BY Q ORDER BY N <reversed>)`, keep rank 1 (the last snapshot of every group), then
+  aggregate. When a dimension of `N` is also in `Q`, every group has a single value of it and the aggregation is a
+  plain one. (A single-column max/min + semi-join fast path is a possible later optimization.)
 - **Window metrics.** Computed in the final projection layer over the combined result:
   `fn(<post-expr of inner metric>) OVER (PARTITION BY ... ORDER BY ... frame)`;
   `PARTITION BY EXCLUDING d` = all query dimensions except `d`. Referenced dimensions must be in the
