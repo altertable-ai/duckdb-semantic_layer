@@ -281,9 +281,14 @@ static void ShowMembers(ClientContext &context, TableFunctionBindInput &input, R
                         vector<LogicalType> &return_types, vector<string> &names, SemanticMemberKind kind) {
 	names = {"database_name", "schema_name", "semantic_view_name", "table_name",
 	         "name",          "data_type",   "synonyms",           "comment"};
-	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	                LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	                LogicalType::LIST(LogicalType::VARCHAR), LogicalType::VARCHAR};
+	return_types = {LogicalType::VARCHAR,
+	                LogicalType::VARCHAR,
+	                LogicalType::VARCHAR,
+	                LogicalType::VARCHAR,
+	                LogicalType::VARCHAR,
+	                LogicalType::VARCHAR,
+	                LogicalType::LIST(LogicalType::VARCHAR),
+	                LogicalType::VARCHAR};
 	auto &registry = GetState(input).registry;
 	auto view_name = NameArgs(input, 1);
 	auto like = StringArg(input, 4);
@@ -308,14 +313,15 @@ static void ShowMembers(ClientContext &context, TableFunctionBindInput &input, R
 			if (!like.empty() && !LikeMatch(member.name, like)) {
 				continue;
 			}
-			result.rows.push_back({Value(model->name.catalog), Value(model->name.schema), Value(model->name.name),
-			                       member.IsDerived() ? Value(LogicalType::VARCHAR) : Value(model->tables[member.table].name),
-			                       Value(member.name),
-			                       member.type.id() == LogicalTypeId::UNKNOWN ? Value(LogicalType::VARCHAR)
-			                                                                  : Value(member.type.ToString()),
-			                       member.parsed.synonyms.empty() ? Value(LogicalType::LIST(LogicalType::VARCHAR))
-			                                                      : ListValue(member.parsed.synonyms),
-			                       OptionalString(member.parsed.comment)});
+			result.rows.push_back(
+			    {Value(model->name.catalog), Value(model->name.schema), Value(model->name.name),
+			     member.IsDerived() ? Value(LogicalType::VARCHAR) : Value(model->tables[member.table].name),
+			     Value(member.name),
+			     member.type.id() == LogicalTypeId::UNKNOWN ? Value(LogicalType::VARCHAR)
+			                                                : Value(member.type.ToString()),
+			     member.parsed.synonyms.empty() ? Value(LogicalType::LIST(LogicalType::VARCHAR))
+			                                    : ListValue(member.parsed.synonyms),
+			     OptionalString(member.parsed.comment)});
 		}
 	}
 }
@@ -570,8 +576,8 @@ void RegisterSemanticViewsFunctions(ExtensionLoader &loader, shared_ptr<Semantic
 	loader.RegisterFunction(ddl);
 
 	TableFunction query(SEMANTIC_VIEW_QUERY_FUNCTION,
-	                    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, ParsedSemanticQuery::ItemsType(),
-	                     LogicalType::VARCHAR},
+	                    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                     ParsedSemanticQuery::ItemsType(), LogicalType::VARCHAR},
 	                    nullptr, nullptr);
 	query.bind_replace = SemanticQueryBindReplace;
 	query.function_info = make_shared_ptr<SemanticViewsFunctionInfo>(state);
@@ -582,8 +588,7 @@ void RegisterSemanticViewsFunctions(ExtensionLoader &loader, shared_ptr<Semantic
 	sql.function_info = make_shared_ptr<SemanticViewsFunctionInfo>(state);
 	loader.RegisterFunction(sql);
 
-	TableFunction show(SEMANTIC_VIEW_SHOW_FUNCTION, six_varchars, RowsFunctionScan, SemanticShowBind,
-	                   RowsFunctionInit);
+	TableFunction show(SEMANTIC_VIEW_SHOW_FUNCTION, six_varchars, RowsFunctionScan, SemanticShowBind, RowsFunctionInit);
 	show.function_info = make_shared_ptr<SemanticViewsFunctionInfo>(state);
 	loader.RegisterFunction(show);
 }

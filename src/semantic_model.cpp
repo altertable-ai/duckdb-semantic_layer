@@ -233,8 +233,8 @@ static unique_ptr<ParsedExpression> ResolveColumnRef(const SemanticModel &model,
                                                      const SemanticResolveContext &context) {
 	auto check_private = [&](idx_t member) {
 		if (!context.allow_private && model.members[member].is_private) {
-			throw BinderException("%sSemantic expression \"%s\" is PRIVATE and cannot be queried",
-			                      ErrorPrefix(context), model.MemberDisplayName(member));
+			throw BinderException("%sSemantic expression \"%s\" is PRIVATE and cannot be queried", ErrorPrefix(context),
+			                      model.MemberDisplayName(member));
 		}
 		return member;
 	};

@@ -169,8 +169,7 @@ SemanticViewsParserExtension::SemanticViewsParserExtension() {
 	plan_function = SemanticViewsParserExtension::PlanFunction;
 }
 
-ParserExtensionParseResult SemanticViewsParserExtension::ParseFunction(ParserExtensionInfo *info,
-                                                                       const string &query) {
+ParserExtensionParseResult SemanticViewsParserExtension::ParseFunction(ParserExtensionInfo *info, const string &query) {
 	// Only invoked when the postgres parser failed on this statement.
 	if (!SemanticViewsRewriter::ContainsSemanticSyntax(query)) {
 		return ParserExtensionParseResult();

@@ -57,8 +57,7 @@ static unique_ptr<ParsedExpression> Equals(const string &left_alias, const strin
 class SemanticJoinScope {
 public:
 	SemanticJoinScope(const SemanticModel &model, idx_t base, string prefix,
-	                  optional_ptr<SemanticJoinScope> parent = nullptr,
-	                  idx_t outer_context = DConstants::INVALID_INDEX)
+	                  optional_ptr<SemanticJoinScope> parent = nullptr, idx_t outer_context = DConstants::INVALID_INDEX)
 	    : model(model), base(base), prefix(std::move(prefix)), parent(parent), outer_context(outer_context) {
 		present.insert(base);
 	}
@@ -162,7 +161,8 @@ public:
 				// a metric used in a row-level expression: aggregate the finer rows of the current row
 				vector<SemanticAtom> atoms;
 				auto post = analyzer.Decompose(*entry.resolved, entry.table, atoms, what);
-				result = ReplaceAtoms(*post, [&](idx_t atom) { return ChildAggregate(atoms[atom], context_table, scope, what); });
+				result = ReplaceAtoms(
+				    *post, [&](idx_t atom) { return ChildAggregate(atoms[atom], context_table, scope, what); });
 			}
 			result->alias = expr.alias;
 			return result;
@@ -180,18 +180,16 @@ public:
 			return result;
 		}
 		auto result = expr.Copy();
-		ParsedExpressionIterator::EnumerateChildren(*result, [&](unique_ptr<ParsedExpression> &child) {
-			child = Row(*child, scope, context_table, what);
-		});
+		ParsedExpressionIterator::EnumerateChildren(
+		    *result, [&](unique_ptr<ParsedExpression> &child) { child = Row(*child, scope, context_table, what); });
 		return result;
 	}
 
 	//! Compiles an aggregate atom evaluated over the rows of `scope`'s base
 	unique_ptr<ParsedExpression> Aggregate(const SemanticAtom &atom, SemanticJoinScope &scope, const string &what) {
 		auto result = atom.aggregate->Copy();
-		ParsedExpressionIterator::EnumerateChildren(*result, [&](unique_ptr<ParsedExpression> &child) {
-			child = Row(*child, scope, atom.home, what);
-		});
+		ParsedExpressionIterator::EnumerateChildren(
+		    *result, [&](unique_ptr<ParsedExpression> &child) { child = Row(*child, scope, atom.home, what); });
 		return result;
 	}
 
@@ -457,8 +455,8 @@ unique_ptr<SelectStatement> SemanticQueryCompiler::Compile(const SemanticQuerySp
 		SemanticJoinScope scope(model, home, "");
 		auto node = make_uniq<SelectNode>();
 		for (idx_t d = 0; d < dimensions.size(); d++) {
-			auto expr = compiler.Row(*dimensions[d]->resolved, scope, DConstants::INVALID_INDEX,
-			                         ItemWhat(*dimensions[d]));
+			auto expr =
+			    compiler.Row(*dimensions[d]->resolved, scope, DConstants::INVALID_INDEX, ItemWhat(*dimensions[d]));
 			node->groups.group_expressions.push_back(expr->Copy());
 			expr->alias = DimensionColumn(d);
 			node->select_list.push_back(std::move(expr));

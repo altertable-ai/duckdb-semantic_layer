@@ -216,7 +216,8 @@ private:
 					     rel.from_columns.size(), to.name, rel.to_columns.size());
 				}
 			}
-			rel.one_to_one = !rel.is_range && rel.asof_index == DConstants::INVALID_INDEX && from.IsKey(rel.from_columns);
+			rel.one_to_one =
+			    !rel.is_range && rel.asof_index == DConstants::INVALID_INDEX && from.IsKey(rel.from_columns);
 			model->relationships.push_back(std::move(rel));
 		}
 	}
@@ -299,7 +300,8 @@ private:
 			if (parsed.table.empty()) {
 				member.table = DConstants::INVALID_INDEX;
 				for (auto &existing : model->members) {
-					if (existing.kind == SemanticMemberKind::METRIC && StringUtil::CIEquals(existing.name, member.name)) {
+					if (existing.kind == SemanticMemberKind::METRIC &&
+					    StringUtil::CIEquals(existing.name, member.name)) {
 						Fail("Derived metric \"%s\" has the same name as another metric", member.name);
 					}
 				}
@@ -357,8 +359,8 @@ private:
 			out.push_back(member);
 			return;
 		}
-		ParsedExpressionIterator::EnumerateChildren(expr,
-		                                            [&](const ParsedExpression &child) { CollectMemberRefs(child, out); });
+		ParsedExpressionIterator::EnumerateChildren(
+		    expr, [&](const ParsedExpression &child) { CollectMemberRefs(child, out); });
 	}
 
 	void CheckMemberCycles() {
@@ -427,9 +429,8 @@ private:
 			}
 			return;
 		}
-		ParsedExpressionIterator::EnumerateChildren(expr, [&](const ParsedExpression &child) {
-			CheckChildAggregations(analyzer, child, table, what);
-		});
+		ParsedExpressionIterator::EnumerateChildren(
+		    expr, [&](const ParsedExpression &child) { CheckChildAggregations(analyzer, child, table, what); });
 	}
 
 	void CheckMemberKinds() {

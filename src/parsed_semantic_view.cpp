@@ -187,8 +187,8 @@ static string TableSourceToSQL(const TableRef &source) {
 	throw InternalException("unsupported semantic view table source");
 }
 
-static void AppendCommonAnnotations(string &sql, const vector<string> &synonyms, const vector<pair<string, string>> &tags,
-                                    const string &comment) {
+static void AppendCommonAnnotations(string &sql, const vector<string> &synonyms,
+                                    const vector<pair<string, string>> &tags, const string &comment) {
 	if (!synonyms.empty()) {
 		sql += " WITH SYNONYMS " + StringList(synonyms);
 	}
