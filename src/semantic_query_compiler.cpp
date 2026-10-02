@@ -56,9 +56,10 @@ static unique_ptr<ParsedExpression> Equals(const string &left_alias, const strin
 //===--------------------------------------------------------------------===//
 class SemanticJoinScope {
 public:
-	SemanticJoinScope(const SemanticModel &model, idx_t base, string prefix,
+	SemanticJoinScope(const SemanticModel &model, idx_t base, string prefix, vector<idx_t> using_relationships = {},
 	                  optional_ptr<SemanticJoinScope> parent = nullptr, idx_t outer_context = DConstants::INVALID_INDEX)
-	    : model(model), base(base), prefix(std::move(prefix)), parent(parent), outer_context(outer_context) {
+	    : model(model), base(base), using_relationships(std::move(using_relationships)), prefix(std::move(prefix)),
+	      parent(parent), outer_context(outer_context) {
 		present.insert(base);
 	}
 
@@ -76,7 +77,7 @@ public:
 			return AliasOf(table);
 		}
 		idx_t current = base;
-		for (auto &edge : model.Path(base, table)) {
+		for (auto &edge : model.Path(base, table, using_relationships)) {
 			if (!present.count(edge.target)) {
 				joins.push_back(Joined {edge.target, edge, current});
 				present.insert(edge.target);
@@ -115,6 +116,7 @@ public:
 
 	const SemanticModel &model;
 	idx_t base;
+	vector<idx_t> using_relationships;
 
 private:
 	struct Joined {
@@ -160,7 +162,7 @@ public:
 			} else {
 				// a metric used in a row-level expression: aggregate the finer rows of the current row
 				vector<SemanticAtom> atoms;
-				auto post = analyzer.Decompose(*entry.resolved, entry.table, atoms, what);
+				auto post = analyzer.Decompose(*entry.resolved, entry.table, atoms, what, entry.using_relationships);
 				result = ReplaceAtoms(
 				    *post, [&](idx_t atom) { return ChildAggregate(atoms[atom], context_table, scope, what); });
 			}
@@ -175,6 +177,7 @@ public:
 			atom.home = analyzer.AggregateHome(expr.Cast<FunctionExpression>(), context_table, what);
 			atom.aggregate = expr.Copy();
 			atom.context_table = context_table;
+			atom.using_relationships = scope.using_relationships;
 			auto result = ChildAggregate(atom, context_table, scope, what);
 			result->alias = expr.alias;
 			return result;
@@ -216,10 +219,10 @@ private:
 			                      model.tables[atom.home].name);
 		}
 		auto prefix = "__sv" + to_string(++scope_counter) + "_";
-		SemanticJoinScope inner(model, atom.home, prefix, &outer, context);
+		SemanticJoinScope inner(model, atom.home, prefix, atom.using_relationships, &outer, context);
 		auto aggregate = Aggregate(atom, inner, what);
 
-		auto path = model.Path(atom.home, context);
+		auto path = model.Path(atom.home, context, atom.using_relationships);
 		auto &last = path.back();
 		auto source = path.size() >= 2 ? path[path.size() - 2].target : atom.home;
 		auto &rel = model.relationships[last.relationship];
@@ -425,18 +428,23 @@ unique_ptr<SelectStatement> SemanticQueryCompiler::Compile(const SemanticQuerySp
 	for (auto *item : metrics) {
 		posts.push_back(analyzer.Decompose(*item->resolved, DConstants::INVALID_INDEX, atoms, ItemWhat(*item)));
 	}
+	// one block per (home table, USING relationships)
 	vector<idx_t> block_homes;
+	vector<vector<idx_t>> block_using;
 	vector<vector<idx_t>> block_atoms;
 	for (idx_t a = 0; a < atoms.size(); a++) {
+		auto using_key = atoms[a].using_relationships;
+		std::sort(using_key.begin(), using_key.end());
 		idx_t block = DConstants::INVALID_INDEX;
 		for (idx_t b = 0; b < block_homes.size(); b++) {
-			if (block_homes[b] == atoms[a].home) {
+			if (block_homes[b] == atoms[a].home && block_using[b] == using_key) {
 				block = b;
 			}
 		}
 		if (block == DConstants::INVALID_INDEX) {
 			block = block_homes.size();
 			block_homes.push_back(atoms[a].home);
+			block_using.push_back(using_key);
 			block_atoms.emplace_back();
 		}
 		block_atoms[block].push_back(a);
@@ -452,7 +460,7 @@ unique_ptr<SelectStatement> SemanticQueryCompiler::Compile(const SemanticQuerySp
 				                      model.tables[table].name, model.tables[home].name);
 			}
 		}
-		SemanticJoinScope scope(model, home, "");
+		SemanticJoinScope scope(model, home, "", block_using[block]);
 		auto node = make_uniq<SelectNode>();
 		for (idx_t d = 0; d < dimensions.size(); d++) {
 			auto expr =

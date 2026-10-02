@@ -288,9 +288,12 @@ static void ShowDimensionsForMetric(ClientContext &context, shared_ptr<SemanticM
                                     const string &like, RowsFunctionData &result, vector<LogicalType> &return_types,
                                     vector<string> &names) {
 	names = {"table_name", "name", "data_type", "required", "synonyms", "comment"};
-	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR,
-	                LogicalType::VARCHAR, LogicalType::BOOLEAN,
-	                LogicalType::LIST(LogicalType::VARCHAR), LogicalType::VARCHAR};
+	return_types = {LogicalType::VARCHAR,
+	                LogicalType::VARCHAR,
+	                LogicalType::VARCHAR,
+	                LogicalType::BOOLEAN,
+	                LogicalType::LIST(LogicalType::VARCHAR),
+	                LogicalType::VARCHAR};
 	auto parts = StringUtil::Split(metric_name, '.');
 	idx_t metric = DConstants::INVALID_INDEX;
 	for (idx_t m = 0; m < model->members.size(); m++) {
@@ -298,10 +301,10 @@ static void ShowDimensionsForMetric(ClientContext &context, shared_ptr<SemanticM
 		if (member.kind != SemanticMemberKind::METRIC) {
 			continue;
 		}
-		bool matches = parts.size() == 1 ? StringUtil::CIEquals(member.name, parts[0])
-		                                 : !member.IsDerived() &&
-		                                       StringUtil::CIEquals(model->tables[member.table].name, parts[0]) &&
-		                                       StringUtil::CIEquals(member.name, parts[1]);
+		bool matches = parts.size() == 1
+		                   ? StringUtil::CIEquals(member.name, parts[0])
+		                   : !member.IsDerived() && StringUtil::CIEquals(model->tables[member.table].name, parts[0]) &&
+		                         StringUtil::CIEquals(member.name, parts[1]);
 		if (matches) {
 			if (metric != DConstants::INVALID_INDEX) {
 				throw BinderException("Ambiguous metric name \"%s\"; qualify it with its logical table", metric_name);
@@ -315,7 +318,8 @@ static void ShowDimensionsForMetric(ClientContext &context, shared_ptr<SemanticM
 	SemanticAnalyzer analyzer(*model, context);
 	vector<SemanticAtom> atoms;
 	auto &metric_member = model->members[metric];
-	analyzer.Decompose(*metric_member.resolved, metric_member.table, atoms, "Metric");
+	analyzer.Decompose(*metric_member.resolved, metric_member.table, atoms, "Metric",
+	                   metric_member.using_relationships);
 	auto required = RequiredWindowDimensions(*model, metric);
 	for (idx_t d = 0; d < model->members.size(); d++) {
 		auto &dimension = model->members[d];

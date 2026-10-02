@@ -78,6 +78,7 @@ shared_ptr<SemanticModel> SemanticModel::Copy() const {
 		copy.resolved = member.resolved ? member.resolved->Copy() : nullptr;
 		copy.type = member.type;
 		copy.parsed = member.parsed.Copy();
+		copy.using_relationships = member.using_relationships;
 		result->members.push_back(std::move(copy));
 	}
 	result->edges = edges;
@@ -143,7 +144,7 @@ string SemanticModel::MemberDisplayName(idx_t member_idx) const {
 //===--------------------------------------------------------------------===//
 // Graph
 //===--------------------------------------------------------------------===//
-vector<SemanticEdge> SemanticModel::Path(idx_t from, idx_t to) const {
+vector<SemanticEdge> SemanticModel::Path(idx_t from, idx_t to, const vector<idx_t> &using_relationships) const {
 	if (from == to) {
 		return {};
 	}
@@ -152,36 +153,52 @@ vector<SemanticEdge> SemanticModel::Path(idx_t from, idx_t to) const {
 		                      "many-to-one relationships",
 		                      QualifiedViewName(), tables[to].name, tables[from].name);
 	}
-	if (path_count[from][to] > 1) {
+	// an edge is allowed unless its target is the target of a USING relationship and it is not one of them
+	auto allowed = [&](const SemanticEdge &edge) {
+		bool target_pinned = false;
+		for (auto rel : using_relationships) {
+			auto &pinned = relationships[rel];
+			if (rel == edge.relationship) {
+				return true;
+			}
+			target_pinned = target_pinned || pinned.to_table == edge.target;
+		}
+		return !target_pinned;
+	};
+	vector<vector<SemanticEdge>> found;
+	vector<SemanticEdge> path;
+	vector<bool> visited(tables.size(), false);
+	std::function<void(idx_t)> dfs = [&](idx_t node) {
+		if (found.size() > 1) {
+			return;
+		}
+		if (node == to) {
+			found.push_back(path);
+			return;
+		}
+		visited[node] = true;
+		for (auto &edge : edges[node]) {
+			if (visited[edge.target] || !allowed(edge)) {
+				continue;
+			}
+			path.push_back(edge);
+			dfs(edge.target);
+			path.pop_back();
+		}
+		visited[node] = false;
+	};
+	dfs(from);
+	if (found.empty()) {
+		throw BinderException("Semantic view \"%s\": the USING relationships of the metric do not connect \"%s\" to "
+		                      "\"%s\"",
+		                      QualifiedViewName(), tables[from].name, tables[to].name);
+	}
+	if (found.size() > 1) {
 		throw BinderException("Semantic view \"%s\": multiple relationship paths from \"%s\" to \"%s\"; specify "
 		                      "USING (<relationship>) on the metric to choose one",
 		                      QualifiedViewName(), tables[from].name, tables[to].name);
 	}
-	// unique path: depth-first search over simple paths
-	vector<SemanticEdge> path;
-	vector<bool> visited(tables.size(), false);
-	std::function<bool(idx_t)> dfs = [&](idx_t node) -> bool {
-		if (node == to) {
-			return true;
-		}
-		visited[node] = true;
-		for (auto &edge : edges[node]) {
-			if (visited[edge.target]) {
-				continue;
-			}
-			path.push_back(edge);
-			if (dfs(edge.target)) {
-				return true;
-			}
-			path.pop_back();
-		}
-		visited[node] = false;
-		return false;
-	};
-	if (!dfs(from)) {
-		throw InternalException("semantic view path not found although path_count > 0");
-	}
-	return path;
+	return found[0];
 }
 
 //===--------------------------------------------------------------------===//

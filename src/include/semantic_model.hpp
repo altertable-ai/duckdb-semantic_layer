@@ -86,6 +86,8 @@ struct SemanticMember {
 	LogicalType type = LogicalType::UNKNOWN;
 	//! Parsed definition entry (metadata: synonyms, comment, labels, USING, NON ADDITIVE BY, ...)
 	ParsedSemanticMember parsed;
+	//! Relationships pinned with USING (...) (metrics only)
+	vector<idx_t> using_relationships;
 
 	bool IsDerived() const {
 		return table == DConstants::INVALID_INDEX;
@@ -136,8 +138,9 @@ public:
 	bool Reaches(idx_t from, idx_t to) const {
 		return path_count[from][to] > 0;
 	}
-	//! The unique path from -> to (empty when from == to); throws when there are several paths
-	vector<SemanticEdge> Path(idx_t from, idx_t to) const;
+	//! The unique path from -> to (empty when from == to); throws when there are several paths.
+	//! `using_relationships` (USING on metrics) restricts how the tables they reference are reached.
+	vector<SemanticEdge> Path(idx_t from, idx_t to, const vector<idx_t> &using_relationships = {}) const;
 
 	//! Resolves every column reference of `expr` to a marker reference
 	unique_ptr<ParsedExpression> Resolve(const ParsedExpression &expr, const SemanticResolveContext &context) const;

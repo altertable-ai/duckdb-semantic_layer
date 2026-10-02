@@ -155,7 +155,8 @@ bool SemanticAnalyzer::IsAtomRef(const ParsedExpression &expr, idx_t &atom) {
 }
 
 unique_ptr<ParsedExpression> SemanticAnalyzer::Decompose(const ParsedExpression &expr, idx_t context_table,
-                                                         vector<SemanticAtom> &atoms, const string &what) {
+                                                         vector<SemanticAtom> &atoms, const string &what,
+                                                         const vector<idx_t> &using_relationships) {
 	auto result = expr.Copy();
 	std::function<void(unique_ptr<ParsedExpression> &)> rewrite = [&](unique_ptr<ParsedExpression> &node) {
 		if (IsAggregate(*node)) {
@@ -163,6 +164,7 @@ unique_ptr<ParsedExpression> SemanticAnalyzer::Decompose(const ParsedExpression 
 			atom.home = AggregateHome(node->Cast<FunctionExpression>(), context_table, what);
 			atom.aggregate = node->Copy();
 			atom.context_table = context_table;
+			atom.using_relationships = using_relationships;
 			atoms.push_back(std::move(atom));
 			auto alias = node->alias;
 			node = MakeAtomRef(atoms.size() - 1);
@@ -174,7 +176,9 @@ unique_ptr<ParsedExpression> SemanticAnalyzer::Decompose(const ParsedExpression 
 			auto &entry = model.members[member];
 			if (entry.kind == SemanticMemberKind::METRIC) {
 				auto alias = node->alias;
-				node = Decompose(*entry.resolved, entry.table, atoms, what);
+				auto &member_using =
+				    entry.using_relationships.empty() ? using_relationships : entry.using_relationships;
+				node = Decompose(*entry.resolved, entry.table, atoms, what, member_using);
 				node->alias = alias;
 				return;
 			}

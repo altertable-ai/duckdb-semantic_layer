@@ -317,8 +317,20 @@ private:
 					Fail("Metric \"%s\" has the same name as a derived metric", parsed.FullName());
 				}
 			}
-			if (!parsed.using_relationships.empty()) {
-				throw NotImplementedException("USING (...) on metrics is not supported yet");
+			for (auto &rel_name : parsed.using_relationships) {
+				if (member.kind != SemanticMemberKind::METRIC) {
+					Fail("USING is only allowed on metrics (\"%s\")", parsed.FullName());
+				}
+				idx_t found = DConstants::INVALID_INDEX;
+				for (idx_t r = 0; r < model->relationships.size(); r++) {
+					if (StringUtil::CIEquals(model->relationships[r].name, rel_name)) {
+						found = r;
+					}
+				}
+				if (found == DConstants::INVALID_INDEX) {
+					Fail("Unknown relationship \"%s\" in USING of \"%s\"", rel_name, parsed.FullName());
+				}
+				member.using_relationships.push_back(found);
 			}
 			if (!parsed.non_additive_by.empty()) {
 				throw NotImplementedException("NON ADDITIVE BY is not supported yet");
@@ -455,7 +467,7 @@ private:
 				Fail("%s must use an aggregate function", what);
 			}
 			vector<SemanticAtom> atoms;
-			analyzer.Decompose(*member.resolved, member.table, atoms, what);
+			analyzer.Decompose(*member.resolved, member.table, atoms, what, member.using_relationships);
 			if (member.IsDerived()) {
 				continue;
 			}

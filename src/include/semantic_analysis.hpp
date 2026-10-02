@@ -25,6 +25,8 @@ struct SemanticAtom {
 	unique_ptr<ParsedExpression> aggregate;
 	//! Logical table whose rows provide the grain for nested (child) aggregates inside `aggregate`
 	idx_t context_table;
+	//! Relationships pinned by the metric the atom comes from (USING)
+	vector<idx_t> using_relationships;
 };
 
 class SemanticAnalyzer {
@@ -49,7 +51,8 @@ public:
 	//! Splits a metric-level expression into a post-aggregation expression over atom references.
 	//! Metric references are inlined recursively. Throws when row-level values appear outside aggregates.
 	unique_ptr<ParsedExpression> Decompose(const ParsedExpression &expr, idx_t context_table,
-	                                       vector<SemanticAtom> &atoms, const string &what);
+	                                       vector<SemanticAtom> &atoms, const string &what,
+	                                       const vector<idx_t> &using_relationships = {});
 
 	static unique_ptr<ParsedExpression> MakeAtomRef(idx_t atom);
 	static bool IsAtomRef(const ParsedExpression &expr, idx_t &atom);

@@ -1,0 +1,80 @@
+# name: test/sql/semantic_views/using.test
+# description: USING (relationship) selects the join path of a metric when several relationships connect two tables
+# group: [semantic_views]
+
+require semantic_views
+
+statement ok
+PRAGMA enable_verification
+
+statement ok
+CREATE TABLE airports (airport_code VARCHAR, city_name VARCHAR, airport_region_code VARCHAR);
+
+statement ok
+INSERT INTO airports VALUES ('SEA', 'Seattle', 'NA'), ('SFO', 'San Francisco', 'NA'), ('PVG', 'Shanghai', 'AS');
+
+statement ok
+CREATE TABLE flights (flight_id INTEGER, departure_airport VARCHAR, arrival_airport VARCHAR, is_late BOOLEAN);
+
+statement ok
+INSERT INTO flights VALUES (1, 'SFO', 'SEA', true), (2, 'SEA', 'SFO', false), (3, 'SEA', 'PVG', false), (4, 'SFO', 'PVG', true);
+
+statement ok
+CREATE SEMANTIC VIEW flights_sv
+  TABLES (
+    airports PRIMARY KEY (airport_code),
+    flights PRIMARY KEY (flight_id)
+  )
+  RELATIONSHIPS (
+    flight_departure_airport AS flights (departure_airport) REFERENCES airports,
+    flight_arrival_airport AS flights (arrival_airport) REFERENCES airports
+  )
+  DIMENSIONS (
+    airports.city AS city_name,
+    flights.late AS is_late
+  )
+  METRICS (
+    flights.m_departures USING (flight_departure_airport) AS COUNT(*),
+    flights.m_arrivals USING (flight_arrival_airport) AS COUNT(*),
+    flights.m_late_departures USING (flight_departure_airport) AS COUNT_IF(is_late),
+    flights.m_flights AS COUNT(*),
+    traffic AS flights.m_departures + flights.m_arrivals
+  );
+
+query II
+SELECT * FROM SEMANTIC_VIEW(flights_sv DIMENSIONS airports.city METRICS flights.m_departures) ORDER BY 1;
+----
+San Francisco	2
+Seattle	2
+
+query II
+SELECT * FROM SEMANTIC_VIEW(flights_sv DIMENSIONS airports.city METRICS flights.m_arrivals) ORDER BY 1;
+----
+San Francisco	1
+Seattle	1
+Shanghai	2
+
+# metrics pinned to different relationships in the same query
+query IIIII
+SELECT * FROM SEMANTIC_VIEW(flights_sv DIMENSIONS airports.city METRICS flights.m_departures, flights.m_arrivals, flights.m_late_departures, traffic) ORDER BY 1;
+----
+San Francisco	2	1	2	3
+Seattle	2	1	0	3
+Shanghai	NULL	2	NULL	NULL
+
+# no path ambiguity without airport dimensions
+query I
+SELECT * FROM SEMANTIC_VIEW(flights_sv METRICS flights.m_flights);
+----
+4
+
+# without USING the path from flights to airports is ambiguous
+statement error
+SELECT * FROM SEMANTIC_VIEW(flights_sv DIMENSIONS airports.city METRICS flights.m_flights);
+----
+multiple relationship paths
+
+statement error
+CREATE SEMANTIC VIEW bad TABLES (airports PRIMARY KEY (airport_code), flights PRIMARY KEY (flight_id)) RELATIONSHIPS (r1 AS flights (departure_airport) REFERENCES airports) METRICS (flights.m USING (nope) AS COUNT(*));
+----
+Unknown relationship "nope"
