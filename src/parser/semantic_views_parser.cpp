@@ -9,6 +9,7 @@
 #include "duckdb/parser/statement/explain_statement.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "matcher.hpp"
+#include "semantic_view_peg_context.hpp"
 #include "tokenizer.hpp"
 #include "transformer/peg_transformer.hpp"
 
@@ -99,6 +100,18 @@ vector<unique_ptr<SQLStatement>> SemanticViewsRewriter::Parse(const string &quer
 				create.info->sql = statement->query;
 			}
 		}
+	}
+	return result;
+}
+
+unique_ptr<ParsedSemanticView> SemanticViewsRewriter::ParseDefinition(const string &sql) {
+	unique_ptr<ParsedSemanticView> result;
+	{
+		SemanticViewPegContext::ScopedCapture capture(result);
+		Parse(sql, ParserOptions());
+	}
+	if (!result) {
+		throw InternalException("semantic_views: expected a CREATE SEMANTIC VIEW statement");
 	}
 	return result;
 }

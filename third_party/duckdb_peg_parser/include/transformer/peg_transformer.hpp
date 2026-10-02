@@ -278,6 +278,8 @@ public:
 	void RegisterVacuum();
 	void RegisterKeywordsAndIdentifiers();
 	void RegisterEnums();
+	//! semantic_views: grammar for CREATE/DROP/ALTER/SHOW/DESCRIBE SEMANTIC VIEW and SEMANTIC_VIEW(...)
+	void RegisterSemanticView();
 
 private:
 	template <typename T>

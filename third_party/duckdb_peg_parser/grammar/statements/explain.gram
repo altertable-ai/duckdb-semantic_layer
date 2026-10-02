@@ -1,6 +1,7 @@
 ExplainStatement <- 'EXPLAIN' 'ANALYZE'? GenericCopyOptionList? ExplainableStatements
 
 ExplainableStatements <-
+    SemanticViewStatement /
     AlterStatement /
     AnalyzeStatement /
     CallStatement /

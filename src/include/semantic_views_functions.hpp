@@ -15,6 +15,8 @@ struct RowsFunctionData : public TableFunctionData {
 unique_ptr<GlobalTableFunctionState> RowsFunctionInit(ClientContext &context, TableFunctionInitInput &input);
 void RowsFunctionScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output);
 
-void RegisterSemanticViewsFunctions(ExtensionLoader &loader);
+struct SemanticViewsState;
+
+void RegisterSemanticViewsFunctions(ExtensionLoader &loader, shared_ptr<SemanticViewsState> state);
 
 } // namespace duckdb

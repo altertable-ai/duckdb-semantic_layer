@@ -44,6 +44,7 @@ set(SEMANTIC_VIEWS_PEG_SOURCES
     ${SEMANTIC_VIEWS_PEG_DIR}/transformer/transform_pragma.cpp
     ${SEMANTIC_VIEWS_PEG_DIR}/transformer/transform_prepare.cpp
     ${SEMANTIC_VIEWS_PEG_DIR}/transformer/transform_select.cpp
+    ${SEMANTIC_VIEWS_PEG_DIR}/transformer/transform_semantic_view.cpp
     ${SEMANTIC_VIEWS_PEG_DIR}/transformer/transform_set.cpp
     ${SEMANTIC_VIEWS_PEG_DIR}/transformer/transform_transaction.cpp
     ${SEMANTIC_VIEWS_PEG_DIR}/transformer/transform_update.cpp

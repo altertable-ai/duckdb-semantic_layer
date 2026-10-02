@@ -1,4 +1,5 @@
 Statement <-
+	SemanticViewStatement /
 	CreateStatement /
 	SelectStatement /
 	SetStatement /
@@ -1248,7 +1249,7 @@ DistinctAll <- 'ALL'
 DistinctOn <- 'DISTINCT' DistinctOnTargets?
 DistinctOnTargets <- 'ON' Parens(List(Expression))
 
-InnerTableRef <- ValuesRef / TableFunction / TableSubquery / BaseTableRef / ParensTableRef
+InnerTableRef <- SemanticViewRef / SemanticShowTableRef / ValuesRef / TableFunction / TableSubquery / BaseTableRef / ParensTableRef
 
 TableRef <- InnerTableRef JoinOrPivot*
 TableSubquery <- Lateral? SubqueryReference TableAlias?
@@ -1397,6 +1398,125 @@ TruncateStatement <- 'TRUNCATE' 'TABLE'? BaseTableName
 TargetOptAlias <- BaseTableName 'AS'? ColId?
 DeleteUsingClause <- 'USING' List(TableRef)
 
+# Semantic views (Snowflake-compatible)
+#
+# SemanticViewStatement is the first alternative of Statement (common.gram) and
+# SemanticViewRef the first alternative of InnerTableRef (select.gram).
+#
+# Note: the PEG grammar parser ends a rule at a newline unless the line ends in
+# '/' or we are inside parentheses - keep every rule on one line.
+# Clause keywords (TABLES, DIMENSIONS, METRICS, ...) are deliberately not
+# reserved keywords.
+
+SemanticViewStatement <- CreateSemanticViewStmt / DropSemanticViewStmt / AlterSemanticViewStmt / DescribeSemanticViewStmt / ShowSemanticStmt
+
+CreateSemanticViewStmt <- 'CREATE' SemanticCreateModifier? 'SEMANTIC' 'VIEW' IfNotExists? QualifiedName SemanticViewDefinitionBody
+SemanticCreateModifier <- 'OR' SemanticReplaceOrAlter
+SemanticReplaceOrAlter <- 'REPLACE' / 'ALTER'
+
+SemanticViewDefinitionBody <- SemanticTablesClause SemanticRelationshipsClause? SemanticFactsClause? SemanticDimensionsClause? SemanticMetricsClause? SemanticViewProperty*
+
+SemanticTablesClause <- 'TABLES' Parens(List(SemanticLogicalTable))
+SemanticLogicalTable <- SemanticTableAliasAs? SemanticTableSource SemanticTableOption*
+SemanticTableAliasAs <- ColId 'AS'
+SemanticTableSource <- SemanticParensSelect / BaseTableName
+SemanticParensSelect <- Parens(SelectStatementInternal)
+SemanticTableOption <- SemanticPrimaryKey / SemanticUnique / SemanticRangeConstraint / SemanticWithSynonyms / SemanticComment / SemanticTag
+SemanticPrimaryKey <- 'PRIMARY' 'KEY' SemanticColumnList
+SemanticUnique <- 'UNIQUE' SemanticColumnList
+SemanticRangeConstraint <- 'CONSTRAINT' SemanticConstraintName? 'DISTINCT' 'RANGE' 'BETWEEN' ColId 'AND' ColId 'EXCLUSIVE'
+SemanticConstraintName <- ColId
+SemanticColumnList <- Parens(List(ColId))
+
+SemanticRelationshipsClause <- 'RELATIONSHIPS' Parens(List(SemanticRelationship))
+SemanticRelationship <- SemanticRelationshipName? ColId SemanticColumnList 'REFERENCES' ColId SemanticReferencedColumns?
+SemanticRelationshipName <- ColId 'AS'
+SemanticReferencedColumns <- Parens(SemanticReferencedSpec)
+SemanticReferencedSpec <- SemanticRangeReference / SemanticReferencedColumnList
+SemanticRangeReference <- 'BETWEEN' ColId 'AND' ColId 'EXCLUSIVE'
+SemanticReferencedColumnList <- List(SemanticReferencedColumn)
+SemanticReferencedColumn <- SemanticAsof? ColId
+SemanticAsof <- 'ASOF'
+
+SemanticFactsClause <- 'FACTS' Parens(List(SemanticMember))
+SemanticDimensionsClause <- 'DIMENSIONS' Parens(List(SemanticMember))
+SemanticMetricsClause <- 'METRICS' Parens(List(SemanticMember))
+SemanticMember <- SemanticVisibility? SemanticMemberName SemanticLabels? SemanticUsing? SemanticNonAdditive? 'AS' Expression SemanticMemberOption*
+SemanticVisibility <- 'PRIVATE' / 'PUBLIC'
+SemanticMemberName <- SemanticQualifiedMemberName / ColId
+SemanticQualifiedMemberName <- ColId '.' ColLabel
+SemanticLabels <- 'LABELS' '=' Parens(List(ColId))
+SemanticUsing <- 'USING' Parens(List(ColId))
+SemanticNonAdditive <- 'NON' 'ADDITIVE' 'BY' Parens(List(OrderByExpression))
+SemanticMemberOption <- SemanticWithSynonyms / SemanticComment / SemanticTag / SemanticSampleValues / SemanticIsEnum / SemanticCortexSearch
+SemanticWithSynonyms <- 'WITH'? 'SYNONYMS' '='? Parens(List(StringLiteral))
+SemanticComment <- 'COMMENT' '=' StringLiteral
+SemanticTag <- 'WITH'? 'TAG' Parens(List(SemanticTagEntry))
+SemanticTagEntry <- SemanticDottedName '=' StringLiteral
+SemanticDottedName <- ColId ('.' ColLabel)*
+SemanticSampleValues <- 'SAMPLE_VALUES' Parens(List(StringLiteral))
+SemanticIsEnum <- 'IS_ENUM'
+SemanticCortexSearch <- 'WITH' 'CORTEX' 'SEARCH' 'SERVICE' SemanticDottedName SemanticCortexSearchColumn?
+SemanticCortexSearchColumn <- 'USING' ColId
+
+SemanticViewProperty <- SemanticComment / SemanticMaxStaleness / SemanticAiSqlGeneration / SemanticAiQuestionCategorization / SemanticAiVerifiedQueries / SemanticTag / SemanticCopyGrants
+SemanticMaxStaleness <- 'MAX_STALENESS' '=' NumberLiteral
+SemanticAiSqlGeneration <- 'AI_SQL_GENERATION' StringLiteral
+SemanticAiQuestionCategorization <- 'AI_QUESTION_CATEGORIZATION' StringLiteral
+SemanticAiVerifiedQueries <- 'AI_VERIFIED_QUERIES' Parens(List(SemanticVerifiedQuery))
+SemanticVerifiedQuery <- ColId 'AS' Parens(SemanticVerifiedQueryProperty+)
+SemanticVerifiedQueryProperty <- SemanticVqQuestion / SemanticVqVerifiedAt / SemanticVqOnboarding / SemanticVqVerifiedBy / SemanticVqSql
+SemanticVqQuestion <- 'QUESTION' StringLiteral
+SemanticVqVerifiedAt <- 'VERIFIED_AT' NumberLiteral
+SemanticVqOnboarding <- 'ONBOARDING_QUESTION' SemanticBoolean
+SemanticBoolean <- 'TRUE' / 'FALSE'
+SemanticVqVerifiedBy <- 'VERIFIED_BY' StringLiteral
+SemanticVqSql <- 'SQL' StringLiteral
+SemanticCopyGrants <- 'COPY' 'GRANTS'
+
+DropSemanticViewStmt <- 'DROP' 'SEMANTIC' 'VIEW' IfExists? QualifiedName
+
+AlterSemanticViewStmt <- 'ALTER' 'SEMANTIC' 'VIEW' IfExists? QualifiedName SemanticAlterAction
+SemanticAlterAction <- SemanticAlterRename / SemanticAlterSetComment / SemanticAlterUnsetComment
+SemanticAlterRename <- 'RENAME' 'TO' QualifiedName
+SemanticAlterSetComment <- 'SET' 'COMMENT' '=' StringLiteral
+SemanticAlterUnsetComment <- 'UNSET' 'COMMENT'
+
+DescribeSemanticViewStmt <- SemanticDescribeKeyword 'SEMANTIC' 'VIEW' QualifiedName
+SemanticDescribeKeyword <- 'DESCRIBE' / 'DESC'
+
+ShowSemanticStmt <- 'SHOW' 'SEMANTIC' SemanticShowTarget
+SemanticShowTarget <- SemanticShowViews / SemanticShowMembers
+SemanticShowViews <- 'VIEWS' SemanticShowLike? SemanticShowViewsScope?
+SemanticShowViewsScope <- 'IN' SemanticShowScopeKind QualifiedName
+SemanticShowScopeKind <- 'SCHEMA' / 'DATABASE'
+SemanticShowMembers <- SemanticShowMemberKind SemanticShowLike? SemanticShowIn? SemanticShowForMetric?
+SemanticShowMemberKind <- 'DIMENSIONS' / 'METRICS' / 'FACTS'
+SemanticShowLike <- 'LIKE' StringLiteral
+SemanticShowIn <- 'IN' SemanticShowInView? QualifiedName
+SemanticShowInView <- 'SEMANTIC' 'VIEW'
+SemanticShowForMetric <- 'FOR' 'METRIC' SemanticDottedName
+
+# (SHOW SEMANTIC ...) / (DESCRIBE SEMANTIC VIEW ...) as a table reference
+SemanticShowTableRef <- Parens(SemanticShowOrDescribe) TableAlias?
+SemanticShowOrDescribe <- ShowSemanticStmt / DescribeSemanticViewStmt
+
+# SEMANTIC_VIEW(...) in the FROM clause
+SemanticViewRef <- SemanticViewKeyword Parens(SemanticViewQueryBody) TableAlias?
+SemanticViewKeyword <- 'SEMANTIC_VIEW' / SemanticViewTwoWords
+SemanticViewTwoWords <- 'SEMANTIC' 'VIEW'
+# The body is parsed as a flat sequence of pieces; TransformSemanticViewRef assigns
+# clause keywords (DIMENSIONS / METRICS / FACTS parse as bare column references),
+# items and optional bare aliases. The PEG matcher ignores '!' lookaheads, so this
+# is how clause keywords stay unreserved.
+SemanticViewQueryBody <- QualifiedName SemanticQueryPiece*
+SemanticQueryPiece <- SemanticQueryComma / SemanticQueryAliasAs / SemanticQueryStar / SemanticQueryWhere / SemanticQueryExpression
+SemanticQueryComma <- ','
+SemanticQueryAliasAs <- 'AS' ColLabel
+SemanticQueryStar <- ColId '.' '*'
+SemanticQueryWhere <- 'WHERE' Expression
+SemanticQueryExpression <- Expression
+
 CreateTypeStmt <- 'TYPE' IfNotExists? QualifiedName 'AS' CreateType
 CreateType <- EnumSelectType / EnumStringLiteralList / Type
 EnumSelectType <- 'ENUM' Parens(SelectStatementInternal)
@@ -1541,6 +1661,7 @@ MaxValue <- 'MAXVALUE'
 ExplainStatement <- 'EXPLAIN' 'ANALYZE'? GenericCopyOptionList? ExplainableStatements
 
 ExplainableStatements <-
+    SemanticViewStatement /
     AlterStatement /
     AnalyzeStatement /
     CallStatement /

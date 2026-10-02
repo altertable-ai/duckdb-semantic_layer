@@ -11,7 +11,9 @@ DEST="${TMP}/clean"
 mkdir -p "${DEST}"
 
 PATHS=(
+	"grammar/statements/common.gram"
 	"grammar/statements/select.gram"
+	"grammar/statements/explain.gram"
 	"grammar/statements/expression.gram"
 	"grammar/keywords/unreserved_keyword.list"
 	"grammar/keywords/reserved_keyword.list"

@@ -1,0 +1,50 @@
+--- a/grammar/statements/common.gram	2026-10-03 01:19:23
++++ b/grammar/statements/common.gram	2026-10-03 01:07:40
+@@ -1,4 +1,5 @@
+ Statement <-
++	SemanticViewStatement /
+ 	CreateStatement /
+ 	SelectStatement /
+ 	SetStatement /
+--- a/grammar/statements/select.gram	2026-10-03 01:19:23
++++ b/grammar/statements/select.gram	2026-10-03 01:19:08
+@@ -42,7 +42,7 @@
+ DistinctOn <- 'DISTINCT' DistinctOnTargets?
+ DistinctOnTargets <- 'ON' Parens(List(Expression))
+ 
+-InnerTableRef <- ValuesRef / TableFunction / TableSubquery / BaseTableRef / ParensTableRef
++InnerTableRef <- SemanticViewRef / SemanticShowTableRef / ValuesRef / TableFunction / TableSubquery / BaseTableRef / ParensTableRef
+ 
+ TableRef <- InnerTableRef JoinOrPivot*
+ TableSubquery <- Lateral? SubqueryReference TableAlias?
+--- a/grammar/statements/explain.gram	2026-10-03 01:19:23
++++ b/grammar/statements/explain.gram	2026-10-03 01:19:20
+@@ -1,6 +1,7 @@
+ ExplainStatement <- 'EXPLAIN' 'ANALYZE'? GenericCopyOptionList? ExplainableStatements
+ 
+ ExplainableStatements <-
++    SemanticViewStatement /
+     AlterStatement /
+     AnalyzeStatement /
+     CallStatement /
+--- a/include/transformer/peg_transformer.hpp	2026-10-03 01:19:23
++++ b/include/transformer/peg_transformer.hpp	2026-10-03 01:07:40
+@@ -278,6 +278,8 @@
+ 	void RegisterVacuum();
+ 	void RegisterKeywordsAndIdentifiers();
+ 	void RegisterEnums();
++	//! semantic_views: grammar for CREATE/DROP/ALTER/SHOW/DESCRIBE SEMANTIC VIEW and SEMANTIC_VIEW(...)
++	void RegisterSemanticView();
+ 
+ private:
+ 	template <typename T>
+--- a/transformer/peg_transformer_factory.cpp	2026-10-03 01:19:23
++++ b/transformer/peg_transformer_factory.cpp	2026-10-03 01:07:40
+@@ -1049,6 +1049,7 @@
+ 	RegisterVacuum();
+ 	RegisterKeywordsAndIdentifiers();
+ 	RegisterEnums();
++	RegisterSemanticView();
+ }
+ 
+ vector<optional_ptr<ParseResult>>

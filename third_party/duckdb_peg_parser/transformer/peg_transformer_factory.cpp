@@ -1049,6 +1049,7 @@ PEGTransformerFactory::PEGTransformerFactory() {
 	RegisterVacuum();
 	RegisterKeywordsAndIdentifiers();
 	RegisterEnums();
+	RegisterSemanticView();
 }
 
 vector<optional_ptr<ParseResult>>

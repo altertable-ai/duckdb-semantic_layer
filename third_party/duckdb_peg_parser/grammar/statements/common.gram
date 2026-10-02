@@ -1,4 +1,5 @@
 Statement <-
+	SemanticViewStatement /
 	CreateStatement /
 	SelectStatement /
 	SetStatement /
