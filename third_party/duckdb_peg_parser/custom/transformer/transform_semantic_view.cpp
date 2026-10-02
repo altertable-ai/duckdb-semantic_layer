@@ -623,7 +623,15 @@ static unique_ptr<TableRef> TransformSemanticViewRef(PEGTransformer &transformer
 	query.view = transformer.Transform<QualifiedName>(FirstNamed(body, "QualifiedName"));
 	bool has_kind = false;
 	bool expecting_item = true;
+	idx_t clause_items = 0;
 	SemanticMemberKind kind = SemanticMemberKind::DIMENSION;
+	// a clause keyword must be followed by at least one item, and a ',' by another item
+	auto close_clause = [&]() {
+		if (has_kind && expecting_item) {
+			throw ParserException("SEMANTIC_VIEW: %sS requires at least one item%s", SemanticMemberKindToString(kind),
+			                      clause_items > 0 ? " after ','" : "");
+		}
+	};
 	for (auto &piece : AllNamed(body, "SemanticQueryPiece")) {
 		if (FirstNamed(piece, "SemanticQueryComma")) {
 			if (expecting_item) {
@@ -644,6 +652,7 @@ static unique_ptr<TableRef> TransformSemanticViewRef(PEGTransformer &transformer
 			if (query.where) {
 				throw ParserException("SEMANTIC_VIEW accepts at most one WHERE clause");
 			}
+			close_clause();
 			query.where = transformer.Transform<unique_ptr<ParsedExpression>>(FirstNamed(where, "Expression"));
 			has_kind = false;
 			expecting_item = true;
@@ -659,6 +668,7 @@ static unique_ptr<TableRef> TransformSemanticViewRef(PEGTransformer &transformer
 			item.star_table = LeafText(FirstNamed(star, "ColId"));
 			query.items.push_back(std::move(item));
 			expecting_item = false;
+			clause_items++;
 			continue;
 		}
 		auto expression = transformer.Transform<unique_ptr<ParsedExpression>>(FirstNamed(piece, "Expression"));
@@ -673,6 +683,8 @@ static unique_ptr<TableRef> TransformSemanticViewRef(PEGTransformer &transformer
 			// DIMENSIONS / METRICS / FACTS parse as bare column references: they open a clause
 			auto upper = StringUtil::Upper(bare_name);
 			if (upper == "DIMENSIONS" || upper == "METRICS" || upper == "FACTS") {
+				close_clause();
+				clause_items = 0;
 				kind = upper == "DIMENSIONS" ? SemanticMemberKind::DIMENSION
 				       : upper == "METRICS"  ? SemanticMemberKind::METRIC
 				                             : SemanticMemberKind::FACT;
@@ -702,7 +714,9 @@ static unique_ptr<TableRef> TransformSemanticViewRef(PEGTransformer &transformer
 		item.expression = std::move(expression);
 		query.items.push_back(std::move(item));
 		expecting_item = false;
+		clause_items++;
 	}
+	close_clause();
 	if (query.items.empty()) {
 		throw ParserException("SEMANTIC_VIEW requires at least one of DIMENSIONS, METRICS or FACTS");
 	}

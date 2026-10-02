@@ -244,6 +244,27 @@ SELECT * FROM SEMANTIC_VIEW(shop METRICS o.revenue WHERE o.revenue > 10);
 ----
 WHERE
 
+# a clause without items, or a trailing comma, is a syntax error
+statement error
+SELECT * FROM SEMANTIC_VIEW(shop DIMENSIONS o.status METRICS);
+----
+METRICS requires at least one item
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(shop DIMENSIONS o.status, METRICS o.revenue);
+----
+DIMENSIONS requires at least one item
+
+# DuckDB views can wrap semantic queries
+statement ok
+CREATE VIEW v_rev AS SELECT * FROM SEMANTIC_VIEW(shop DIMENSIONS o.status METRICS o.revenue);
+
+query II
+SELECT * FROM v_rev ORDER BY 1;
+----
+closed	50.00
+open	317.00
+
 # a view with quoted identifiers
 statement ok
 CREATE TABLE "Order Lines" ("Line Id" INTEGER, "Amount" DOUBLE);
