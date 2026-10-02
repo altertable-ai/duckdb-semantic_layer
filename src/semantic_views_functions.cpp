@@ -11,6 +11,9 @@
 #include "duckdb/catalog/catalog_search_path.hpp"
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/tableref/subqueryref.hpp"
+#include "semantic_query_compiler.hpp"
 #include "semantic_view_registry.hpp"
 #include "semantic_views_parser.hpp"
 
@@ -405,6 +408,33 @@ static unique_ptr<FunctionData> SemanticShowBind(ClientContext &context, TableFu
 }
 
 //===--------------------------------------------------------------------===//
+// __semantic_view_query(catalog, schema, name, items, where) - SEMANTIC_VIEW(...)
+//===--------------------------------------------------------------------===//
+static unique_ptr<SelectStatement> CompileSemanticQuery(ClientContext &context, SemanticViewsState &state,
+                                                        TableFunctionBindInput &input, string &view_name) {
+	auto model = state.registry.GetOrThrow(context, NameArgs(input, 0));
+	view_name = model->name.name;
+	auto items = ParsedSemanticQuery::ItemsFromValue(input.inputs[3]);
+	unique_ptr<ParsedExpression> where;
+	if (!input.inputs[4].IsNull() && !StringValue::Get(input.inputs[4]).empty()) {
+		auto expressions = Parser::ParseExpressionList(StringValue::Get(input.inputs[4]));
+		if (expressions.size() != 1) {
+			throw InternalException("semantic view WHERE clause did not round-trip");
+		}
+		where = std::move(expressions[0]);
+	}
+	SemanticQueryCompiler compiler(*model, context);
+	auto spec = compiler.Resolve(items, where.get());
+	return compiler.Compile(spec);
+}
+
+static unique_ptr<TableRef> SemanticQueryBindReplace(ClientContext &context, TableFunctionBindInput &input) {
+	string view_name;
+	auto select = CompileSemanticQuery(context, GetState(input), input, view_name);
+	return make_uniq<SubqueryRef>(std::move(select), view_name);
+}
+
+//===--------------------------------------------------------------------===//
 // Registration
 //===--------------------------------------------------------------------===//
 void RegisterSemanticViewsFunctions(ExtensionLoader &loader, shared_ptr<SemanticViewsState> state) {
@@ -416,6 +446,14 @@ void RegisterSemanticViewsFunctions(ExtensionLoader &loader, shared_ptr<Semantic
 	TableFunction ddl(SEMANTIC_VIEW_DDL_FUNCTION, six_varchars, SemanticDDLScan, SemanticDDLBind, SemanticDDLInit);
 	ddl.function_info = make_shared_ptr<SemanticViewsFunctionInfo>(state);
 	loader.RegisterFunction(ddl);
+
+	TableFunction query(SEMANTIC_VIEW_QUERY_FUNCTION,
+	                    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, ParsedSemanticQuery::ItemsType(),
+	                     LogicalType::VARCHAR},
+	                    nullptr, nullptr);
+	query.bind_replace = SemanticQueryBindReplace;
+	query.function_info = make_shared_ptr<SemanticViewsFunctionInfo>(state);
+	loader.RegisterFunction(query);
 
 	TableFunction show(SEMANTIC_VIEW_SHOW_FUNCTION, six_varchars, RowsFunctionScan, SemanticShowBind,
 	                   RowsFunctionInit);

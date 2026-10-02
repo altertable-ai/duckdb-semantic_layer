@@ -712,7 +712,8 @@ static unique_ptr<TableRef> TransformSemanticViewRef(PEGTransformer &transformer
 	children.push_back(make_uniq<ConstantExpression>(NameValue(query.view.schema)));
 	children.push_back(make_uniq<ConstantExpression>(NameValue(query.view.name)));
 	children.push_back(make_uniq<ConstantExpression>(query.ItemsToValue()));
-	children.push_back(make_uniq<ConstantExpression>(query.where ? Value(query.where->ToString()) : Value()));
+	children.push_back(
+	    make_uniq<ConstantExpression>(Value(query.where ? query.where->ToString() : string())));
 	auto result = make_uniq<TableFunctionRef>();
 	result->function = make_uniq<FunctionExpression>(SEMANTIC_VIEW_QUERY_FUNCTION, std::move(children));
 

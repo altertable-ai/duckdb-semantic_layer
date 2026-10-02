@@ -17,6 +17,7 @@
 #include "duckdb/planner/binder.hpp"
 #include "semantic_analysis.hpp"
 #include "semantic_model.hpp"
+#include "semantic_query_compiler.hpp"
 
 namespace duckdb {
 
@@ -45,6 +46,7 @@ public:
 		ResolveMembers();
 		CheckMemberCycles();
 		CheckMemberKinds();
+		ProbeSemanticModelTypes(context, *model);
 		return model;
 	}
 
@@ -402,7 +404,7 @@ private:
 	                            const string &what) {
 		if (analyzer.IsAggregate(expr)) {
 			auto home = analyzer.AggregateHome(expr.Cast<FunctionExpression>(), table, what);
-			if (home == table || !model->Reaches(home, table)) {
+			if (home == table || !model->Reaches(home, table) || model->Reaches(table, home)) {
 				Fail("%s cannot contain an aggregate over rows of logical table \"%s\"; only rows of tables with "
 				     "a higher granularity (that reference \"%s\") can be aggregated",
 				     what, model->tables[home].name, model->tables[table].name);
@@ -416,7 +418,7 @@ private:
 				vector<SemanticAtom> atoms;
 				analyzer.Decompose(*entry.resolved, entry.table, atoms, what);
 				for (auto &atom : atoms) {
-					if (atom.home == table || !model->Reaches(atom.home, table)) {
+					if (atom.home == table || !model->Reaches(atom.home, table) || model->Reaches(table, atom.home)) {
 						Fail("%s cannot reference metric \"%s\": its logical table must have a higher granularity "
 						     "than \"%s\"",
 						     what, model->MemberDisplayName(member), model->tables[table].name);

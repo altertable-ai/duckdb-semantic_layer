@@ -21,6 +21,7 @@ set(EXTENSION_SOURCES
     src/semantic_analysis.cpp
     src/semantic_model.cpp
     src/semantic_model_builder.cpp
+    src/semantic_query_compiler.cpp
     src/semantic_view_registry.cpp
     src/parser/semantic_views_parser.cpp)
 

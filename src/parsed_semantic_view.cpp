@@ -365,12 +365,14 @@ Value ParsedSemanticQuery::ItemsToValue() const {
 	auto item_type = ListType::GetChildType(ItemsType());
 	vector<Value> values;
 	for (auto &item : items) {
-		child_list_t<Value> fields;
-		fields.emplace_back("kind", Value(SemanticMemberKindToString(item.kind)));
-		fields.emplace_back("expr", item.expression ? Value(item.expression->ToString()) : Value());
-		fields.emplace_back("star_table", item.expression ? Value() : Value(item.star_table));
-		fields.emplace_back("alias", item.alias.empty() ? Value() : Value(item.alias));
-		values.push_back(Value::STRUCT(std::move(fields)));
+		// missing fields are empty strings (not NULL): the lowered SQL must keep its types when it is
+		// re-parsed from its textual form (e.g. statement verification, views)
+		vector<Value> fields;
+		fields.emplace_back(SemanticMemberKindToString(item.kind));
+		fields.emplace_back(item.expression ? item.expression->ToString() : string());
+		fields.emplace_back(item.expression ? string() : item.star_table);
+		fields.emplace_back(item.alias);
+		values.push_back(Value::STRUCT(item_type, std::move(fields)));
 	}
 	return Value::LIST(item_type, std::move(values));
 }
@@ -384,7 +386,7 @@ vector<ParsedSemanticQueryItem> ParsedSemanticQuery::ItemsFromValue(const Value 
 		auto &fields = StructValue::GetChildren(entry);
 		ParsedSemanticQueryItem item;
 		item.kind = SemanticMemberKindFromString(fields[0].ToString());
-		if (!fields[1].IsNull()) {
+		if (!fields[1].IsNull() && !StringValue::Get(fields[1]).empty()) {
 			auto expressions = Parser::ParseExpressionList(fields[1].ToString());
 			if (expressions.size() != 1) {
 				throw InternalException("semantic view query item did not round-trip: %s", fields[1].ToString());
@@ -394,7 +396,7 @@ vector<ParsedSemanticQueryItem> ParsedSemanticQuery::ItemsFromValue(const Value 
 			item.star_table = fields[2].ToString();
 		}
 		if (!fields[3].IsNull()) {
-			item.alias = fields[3].ToString();
+			item.alias = StringValue::Get(fields[3]);
 		}
 		result.push_back(std::move(item));
 	}
