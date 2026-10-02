@@ -22,6 +22,7 @@
 #include "duckdb/parser/tableref/joinref.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckdb/parser/tableref/table_function_ref.hpp"
+#include "semantic_analysis.hpp"
 #include "semantic_query_compiler.hpp"
 #include "semantic_view_registry.hpp"
 #include "semantic_views_parser.hpp"
@@ -277,6 +278,67 @@ static void ShowViews(ClientContext &context, TableFunctionBindInput &input, Row
 	}
 }
 
+//! Dimensions a window-function metric needs in the query (filled in by window metric support)
+static set<idx_t> RequiredWindowDimensions(const SemanticModel &model, idx_t metric) {
+	return set<idx_t>();
+}
+
+//! SHOW SEMANTIC DIMENSIONS IN <view> FOR METRIC <metric>: dimensions every aggregate of the metric can be grouped by
+static void ShowDimensionsForMetric(ClientContext &context, shared_ptr<SemanticModel> model, const string &metric_name,
+                                    const string &like, RowsFunctionData &result, vector<LogicalType> &return_types,
+                                    vector<string> &names) {
+	names = {"table_name", "name", "data_type", "required", "synonyms", "comment"};
+	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                LogicalType::VARCHAR, LogicalType::BOOLEAN,
+	                LogicalType::LIST(LogicalType::VARCHAR), LogicalType::VARCHAR};
+	auto parts = StringUtil::Split(metric_name, '.');
+	idx_t metric = DConstants::INVALID_INDEX;
+	for (idx_t m = 0; m < model->members.size(); m++) {
+		auto &member = model->members[m];
+		if (member.kind != SemanticMemberKind::METRIC) {
+			continue;
+		}
+		bool matches = parts.size() == 1 ? StringUtil::CIEquals(member.name, parts[0])
+		                                 : !member.IsDerived() &&
+		                                       StringUtil::CIEquals(model->tables[member.table].name, parts[0]) &&
+		                                       StringUtil::CIEquals(member.name, parts[1]);
+		if (matches) {
+			if (metric != DConstants::INVALID_INDEX) {
+				throw BinderException("Ambiguous metric name \"%s\"; qualify it with its logical table", metric_name);
+			}
+			metric = m;
+		}
+	}
+	if (metric == DConstants::INVALID_INDEX) {
+		throw BinderException("Unknown metric \"%s\" in semantic view \"%s\"", metric_name, model->name.name);
+	}
+	SemanticAnalyzer analyzer(*model, context);
+	vector<SemanticAtom> atoms;
+	auto &metric_member = model->members[metric];
+	analyzer.Decompose(*metric_member.resolved, metric_member.table, atoms, "Metric");
+	auto required = RequiredWindowDimensions(*model, metric);
+	for (idx_t d = 0; d < model->members.size(); d++) {
+		auto &dimension = model->members[d];
+		if (dimension.kind != SemanticMemberKind::DIMENSION) {
+			continue;
+		}
+		bool valid = true;
+		for (auto &atom : atoms) {
+			valid = valid && model->Reaches(atom.home, dimension.table);
+		}
+		if (!valid || (!like.empty() && !LikeMatch(dimension.name, like))) {
+			continue;
+		}
+		result.rows.push_back({Value(model->tables[dimension.table].name), Value(dimension.name),
+		                       dimension.type.id() == LogicalTypeId::UNKNOWN ? Value(LogicalType::VARCHAR)
+		                                                                     : Value(dimension.type.ToString()),
+		                       Value::BOOLEAN(required.count(d) > 0),
+		                       dimension.parsed.synonyms.empty() ? Value(LogicalType::LIST(LogicalType::VARCHAR))
+		                                                         : ListValue(dimension.parsed.synonyms),
+		                       OptionalString(dimension.parsed.comment)});
+	}
+}
+
 static void ShowMembers(ClientContext &context, TableFunctionBindInput &input, RowsFunctionData &result,
                         vector<LogicalType> &return_types, vector<string> &names, SemanticMemberKind kind) {
 	names = {"database_name", "schema_name", "semantic_view_name", "table_name",
@@ -292,8 +354,11 @@ static void ShowMembers(ClientContext &context, TableFunctionBindInput &input, R
 	auto &registry = GetState(input).registry;
 	auto view_name = NameArgs(input, 1);
 	auto like = StringArg(input, 4);
-	if (!StringArg(input, 5).empty()) {
-		throw NotImplementedException("SHOW SEMANTIC DIMENSIONS ... FOR METRIC is not supported yet");
+	auto for_metric = StringArg(input, 5);
+	if (!for_metric.empty()) {
+		ShowDimensionsForMetric(context, registry.GetOrThrow(context, view_name), for_metric, like, result,
+		                        return_types, names);
+		return;
 	}
 	vector<shared_ptr<SemanticModel>> models;
 	if (!view_name.name.empty()) {
