@@ -51,6 +51,12 @@ SELECT view_name, comment, internal, temporary FROM duckdb_views() WHERE view_na
 ----
 shop	shop model	false	false
 
+# the placeholder is marked with a tag
+query I
+SELECT tags FROM duckdb_views() WHERE view_name = 'shop';
+----
+{semantic_view=true}
+
 query II
 SELECT column_name, comment FROM duckdb_columns() WHERE table_name = 'shop' AND comment IS NOT NULL ORDER BY column_index;
 ----

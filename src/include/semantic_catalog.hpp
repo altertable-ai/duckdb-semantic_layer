@@ -26,6 +26,8 @@ struct SemanticViewsState;
 
 //! (catalog, schema, name): fails at bind time
 static constexpr const char *SEMANTIC_VIEW_PLACEHOLDER_FUNCTION = "__semantic_view_placeholder";
+//! Tag marking placeholder views (saved with them in database files, shown by duckdb_views())
+static constexpr const char *SEMANTIC_VIEW_PLACEHOLDER_TAG = "semantic_view";
 
 struct SemanticCatalogColumn {
 	string name;

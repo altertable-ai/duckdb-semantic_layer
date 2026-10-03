@@ -105,8 +105,8 @@ Every semantic view is also listed as a view of the same name in `information_sc
 `duckdb_views()` and `duckdb_columns()`, so BI tools and SQL clients discover it like any view. It has one column per
 public fact, dimension and metric (in that order), with the member's type and comment; a name shared by several
 members is qualified (`"orders.revenue"`), which the query-by-name form resolves. `DESCRIBE sales` shows those columns.
-The view is a placeholder: reading it as a plain table fails with a message pointing to `SEMANTIC_VIEW(...)` and
-`AGG(...)`.
+The view is a placeholder, tagged `semantic_view` (`duckdb_views().tags`): reading it as a plain table fails with a
+message pointing to `SEMANTIC_VIEW(...)` and `AGG(...)`.
 
 Semantic views therefore share the namespace of tables and views: creating one with the name of an existing table or
 view fails, and so does creating a table with the name of a semantic view.

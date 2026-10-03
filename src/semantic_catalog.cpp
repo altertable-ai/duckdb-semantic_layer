@@ -1,7 +1,6 @@
 #include "semantic_catalog.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
-#include "duckdb/catalog/catalog_entry/view_catalog_entry.hpp"
 #include "duckdb/catalog/entry_lookup_info.hpp"
 #include "duckdb/common/case_insensitive_map.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
@@ -122,6 +121,7 @@ static void CreatePlaceholder(ClientContext &context, const SemanticModel &model
 			info.column_comments_map[column.name] = column.comment;
 		}
 	}
+	info.tags[SEMANTIC_VIEW_PLACEHOLDER_TAG] = "true";
 	info.query = PlaceholderQuery(name);
 	catalog->CreateView(context, info);
 }
@@ -159,20 +159,7 @@ bool ApplySemanticViewChange(ClientContext &context, const QualifiedName &before
 }
 
 bool IsSemanticPlaceholder(const CatalogEntry &entry) {
-	if (entry.type != CatalogType::VIEW_ENTRY) {
-		return false;
-	}
-	auto &view = entry.Cast<ViewCatalogEntry>();
-	if (!view.query || view.query->node->type != QueryNodeType::SELECT_NODE) {
-		return false;
-	}
-	auto &node = view.query->node->Cast<SelectNode>();
-	if (!node.from_table || node.from_table->type != TableReferenceType::TABLE_FUNCTION) {
-		return false;
-	}
-	auto &function = node.from_table->Cast<TableFunctionRef>().function;
-	return function && function->GetExpressionClass() == ExpressionClass::FUNCTION &&
-	       StringUtil::CIEquals(function->Cast<FunctionExpression>().function_name, SEMANTIC_VIEW_PLACEHOLDER_FUNCTION);
+	return entry.type == CatalogType::VIEW_ENTRY && entry.tags.find(SEMANTIC_VIEW_PLACEHOLDER_TAG) != entry.tags.end();
 }
 
 unique_ptr<SelectNode> SemanticDescribeNode(const SemanticModel &model) {
