@@ -1,0 +1,10 @@
+# name: test/sql/semantic_views/load.test
+# description: the semantic_views extension loads
+# group: [semantic_views]
+
+require semantic_views
+
+query I
+SELECT extension_name FROM duckdb_extensions() WHERE extension_name = 'semantic_views' AND loaded;
+----
+semantic_views

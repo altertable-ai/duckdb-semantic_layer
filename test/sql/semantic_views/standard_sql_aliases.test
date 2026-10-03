@@ -1,0 +1,137 @@
+# name: test/sql/semantic_views/standard_sql_aliases.test
+# description: output alias and input column precedence in semantic SQL modifiers
+# group: [semantic_views]
+
+require semantic_views
+
+statement ok
+PRAGMA enable_verification
+
+statement ok
+CREATE TABLE alias_values (a INTEGER, b INTEGER);
+INSERT INTO alias_values VALUES (1, 20), (2, 10), (1, 5);
+CREATE SEMANTIC VIEW alias_view TABLES (t AS alias_values) DIMENSIONS (t.a AS a, t.b AS b) METRICS (t.n AS COUNT(*));
+
+# A bare modifier name refers to an explicit output alias first.
+query II
+SELECT a AS b, b AS z FROM alias_view ORDER BY b, z;
+----
+1	5
+1	20
+2	10
+
+# A view-qualified name can only refer to an input, never to an output alias.
+statement error
+SELECT a AS x FROM alias_view ORDER BY alias_view.x;
+----
+Unknown column or semantic expression "x"
+
+statement error
+SELECT a AS x FROM alias_view ORDER BY alias_view.x + 0;
+----
+Unknown column or semantic expression "x"
+
+statement error
+SELECT a AS x, AGG(n) FROM alias_view GROUP BY alias_view.x;
+----
+Unknown column or semantic expression "x"
+
+statement error
+SELECT a AS x, AGG(n) FROM alias_view GROUP BY a ORDER BY alias_view.x + 0;
+----
+Unknown column or semantic expression "x"
+
+# Repeated GROUP BY aliases also resolve to the last output expression.
+query III
+SELECT 0 AS x, b AS x, AGG(n) FROM alias_view GROUP BY x ORDER BY 2;
+----
+0	5	1
+0	10	1
+0	20	1
+
+# Inside an expression (or with qualification), input names take precedence.
+query II
+SELECT a AS b, b AS z FROM alias_view ORDER BY b + 0;
+----
+1	5
+2	10
+1	20
+
+query II
+SELECT a AS b, b AS z FROM alias_view ORDER BY alias_view.b;
+----
+1	5
+2	10
+1	20
+
+query II
+SELECT a AS b, b AS z FROM alias_view ORDER BY t.b;
+----
+1	5
+2	10
+1	20
+
+query II
+SELECT DISTINCT ON (b) a AS b, b AS z FROM alias_view ORDER BY z;
+----
+1	5
+2	10
+
+query II
+SELECT DISTINCT ON (b + 0) a AS b, b AS z FROM alias_view ORDER BY z;
+----
+1	5
+2	10
+1	20
+
+# Grouped queries obey the same ordering rules.
+query II
+SELECT a AS b, b AS z FROM alias_view GROUP BY a, b ORDER BY b, z;
+----
+1	5
+1	20
+2	10
+
+query II
+SELECT a AS b, AGG(n) AS n FROM alias_view GROUP BY a ORDER BY b;
+----
+1	2
+2	1
+
+statement error
+SELECT a AS b, AGG(n) AS n FROM alias_view GROUP BY a ORDER BY b + 0;
+----
+must appear in the GROUP BY clause
+
+statement error
+SELECT a AS b, AGG(n) AS n FROM alias_view GROUP BY a ORDER BY alias_view.b;
+----
+must appear in the GROUP BY clause
+
+# GROUP BY prefers an existing input name to a colliding output alias.
+statement error
+SELECT a AS b, AGG(n) FROM alias_view GROUP BY b;
+----
+must appear in the GROUP BY clause
+
+# Aliases that do not collide with inputs remain usable inside expressions.
+query II
+SELECT a AS x, b AS z FROM alias_view ORDER BY x * -1, z;
+----
+2	10
+1	5
+1	20
+
+query II
+SELECT a AS x, AGG(n) AS n FROM alias_view GROUP BY a ORDER BY x * -1;
+----
+2	1
+1	2
+
+# With repeated output aliases, DuckDB selects the last one in ORDER BY.
+query II
+SELECT a AS x, b AS x FROM alias_view ORDER BY x;
+----
+1	5
+2	10
+1	20

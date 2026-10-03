@@ -1,0 +1,157 @@
+# name: test/sql/semantic_views/range.test
+# description: range relationships (Snowflake my_events / my_time_periods example)
+# group: [semantic_views]
+
+require semantic_views
+
+statement ok
+PRAGMA enable_verification
+
+statement ok
+CREATE TABLE my_time_periods (time_period_id INTEGER PRIMARY KEY, time_period_name VARCHAR(50), start_time TIMESTAMP, end_time TIMESTAMP);
+
+statement ok
+INSERT INTO my_time_periods (time_period_id, time_period_name, start_time, end_time) VALUES
+  (1, 'Before_January', NULL, '2024-01-01 00:00:00'::TIMESTAMP),
+  (2, 'Early_January', '2024-01-01 00:00:00'::TIMESTAMP, '2024-01-15 00:00:00'::TIMESTAMP),
+  (3, 'Late_January', '2024-01-15 00:00:00'::TIMESTAMP, '2024-02-01 00:00:00'::TIMESTAMP),
+  (4, 'Early_February', '2024-02-01 00:00:00'::TIMESTAMP, '2024-02-15 00:00:00'::TIMESTAMP),
+  (5, 'Late_February', '2024-02-15 00:00:00'::TIMESTAMP, '2024-03-01 00:00:00'::TIMESTAMP),
+  (6, 'Early_March', '2024-03-01 00:00:00'::TIMESTAMP, '2024-03-20 00:00:00'::TIMESTAMP),
+  (7, 'After_March20', '2024-03-20 00:00:00'::TIMESTAMP, NULL);
+
+statement ok
+CREATE TABLE my_events (event_id INTEGER PRIMARY KEY, event_timestamp TIMESTAMP, event_name VARCHAR);
+
+statement ok
+INSERT INTO my_events (event_id, event_name, event_timestamp) VALUES
+  (1, 'Login', '2024-01-15 10:00:00'::TIMESTAMP),
+  (2, 'Purchase', '2024-01-15 14:30:00'::TIMESTAMP),
+  (3, 'Logout', '2024-01-15 18:45:00'::TIMESTAMP),
+  (4, 'Review', '2024-02-10 12:00:00'::TIMESTAMP),
+  (5, 'Support', '2024-02-20 09:30:00'::TIMESTAMP),
+  (6, 'Upgrade', '2024-03-05 16:00:00'::TIMESTAMP),
+  (7, 'Feedback', '2024-03-25 11:00:00'::TIMESTAMP);
+
+statement ok
+CREATE OR REPLACE SEMANTIC VIEW my_semantic_view_range_join
+  TABLES (
+    my_events PRIMARY KEY (event_id),
+    my_time_periods UNIQUE (start_time, end_time)
+      CONSTRAINT my_time_period_range DISTINCT RANGE BETWEEN start_time AND end_time EXCLUSIVE
+  )
+  RELATIONSHIPS (
+    my_time_periods_for_events AS
+      my_events(event_timestamp) REFERENCES
+        my_time_periods(BETWEEN start_time AND end_time EXCLUSIVE)
+  )
+  DIMENSIONS (
+    my_events.dim_event_name AS event_name,
+    my_events.dim_event_timestamp AS event_timestamp,
+    my_time_periods.dim_time_period_name AS time_period_name
+  )
+  METRICS (
+    my_events.m_event_count AS COUNT(*)
+  );
+
+query IIII
+SELECT
+    sv.dim_event_name,
+    sv.dim_event_timestamp,
+    sv.dim_time_period_name,
+    sv.m_event_count
+  FROM SEMANTIC_VIEW(
+    my_semantic_view_range_join
+    METRICS my_events.m_event_count
+    DIMENSIONS
+      my_events.dim_event_name,
+      my_events.dim_event_timestamp,
+      my_time_periods.dim_time_period_name
+  ) AS sv
+  ORDER BY
+    sv.dim_event_timestamp,
+    sv.dim_time_period_name;
+----
+Login	2024-01-15 10:00:00	Late_January	1
+Purchase	2024-01-15 14:30:00	Late_January	1
+Logout	2024-01-15 18:45:00	Late_January	1
+Review	2024-02-10 12:00:00	Early_February	1
+Support	2024-02-20 09:30:00	Late_February	1
+Upgrade	2024-03-05 16:00:00	Early_March	1
+Feedback	2024-03-25 11:00:00	After_March20	1
+
+# boundaries: start inclusive, end exclusive, open-ended first range
+statement ok
+INSERT INTO my_events VALUES (8, '2024-02-01 00:00:00', 'Boundary'), (9, '2023-06-01 00:00:00', 'Old');
+
+query II
+SELECT * FROM SEMANTIC_VIEW(my_semantic_view_range_join DIMENSIONS my_events.dim_event_name, my_time_periods.dim_time_period_name WHERE my_events.dim_event_name IN ('Boundary', 'Old')) ORDER BY 1;
+----
+Boundary	Early_February
+Old	Before_January
+
+query II
+SELECT * FROM SEMANTIC_VIEW(my_semantic_view_range_join DIMENSIONS my_time_periods.dim_time_period_name METRICS my_events.m_event_count) ORDER BY 1;
+----
+After_March20	1
+Before_January	1
+Early_February	2
+Early_March	1
+Late_February	1
+Late_January	3
+
+# events outside every range keep a NULL period
+statement ok
+CREATE TABLE short_periods (name VARCHAR, start_at TIMESTAMP, end_at TIMESTAMP);
+
+statement ok
+INSERT INTO short_periods VALUES ('first_half_of_january', '2024-01-01', '2024-01-15');
+
+statement ok
+CREATE SEMANTIC VIEW short_view
+  TABLES (e AS my_events PRIMARY KEY (event_id), p AS short_periods CONSTRAINT DISTINCT RANGE BETWEEN start_at AND end_at EXCLUSIVE)
+  RELATIONSHIPS (e (event_timestamp) REFERENCES p (BETWEEN start_at AND end_at EXCLUSIVE))
+  DIMENSIONS (p.period AS name)
+  METRICS (e.events AS COUNT(*));
+
+query II
+SELECT * FROM SEMANTIC_VIEW(short_view DIMENSIONS p.period METRICS e.events);
+----
+NULL	9
+
+statement error
+CREATE SEMANTIC VIEW no_constraint
+  TABLES (e AS my_events PRIMARY KEY (event_id), p AS short_periods)
+  RELATIONSHIPS (e (event_timestamp) REFERENCES p (BETWEEN start_at AND end_at EXCLUSIVE))
+  METRICS (e.events AS COUNT(*));
+----
+DISTINCT RANGE
+
+# NULL referencing values never match, even when both range bounds are open.
+statement ok
+CREATE TABLE all_time_periods (name VARCHAR, start_at TIMESTAMP, end_at TIMESTAMP);
+INSERT INTO all_time_periods VALUES ('all_time', NULL, NULL);
+CREATE TABLE nullable_events (id INTEGER, ts TIMESTAMP);
+INSERT INTO nullable_events VALUES (1, NULL), (2, '2024-01-01');
+CREATE SEMANTIC VIEW all_time_view
+  TABLES (e AS nullable_events, p AS all_time_periods CONSTRAINT DISTINCT RANGE BETWEEN start_at AND end_at EXCLUSIVE)
+  RELATIONSHIPS (e (ts) REFERENCES p (BETWEEN start_at AND end_at EXCLUSIVE))
+  DIMENSIONS (e.id AS id, p.period AS name)
+  METRICS (e.events AS COUNT(*));
+
+query III
+SELECT * FROM SEMANTIC_VIEW(all_time_view DIMENSIONS e.id, p.period METRICS e.events) ORDER BY id;
+----
+1	NULL	1
+2	all_time	1
+
+query II
+SELECT * FROM SEMANTIC_VIEW(all_time_view FACTS e.id, p.period) ORDER BY id;
+----
+1	NULL
+2	all_time
+
+query I
+SELECT * FROM SEMANTIC_VIEW(all_time_view METRICS e.events WHERE p.period = 'all_time');
+----
+1

@@ -1,0 +1,281 @@
+# name: test/sql/semantic_views/query_basic.test
+# description: SEMANTIC_VIEW(...) queries over one fact table and its many-to-one dimensions
+# group: [semantic_views]
+
+require semantic_views
+
+statement ok
+PRAGMA enable_verification
+
+statement ok
+CREATE TABLE regions (id INTEGER, name VARCHAR);
+INSERT INTO regions VALUES (1, 'EMEA'), (2, 'AMER');
+CREATE TABLE customers (id INTEGER, name VARCHAR, region_id INTEGER);
+INSERT INTO customers VALUES (1, 'Alice', 1), (2, 'Bob', 1), (3, 'Carol', 2), (4, 'Dan', NULL);
+CREATE TABLE orders (id INTEGER, customer_id INTEGER, amount DECIMAL(10, 2), order_date DATE, status VARCHAR);
+INSERT INTO orders VALUES (1, 1, 100, '2024-01-01', 'open'), (2, 1, 50, '2024-01-02', 'closed'), (3, 2, 200, '2024-02-01', 'open'), (4, 3, 10, '2024-02-15', 'open'), (5, 99, 7, '2024-03-01', 'open');
+CREATE TABLE line_items (order_id INTEGER, line_no INTEGER, qty INTEGER, price DECIMAL(10, 2));
+INSERT INTO line_items VALUES (1, 1, 2, 30), (1, 2, 1, 40), (2, 1, 5, 10), (3, 1, 1, 200), (3, 2, 1, 0);
+CREATE SEMANTIC VIEW shop
+  TABLES (
+    r AS regions PRIMARY KEY (id),
+    c AS customers PRIMARY KEY (id),
+    o AS orders PRIMARY KEY (id),
+    li AS line_items PRIMARY KEY (order_id, line_no)
+  )
+  RELATIONSHIPS (
+    customer_region AS c (region_id) REFERENCES r,
+    order_customer AS o (customer_id) REFERENCES c,
+    line_order AS li (order_id) REFERENCES o
+  )
+  FACTS (
+    li.line_total AS qty * price,
+    o.line_count AS COUNT(li.line_no)
+  )
+  DIMENSIONS (
+    r.region_name AS r.name,
+    c.customer_name AS c.name,
+    c.revenue_tier AS CASE WHEN o.revenue > 100 THEN 'big' ELSE 'small' END,
+    o.order_date AS order_date,
+    o.order_month AS DATE_TRUNC('month', order_date),
+    o.status AS status,
+    o.customer_region AS r.region_name,
+    li.line_number AS line_no
+  )
+  METRICS (
+    o.revenue AS SUM(amount),
+    o.order_count AS COUNT(*),
+    o.avg_lines AS AVG(o.line_count),
+    li.units AS SUM(qty),
+    li.line_revenue AS SUM(li.line_total),
+    c.customer_count AS COUNT(*),
+    c.avg_customer_revenue AS AVG(SUM(o.amount)),
+    PRIVATE o.secret AS MAX(amount),
+    revenue_per_customer AS o.revenue / c.customer_count,
+    avg_order AS o.revenue / o.order_count
+  );
+
+# a metric without dimensions
+query I
+SELECT * FROM SEMANTIC_VIEW(shop METRICS o.revenue);
+----
+367.00
+
+# grouped by a local dimension
+query III
+SELECT * FROM SEMANTIC_VIEW(shop DIMENSIONS o.status METRICS o.revenue, o.order_count) ORDER BY status;
+----
+closed	50.00	1
+open	317.00	4
+
+# grouped by a dimension two relationships away; the dangling foreign key (customer 99) keeps a NULL group
+query II
+SELECT * FROM SEMANTIC_VIEW(shop DIMENSIONS r.region_name METRICS o.revenue) ORDER BY region_name NULLS LAST;
+----
+AMER	10.00
+EMEA	350.00
+NULL	7.00
+
+query II
+SELECT r.name, SUM(o.amount) FROM orders o LEFT JOIN customers c ON o.customer_id = c.id LEFT JOIN regions r ON c.region_id = r.id GROUP BY 1 ORDER BY 1 NULLS LAST;
+----
+AMER	10.00
+EMEA	350.00
+NULL	7.00
+
+# a dimension defined through another table's dimension
+query II
+SELECT * FROM SEMANTIC_VIEW(shop DIMENSIONS o.customer_region METRICS o.order_count) ORDER BY 1 NULLS LAST;
+----
+AMER	1
+EMEA	3
+NULL	1
+
+# dimensions only: distinct values
+query I
+SELECT * FROM SEMANTIC_VIEW(shop DIMENSIONS c.customer_name) ORDER BY 1;
+----
+Alice
+Bob
+Carol
+Dan
+
+query II
+SELECT * FROM SEMANTIC_VIEW(shop DIMENSIONS c.customer_name, r.region_name) ORDER BY 1;
+----
+Alice	EMEA
+Bob	EMEA
+Carol	AMER
+Dan	NULL
+
+# output columns use unqualified names, follow clause order, and honor aliases (AS optional)
+query II
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM SEMANTIC_VIEW(shop METRICS o.revenue AS rev DIMENSIONS o.status s));
+----
+rev	DECIMAL(38,2)
+s	VARCHAR
+
+query II
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM SEMANTIC_VIEW(shop DIMENSIONS o.status METRICS o.revenue, o.order_count));
+----
+status	VARCHAR
+revenue	DECIMAL(38,2)
+order_count	BIGINT
+
+# ad-hoc dimension expressions
+query III
+SELECT * FROM SEMANTIC_VIEW(shop DIMENSIONS YEAR(o.order_date) AS y, MONTH(o.order_month) AS m METRICS o.order_count) ORDER BY m;
+----
+2024	1	2
+2024	2	2
+2024	3	1
+
+# bare member names resolve when unambiguous
+query II
+SELECT * FROM SEMANTIC_VIEW(shop DIMENSIONS status METRICS revenue) ORDER BY 1;
+----
+closed	50.00
+open	317.00
+
+# WHERE filters rows before aggregation, on dimensions of related tables
+query II
+SELECT * FROM SEMANTIC_VIEW(shop DIMENSIONS o.status METRICS o.revenue WHERE r.region_name = 'EMEA') ORDER BY 1;
+----
+closed	50.00
+open	300.00
+
+# WHERE on a fact
+query I
+SELECT * FROM SEMANTIC_VIEW(shop METRICS li.units WHERE li.line_total > 20);
+----
+9
+
+# uncorrelated subquery in WHERE
+query I
+SELECT * FROM SEMANTIC_VIEW(shop METRICS o.revenue WHERE o.status IN (SELECT 'closed'));
+----
+50.00
+
+# wildcard
+query I
+SELECT * FROM SEMANTIC_VIEW(shop DIMENSIONS r.*) ORDER BY 1;
+----
+AMER
+EMEA
+
+# the result composes with the rest of the query
+query II
+SELECT s.status, s.revenue * 2 FROM SEMANTIC_VIEW(shop DIMENSIONS o.status METRICS o.revenue) AS s JOIN (VALUES ('open')) v(x) ON s.status = v.x;
+----
+open	634.00
+
+query I
+WITH t AS (SELECT * FROM SEMANTIC_VIEW(shop DIMENSIONS o.status METRICS o.revenue)) SELECT count(*) FROM t;
+----
+2
+
+statement ok
+CREATE TABLE revenue_by_status AS SELECT * FROM SEMANTIC_VIEW(shop DIMENSIONS o.status METRICS o.revenue);
+
+query II
+SELECT * FROM revenue_by_status ORDER BY 1;
+----
+closed	50.00
+open	317.00
+
+statement ok
+EXPLAIN SELECT * FROM SEMANTIC_VIEW(shop DIMENSIONS o.status METRICS o.revenue);
+
+statement ok
+PREPARE p AS SELECT revenue FROM SEMANTIC_VIEW(shop DIMENSIONS o.status METRICS o.revenue) WHERE status = $1;
+
+query I
+EXECUTE p('open');
+----
+317.00
+
+# member types are reported once the view is created
+query II
+SELECT name, data_type FROM (SHOW SEMANTIC METRICS IN shop) WHERE name IN ('revenue', 'order_count', 'avg_order') ORDER BY name;
+----
+avg_order	DOUBLE
+order_count	BIGINT
+revenue	DECIMAL(38,2)
+
+query II
+SELECT name, data_type FROM (SHOW SEMANTIC DIMENSIONS IN shop) WHERE name IN ('order_month', 'customer_region') ORDER BY name;
+----
+customer_region	VARCHAR
+order_month	TIMESTAMP
+
+# errors
+statement error
+SELECT * FROM SEMANTIC_VIEW(nope METRICS o.revenue);
+----
+Semantic view with name "nope" does not exist
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(shop METRICS o.secret);
+----
+PRIVATE
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(shop METRICS o.nope);
+----
+Unknown column or semantic expression "o.nope"
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(shop DIMENSIONS o.revenue);
+----
+Invalid dimension
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(shop METRICS o.status);
+----
+must aggregate
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(shop DIMENSIONS c.customer_name, c.customer_name);
+----
+Duplicate output column name "customer_name"
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(shop METRICS o.revenue WHERE o.revenue > 10);
+----
+WHERE
+
+# a clause without items, or a trailing comma, is a syntax error
+statement error
+SELECT * FROM SEMANTIC_VIEW(shop DIMENSIONS o.status METRICS);
+----
+METRICS requires at least one item
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(shop DIMENSIONS o.status, METRICS o.revenue);
+----
+DIMENSIONS requires at least one item
+
+# DuckDB views can wrap semantic queries
+statement ok
+CREATE VIEW v_rev AS SELECT * FROM SEMANTIC_VIEW(shop DIMENSIONS o.status METRICS o.revenue);
+
+query II
+SELECT * FROM v_rev ORDER BY 1;
+----
+closed	50.00
+open	317.00
+
+# a view with quoted identifiers
+statement ok
+CREATE TABLE "Order Lines" ("Line Id" INTEGER, "Amount" DOUBLE);
+
+statement ok
+INSERT INTO "Order Lines" VALUES (1, 1.5), (2, 2.5);
+
+statement ok
+CREATE SEMANTIC VIEW "Mixed Case" TABLES ("Lines" AS "Order Lines" PRIMARY KEY ("Line Id")) DIMENSIONS ("Lines"."Line Id" AS "Line Id") METRICS ("Lines"."Total Amount" AS SUM("Amount"));
+
+query I
+SELECT "Total Amount" FROM SEMANTIC_VIEW("Mixed Case" METRICS "Lines"."Total Amount");
+----
+4.0
