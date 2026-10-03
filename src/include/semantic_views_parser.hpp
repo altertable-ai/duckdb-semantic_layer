@@ -14,6 +14,7 @@
 #include "duckdb/parser/parser_extension.hpp"
 #include "duckdb/parser/parser_options.hpp"
 #include "duckdb/parser/sql_statement.hpp"
+#include "duckdb/planner/extension_callback.hpp"
 #include "duckdb/planner/operator_extension.hpp"
 #include "parsed_semantic_view.hpp"
 
@@ -64,9 +65,47 @@ struct SemanticViewsPendingBind {
 	static unique_ptr<SQLStatement> Take(ClientContext &context);
 };
 
+struct SemanticViewsState;
+
+//! Lets DuckDB bind a copy of every statement first: when that fails, OnPlanningError receives the untouched
+//! statement, rewrites `SELECT ... FROM <semantic view>` queries in place and asks for a rebind.
+class SemanticViewsRebindState : public ClientContextState {
+public:
+	explicit SemanticViewsRebindState(shared_ptr<SemanticViewsState> state_p) : state(std::move(state_p)) {
+	}
+	bool CanRequestRebind() override {
+		return true;
+	}
+	RebindQueryInfo OnPlanningError(ClientContext &context, SQLStatement &statement, ErrorData &error) override;
+
+	static constexpr const char *KEY = "semantic_views_rebind";
+	static void Register(ClientContext &context, shared_ptr<SemanticViewsState> state);
+
+private:
+	shared_ptr<SemanticViewsState> state;
+};
+
+class SemanticViewsConnectionCallback : public ExtensionCallback {
+public:
+	explicit SemanticViewsConnectionCallback(shared_ptr<SemanticViewsState> state_p) : state(std::move(state_p)) {
+	}
+	void OnConnectionOpened(ClientContext &context) override {
+		SemanticViewsRebindState::Register(context, state);
+	}
+
+private:
+	shared_ptr<SemanticViewsState> state;
+};
+
+struct SemanticViewsOperatorInfo : public OperatorExtensionInfo {
+	explicit SemanticViewsOperatorInfo(shared_ptr<SemanticViewsState> state_p) : state(std::move(state_p)) {
+	}
+	shared_ptr<SemanticViewsState> state;
+};
+
 class SemanticViewsOperatorExtension : public OperatorExtension {
 public:
-	SemanticViewsOperatorExtension();
+	explicit SemanticViewsOperatorExtension(shared_ptr<SemanticViewsState> state);
 
 	std::string GetName() override {
 		return "semantic_views";

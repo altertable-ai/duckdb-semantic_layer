@@ -16,7 +16,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	auto &db_config = DBConfig::GetConfig(loader.GetDatabaseInstance());
 	ParserExtension::Register(db_config, SemanticViewsParserExtension());
-	OperatorExtension::Register(db_config, make_shared_ptr<SemanticViewsOperatorExtension>());
+	OperatorExtension::Register(db_config, make_shared_ptr<SemanticViewsOperatorExtension>(state));
+	ExtensionCallback::Register(db_config, make_shared_ptr<SemanticViewsConnectionCallback>(state));
 }
 
 void SemanticViewsExtension::Load(ExtensionLoader &loader) {

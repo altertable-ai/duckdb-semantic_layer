@@ -24,6 +24,7 @@
 #include "duckdb/parser/tableref/table_function_ref.hpp"
 #include "semantic_analysis.hpp"
 #include "semantic_query_compiler.hpp"
+#include "semantic_sql_rewrite.hpp"
 #include "semantic_view_registry.hpp"
 #include "semantic_views_parser.hpp"
 
@@ -620,6 +621,7 @@ static unique_ptr<FunctionData> SemanticViewSqlBind(ClientContext &context, Tabl
 	SemanticQueryExpander expander(context, GetState(input));
 	auto result = make_uniq<RowsFunctionData>();
 	for (auto &statement : statements) {
+		RewriteSemanticViewReferences(context, GetState(input), *statement);
 		if (statement->type == StatementType::SELECT_STATEMENT) {
 			expander.Node(*statement->Cast<SelectStatement>().node);
 		}
