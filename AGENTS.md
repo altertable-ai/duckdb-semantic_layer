@@ -6,7 +6,8 @@ Instructions for AI agents working in this repository.
 
 - DuckDB extension implementing Snowflake-compatible semantic views
   (`CREATE SEMANTIC VIEW`, `SEMANTIC_VIEW(...)` queries, `SHOW` / `DESCRIBE`).
-- Design: `docs/superpowers/specs/2026-10-03-semantic-views-design.md`.
+- Design overview: `README.md` ("How it works"). Local design notes and plans go in `docs/superpowers/`
+  (git-ignored, like `.superpowers/` and `.cache/`).
 - Parsing uses a vendored copy of DuckDB's PEG parser (`third_party/duckdb_peg_parser`, namespace
   `duckdb::semantic_views_peg`), reached through `parse_function` when the postgres parser fails.
 - Semantic queries are expanded at bind time into plain DuckDB SQL ASTs (no custom operators).
