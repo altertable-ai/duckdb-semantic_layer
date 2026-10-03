@@ -2,31 +2,16 @@
 
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/entry_lookup_info.hpp"
-#include "duckdb/common/case_insensitive_map.hpp"
-#include "duckdb/common/exception.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/to_string.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
-#include "duckdb/parser/expression/star_expression.hpp"
-#include "duckdb/parser/expression/subquery_expression.hpp"
-#include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
-#include "duckdb/parser/query_node/set_operation_node.hpp"
 #include "duckdb/parser/result_modifier.hpp"
-#include "duckdb/parser/statement/create_statement.hpp"
-#include "duckdb/parser/statement/explain_statement.hpp"
-#include "duckdb/parser/statement/insert_statement.hpp"
-#include "duckdb/parser/statement/prepare_statement.hpp"
-#include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
-#include "duckdb/parser/tableref/joinref.hpp"
-#include "duckdb/parser/tableref/showref.hpp"
-#include "duckdb/parser/tableref/subqueryref.hpp"
-#include "duckdb/parser/tableref/table_function_ref.hpp"
 #include "semantic_analysis.hpp"
 #include "semantic_lowering.hpp"
 #include "semantic_statement_visitor.hpp"
@@ -36,15 +21,11 @@ namespace duckdb {
 
 namespace {
 
-bool ContainsWindowFunction(const ParsedExpression &expr) {
-	return SemanticAnalyzer::ContainsWindow(expr);
-}
-
 //! Rewrites one `SELECT ... FROM <semantic view>` query node
 class StandardFormRewriter {
 public:
 	StandardFormRewriter(ClientContext &context, const SemanticModel &model, const BaseTableRef &ref)
-	    : context(context), model(model), analyzer(model, context), ref(ref) {
+	    : model(model), analyzer(model, context), ref(ref) {
 		query.view.catalog = ref.catalog_name;
 		query.view.schema = ref.schema_name;
 		query.view.name = ref.table_name;
@@ -144,7 +125,8 @@ public:
 		node.having = nullptr;
 		node.groups = GroupByNode();
 		node.aggregate_handling = AggregateHandling::STANDARD_HANDLING;
-		node.from_table = MakeTableFunction();
+		node.from_table = SemanticLowering::Query(query);
+		node.from_table->alias = "__sv_std";
 	}
 
 private:
@@ -200,7 +182,7 @@ private:
 	}
 
 	void CheckNoWindow(const ParsedExpression &expr) {
-		if (ContainsWindowFunction(expr)) {
+		if (SemanticAnalyzer::ContainsWindow(expr)) {
 			throw BinderException("Window functions are not supported when querying semantic view \"%s\" by name; "
 			                      "define a window function metric instead",
 			                      model.Name().name);
@@ -352,13 +334,6 @@ private:
 		return original_text[index];
 	}
 
-	unique_ptr<TableRef> MakeTableFunction() {
-		auto result = SemanticLowering::Query(query);
-		result->alias = "__sv_std";
-		return result;
-	}
-
-	ClientContext &context;
 	const SemanticModel &model;
 	SemanticAnalyzer analyzer;
 	const BaseTableRef &ref;

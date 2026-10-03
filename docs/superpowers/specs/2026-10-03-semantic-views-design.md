@@ -79,31 +79,38 @@ The grammar for **all** phases lands in Phase 1; features scheduled for a later 
 SQL text
   │  postgres parser fails (CREATE SEMANTIC VIEW / SEMANTIC_VIEW( / SHOW SEMANTIC ...)
   ▼
-SemanticViewsParserExtension::ParseFunction           (src/parser/semantic_views_parser.cpp)
-  │  token pre-filter, then vendored PEG parser + custom grammar/transformers
+parser extension (src/semantic_views_binding.cpp)
+  │  token pre-filter, then SemanticViewsParser: vendored PEG parser + custom grammar/transformers
   ▼
-native SQLStatement (SelectStatement over internal table functions)
-  │  stashed in PendingBind, plan_function throws, OperatorExtension::Bind rebinds it
+native SQLStatement (SelectStatement over internal table functions, semantic_lowering.hpp)
+  │  stashed in a ClientContextState, plan_function throws, OperatorExtension::Bind binds it
   ▼
 Binder
-  ├── __semantic_view_ddl(kind, args...)          bind → validate + mutate registry → result rows
-  ├── __semantic_view_show(kind, args...)         bind → snapshot registry → result rows
-  └── __semantic_view_query(name, items, where)   bind_replace → SemanticQueryCompiler → SubqueryRef
-                                                  (plain DuckDB SELECT: scans, LEFT JOINs, GROUP BY, ...)
+  ├── __semantic_view_create / _drop / _rename / _set_comment   bind → validate; scan → mutate registry
+  ├── __semantic_view_describe / _show_views / _show_members / _show_dimensions_for_metric
+  │                                                              bind → snapshot registry → rows
+  └── __semantic_view_query(<serialized ParsedSemanticQuery>)    bind_replace → SemanticQueryCompiler
+                                                                 → SubqueryRef (plain DuckDB SELECT)
+
+SELECT ... FROM <semantic view> (standard SQL): binding fails → SemanticViewsRebindState::OnPlanningError
+rewrites the query node onto __semantic_view_query (semantic_sql_rewrite.cpp) and asks for a rebind.
 ```
 
-Units (each one file pair, testable on its own):
+Units:
 
 | Unit | Responsibility | Depends on |
 |---|---|---|
-| `third_party/duckdb_peg_parser` | vendored PEG parser; `custom/` grammar + transformers; `patches/` | DuckDB headers |
-| `semantic_views_parser` | ParserExtension (parse/plan), PendingBind, token pre-filter, OperatorExtension | PEG parser |
-| `parsed_semantic_view` | `ParsedSemanticView` (definition AST) + `ToSQL()` canonical DDL; `ParsedSemanticQuery` + `ToValue()/FromValue()` | DuckDB parser types |
-| `semantic_view_registry` | thread-safe in-memory map `(catalog, schema, name) → shared_ptr<const SemanticModel>` | model |
-| `semantic_model` | validated, resolved model: tables, relationship graph, members with resolved references, types | parsed def, Binder |
-| `semantic_model_builder` | parsed definition → `SemanticModel` (name resolution, graph checks, binding probe) | catalog, Binder |
-| `semantic_query_compiler` | `SemanticModel` + query spec → `unique_ptr<QueryNode>` | model |
-| `semantic_views_functions` | internal table functions: ddl/show/describe/query/sql | all above |
+| `third_party/duckdb_peg_parser` | vendored PEG parser; `custom/` grammar + per-rule transformers; `patches/` | DuckDB headers |
+| `semantic_views_parser` | SQL text → lowered statements (PEG parser), semantic-syntax pre-filter | PEG parser |
+| `semantic_views_binding` | parser extension, pending-bind handoff, operator extension, rebind state | parser, rewrite |
+| `parsed_semantic_view` | `ParsedSemanticView` / `ParsedSemanticQuery` (serializable parse results) | DuckDB parser types |
+| `semantic_lowering` | internal table function names, argument layouts, BLOB payload encode/decode | parsed types |
+| `semantic_view_registry` | thread-safe in-memory map `(catalog, schema, name) → shared_ptr<SemanticModel>` | model |
+| `semantic_model` / `_builder` | validated, resolved, immutable model: tables, relationship graph, members, types | parsed def, Binder |
+| `semantic_analysis` | grain analysis: row tables, aggregate homes, metric decomposition into atoms | model |
+| `semantic_query_compiler` (+ `semantic_join_scope`) | model + query spec → SELECT statement | model, analysis |
+| `semantic_sql_rewrite` (+ `semantic_statement_visitor`) | standard-SQL queries over a view by name | compiler inputs |
+| `semantic_{ddl,show,query}_functions` | the internal table functions | all above |
 
 ### 3.1 Parser integration
 
@@ -118,8 +125,9 @@ Units (each one file pair, testable on its own):
   - `InnerTableRef` gets `SemanticViewRef` as its first alternative:
     `('SEMANTIC_VIEW' / 'SEMANTIC' 'VIEW') Parens(SemanticViewQueryBody) TableAlias?`.
   - Clause keywords (`DIMENSIONS`, `METRICS`, `FACTS`, `RELATIONSHIPS`, `TABLES`, ...) are **not**
-    reserved; aliases inside the clause use a negative lookahead `!SemanticClauseKeyword Identifier`
-    so `DIMENSIONS a.b METRICS c.d` never parses `METRICS` as an alias.
+    reserved. The PEG matcher ignores negative lookaheads, so the `SEMANTIC_VIEW(...)` body is parsed
+    as a flat sequence of pieces and a small state machine in the transformer tells clause keywords,
+    items and bare aliases apart.
 - `ParseFunction` is only reached when postgres fails. Cheap pre-filter: lowercase text contains
   `semantic`; token scan confirms `SEMANTIC_VIEW (`, `SEMANTIC VIEW`, `SHOW SEMANTIC`,
   `DESCRIBE|DESC SEMANTIC`, `DROP SEMANTIC`, `ALTER SEMANTIC`, `CREATE ... SEMANTIC VIEW`.
@@ -135,23 +143,21 @@ Units (each one file pair, testable on its own):
 The PEG transformers produce only self-contained constant arguments, so lowered ASTs survive
 `PREPARE`, views and macros:
 
-- DDL → `SELECT * FROM __semantic_view_ddl('create', '<canonical DDL text>', or_replace, if_not_exists)`
-  etc. The canonical DDL text is `ParsedSemanticView::ToSQL()` (expressions rendered with
-  `ParsedExpression::ToString()`); the ddl function re-parses it through
-  `SemanticViewParser::ParseDefinition()` (PEG, definition rule only). The same text is what
-  `DESCRIBE` reports as the definition.
-- Query → `__semantic_view_query('<view name>', <items LIST(STRUCT(kind, expr, alias))>, '<where sql>')`
-  wrapped in a `TableFunctionRef` carrying the user's table alias. `kind ∈ {dimension, metric, fact}`;
-  `expr`/`where` are SQL text re-parsed with `Parser::ParseExpressionList` at bind.
+- Each statement lowers to `SELECT * FROM __semantic_view_<operation>(<constant arguments>)`.
+  Definitions (`ParsedSemanticView`) and queries (`ParsedSemanticQuery`) travel as BLOB arguments
+  serialized with DuckDB's `BinarySerializer`, so expressions keep their exact AST (no SQL text
+  round trip). `SHOW ... LIKE 'p'` lowers to a `name ILIKE 'p'` filter around the SHOW function.
+- `SEMANTIC_VIEW(...)` lowers to a `TableFunctionRef` over `__semantic_view_query(<payload>)`
+  carrying the user's table alias.
 
 ### 3.3 Registry
 
 `SemanticViewRegistry` lives in the extension's shared state (one per `DatabaseInstance`), keyed by
 lower-cased `(catalog, schema, name)`; unqualified names resolve against the client's default
 catalog/schema (`ClientData::catalog_search_path`). Not transactional: a `CREATE` inside a
-transaction that is rolled back stays registered (documented). Entries are immutable
-`shared_ptr<const SemanticModel>`; replace = pointer swap under a mutex, so concurrent queries keep
-the version they bound against.
+transaction that is rolled back stays registered (documented). Models are immutable;
+ALTER builds a new model from the edited definition and swaps it in under the mutex only if the
+view is still the one it was built from, so concurrent queries keep the version they bound against.
 
 ## 4. DDL grammar (accepted surface)
 

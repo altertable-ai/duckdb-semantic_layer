@@ -114,17 +114,21 @@ static unique_ptr<FunctionData> SemanticDropBind(ClientContext &context, TableFu
 struct SemanticAlterData : public SemanticDDLData {
 	using SemanticDDLData::SemanticDDLData;
 	bool if_exists;
-	//! null when the view does not exist
+	//! The view as found at bind time, and its altered version; null when the view does not exist
+	shared_ptr<SemanticModel> existing;
 	shared_ptr<SemanticModel> model;
 
 	string Execute() const override {
-		if (model && state->registry.Replace(name, model)) {
-			return "Statement executed successfully.";
+		if (!existing) {
+			if (if_exists) {
+				return "Statement executed successfully.";
+			}
+			throw CatalogException("Semantic view with name \"%s\" does not exist!", name.name);
 		}
-		if (if_exists) {
-			return "Statement executed successfully.";
+		if (!state->registry.Replace(*existing, model)) {
+			throw CatalogException("Semantic view \"%s\" was dropped or altered by a concurrent statement", name.name);
 		}
-		throw CatalogException("Semantic view with name \"%s\" does not exist!", name.name);
+		return "Statement executed successfully.";
 	}
 };
 
@@ -136,12 +140,12 @@ static unique_ptr<FunctionData> SemanticAlterBind(ClientContext &context, TableF
 	auto result =
 	    make_uniq<SemanticAlterData>(state, SemanticViewRegistry::ResolveDDLName(context, NameArguments(input, 0)));
 	result->if_exists = BooleanValue::Get(input.inputs[3]);
-	auto existing = state->registry.Get(result->name);
-	if (existing) {
-		auto definition = existing->definition->Copy();
+	result->existing = state->registry.Get(result->name);
+	if (result->existing) {
+		auto definition = result->existing->definition->Copy();
 		edit(*definition);
 		result->model = BuildSemanticModel(context, *definition, definition->name);
-		result->model->created_on = existing->created_on;
+		result->model->created_on = result->existing->created_on;
 	}
 	return std::move(result);
 }

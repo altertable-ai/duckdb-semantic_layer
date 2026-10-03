@@ -23,6 +23,38 @@ namespace duckdb {
 
 namespace {
 
+//! A cycle of the directed graph (`next[node]`: the targets of node's edges), as the nodes along it with the first
+//! node repeated at the end; empty when the graph is acyclic
+vector<idx_t> FindCycle(const vector<vector<idx_t>> &next) {
+	enum class Mark : uint8_t { UNVISITED, ON_PATH, DONE };
+	vector<Mark> marks(next.size(), Mark::UNVISITED);
+	vector<idx_t> path;
+	vector<idx_t> cycle;
+	std::function<bool(idx_t)> visit = [&](idx_t node) {
+		marks[node] = Mark::ON_PATH;
+		path.push_back(node);
+		for (auto target : next[node]) {
+			if (marks[target] == Mark::ON_PATH) {
+				cycle.assign(std::find(path.begin(), path.end(), target), path.end());
+				cycle.push_back(target);
+				return true;
+			}
+			if (marks[target] == Mark::UNVISITED && visit(target)) {
+				return true;
+			}
+		}
+		path.pop_back();
+		marks[node] = Mark::DONE;
+		return false;
+	};
+	for (idx_t node = 0; node < next.size(); node++) {
+		if (marks[node] == Mark::UNVISITED && visit(node)) {
+			break;
+		}
+	}
+	return cycle;
+}
+
 class SemanticModelBuilder {
 public:
 	SemanticModelBuilder(ClientContext &context, const ParsedSemanticView &parsed, const QualifiedName &name)
@@ -201,12 +233,6 @@ private:
 				} else {
 					rel.to_columns = ResolveColumns(to, parsed.to_columns, "Relationship");
 					rel.asof_index = parsed.asof_index;
-					vector<string> key_columns;
-					for (idx_t i = 0; i < rel.to_columns.size(); i++) {
-						if (i != rel.asof_index) {
-							key_columns.push_back(rel.to_columns[i]);
-						}
-					}
 					if (rel.asof_index == DConstants::INVALID_INDEX && !to.IsKey(rel.to_columns)) {
 						Fail("Relationship \"%s\": referenced columns (%s) of logical table \"%s\" must be the "
 						     "PRIMARY KEY or a UNIQUE key",
@@ -237,35 +263,13 @@ private:
 			}
 		}
 		// no circular relationships (declared direction)
-		vector<int> state(table_count, 0);
-		vector<idx_t> stack;
-		std::function<void(idx_t)> visit = [&](idx_t node) {
-			state[node] = 1;
-			stack.push_back(node);
-			for (auto next : declared[node]) {
-				if (state[next] == 1) {
-					vector<string> cycle;
-					bool in_cycle = false;
-					for (auto entry : stack) {
-						in_cycle = in_cycle || entry == next;
-						if (in_cycle) {
-							cycle.push_back(model->tables[entry].name);
-						}
-					}
-					cycle.push_back(model->tables[next].name);
-					Fail("Relationships form a circular path: %s", StringUtil::Join(cycle, " -> "));
-				}
-				if (state[next] == 0) {
-					visit(next);
-				}
+		auto cycle = FindCycle(declared);
+		if (!cycle.empty()) {
+			vector<string> names;
+			for (auto table : cycle) {
+				names.push_back(model->tables[table].name);
 			}
-			stack.pop_back();
-			state[node] = 2;
-		};
-		for (idx_t t = 0; t < table_count; t++) {
-			if (state[t] == 0) {
-				visit(t);
-			}
+			Fail("Relationships form a circular path: %s", StringUtil::Join(names, " -> "));
 		}
 		// count simple paths (capped at 2)
 		model->path_count.assign(table_count, vector<idx_t>(table_count, 0));
@@ -392,35 +396,13 @@ private:
 		for (idx_t m = 0; m < count; m++) {
 			CollectMemberRefs(*model->members[m].resolved, deps[m]);
 		}
-		vector<int> state(count, 0);
-		vector<idx_t> stack;
-		std::function<void(idx_t)> visit = [&](idx_t node) {
-			state[node] = 1;
-			stack.push_back(node);
-			for (auto next : deps[node]) {
-				if (state[next] == 1) {
-					vector<string> cycle;
-					bool in_cycle = false;
-					for (auto entry : stack) {
-						in_cycle = in_cycle || entry == next;
-						if (in_cycle) {
-							cycle.push_back(model->MemberDisplayName(entry));
-						}
-					}
-					cycle.push_back(model->MemberDisplayName(next));
-					Fail("Circular reference between semantic expressions: %s", StringUtil::Join(cycle, " -> "));
-				}
-				if (state[next] == 0) {
-					visit(next);
-				}
+		auto cycle = FindCycle(deps);
+		if (!cycle.empty()) {
+			vector<string> names;
+			for (auto member : cycle) {
+				names.push_back(model->MemberDisplayName(member));
 			}
-			stack.pop_back();
-			state[node] = 2;
-		};
-		for (idx_t m = 0; m < count; m++) {
-			if (state[m] == 0) {
-				visit(m);
-			}
+			Fail("Circular reference between semantic expressions: %s", StringUtil::Join(names, " -> "));
 		}
 	}
 

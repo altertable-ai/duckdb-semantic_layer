@@ -62,3 +62,11 @@ statement error
 ALTER SEMANTIC VIEW missing SET COMMENT = 'x';
 ----
 Semantic view with name "missing" does not exist
+
+# two ALTERs bound by the same statement: the second one was built from the view as it was before the first one ran,
+# so it must not overwrite it (no lost update)
+statement error
+SELECT * FROM __semantic_view_rename('', '', 'renamed', false, 'renamed_again'),
+              __semantic_view_set_comment('', '', 'renamed', false, 'first');
+----
+was dropped or altered by a concurrent statement

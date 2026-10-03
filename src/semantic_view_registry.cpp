@@ -72,11 +72,12 @@ bool SemanticViewRegistry::Drop(const QualifiedName &name) {
 	return views.erase(Key(name)) > 0;
 }
 
-bool SemanticViewRegistry::Replace(const QualifiedName &name, shared_ptr<SemanticModel> model) {
+bool SemanticViewRegistry::Replace(const SemanticModel &expected, shared_ptr<SemanticModel> model) {
 	lock_guard<mutex> guard(lock);
-	auto old_key = Key(name);
+	auto old_key = Key(expected.Name());
 	auto new_key = Key(model->Name());
-	if (views.find(old_key) == views.end()) {
+	auto current = views.find(old_key);
+	if (current == views.end() || current->second.get() != &expected) {
 		return false;
 	}
 	if (new_key != old_key && views.find(new_key) != views.end()) {
