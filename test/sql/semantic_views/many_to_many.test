@@ -283,3 +283,28 @@ query I
 SELECT sql ILIKE '%SELECT DISTINCT%book_authors%' FROM semantic_view_sql('SELECT * FROM SEMANTIC_VIEW(library DIMENSIONS authors.country METRICS books.total_pages)');
 ----
 true
+
+# the metric's table reaches the bridge's anchor through a many-to-one relationship (chapters -> books)
+statement ok
+CREATE TABLE chapters (chapter_id INTEGER, book_id INTEGER);
+INSERT INTO chapters VALUES (1, 1), (2, 1), (3, 2), (4, 4);
+
+statement ok
+CREATE SEMANTIC VIEW library_chapters
+  TABLES (authors PRIMARY KEY (author_id), books PRIMARY KEY (book_id), book_authors PRIMARY KEY (book_id, author_id), chapters PRIMARY KEY (chapter_id))
+  RELATIONSHIPS (book_authors (author_id) REFERENCES authors, book_authors (book_id) REFERENCES books, chapters (book_id) REFERENCES books)
+  DIMENSIONS (authors.country AS country, chapters.chapter_no AS chapter_id)
+  METRICS (chapters.chapter_count AS COUNT(*));
+
+query II
+SELECT * FROM SEMANTIC_VIEW(library_chapters DIMENSIONS authors.country METRICS chapters.chapter_count) ORDER BY 1 NULLS LAST;
+----
+FR	3
+US	1
+NULL	1
+
+# the bridge does not reach chapters: one dimension cannot combine both
+statement error
+SELECT * FROM SEMANTIC_VIEW(library_chapters DIMENSIONS chapters.chapter_no || authors.country AS x METRICS chapters.chapter_count);
+----
+combines tables that the many-to-many bridge "book_authors" does not relate

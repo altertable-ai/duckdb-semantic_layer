@@ -113,17 +113,6 @@ static unique_ptr<FunctionData> ShowMembersBind(ClientContext &context, TableFun
 //===--------------------------------------------------------------------===//
 // SHOW SEMANTIC DIMENSIONS IN view FOR METRIC m: dimensions every aggregate of the metric can be grouped by
 //===--------------------------------------------------------------------===//
-//! Whether `table` is reachable from `home` through a single, unambiguous many-to-many bridge
-static bool ReachesThroughBridge(const SemanticModel &model, idx_t home, idx_t table,
-                                 const vector<idx_t> &using_relationships) {
-	SemanticBridge bridge;
-	try {
-		return SemanticBridgeResolver(model).Resolve(home, {table}, using_relationships, bridge);
-	} catch (BinderException &) {
-		return false;
-	}
-}
-
 static unique_ptr<FunctionData> ShowForMetricBind(ClientContext &context, TableFunctionBindInput &input,
                                                   vector<LogicalType> &return_types, vector<string> &names) {
 	names = {"table_name", "name", "data_type", "required", "synonyms", "comment"};
@@ -150,6 +139,8 @@ static unique_ptr<FunctionData> ShowForMetricBind(ClientContext &context, TableF
 	// dimensions used by window clauses must be part of the query
 	set<idx_t> required;
 	analyzer.WindowDimensions(*SemanticMarkers::Member(ref.index), required);
+	// dimensions reached through a single, unambiguous many-to-many bridge are available too
+	SemanticBridgeResolver resolver(*model);
 	auto result = make_uniq<RowsFunctionData>();
 	for (idx_t d = 0; d < model->members.size(); d++) {
 		auto &dimension = model->members[d];
@@ -158,9 +149,9 @@ static unique_ptr<FunctionData> ShowForMetricBind(ClientContext &context, TableF
 		}
 		bool valid = true;
 		for (auto &atom : atoms) {
-			valid =
-			    valid && (model->Reaches(atom.home, dimension.table) ||
-			              ReachesThroughBridge(*model, atom.home, dimension.table, atom.context.using_relationships));
+			valid = valid &&
+			        (model->Reaches(atom.home, dimension.table) ||
+			         resolver.Candidates(atom.home, {dimension.table}, atom.context.using_relationships).size() == 1);
 		}
 		if (valid) {
 			result->rows.push_back({TableName(*model, dimension), Value(dimension.Name()), TypeName(dimension),

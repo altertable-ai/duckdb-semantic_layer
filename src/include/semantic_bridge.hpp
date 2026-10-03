@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/common/set.hpp"
 #include "semantic_model.hpp"
 
@@ -37,10 +38,14 @@ class SemanticBridgeResolver {
 public:
 	explicit SemanticBridgeResolver(const SemanticModel &model);
 
-	//! The bridge through which rows of `home` relate to every table of `tables` (some of which `home` does not
-	//! reach). Returns false when there is none; throws a BinderException when several bridges qualify.
-	bool Resolve(idx_t home, const set<idx_t> &tables, const vector<idx_t> &using_relationships,
-	             SemanticBridge &result) const;
+	//! Every bridge through which rows of `home` relate to all tables of `tables` (some of which `home` does not
+	//! reach). A USING relationship starting from one of them narrows the choice to it.
+	vector<SemanticBridge> Candidates(idx_t home, const set<idx_t> &tables,
+	                                  const vector<idx_t> &using_relationships) const;
+	//! The only candidate; otherwise throws a BinderException (prefixed with `what`) naming the table no bridge
+	//! reaches, the competing bridges, or the bridges the tables need (followed by `hint`)
+	SemanticBridge Resolve(idx_t home, const set<idx_t> &tables, const vector<idx_t> &using_relationships,
+	                       const string &what, const string &hint) const;
 	//! A table outside `tables` that reaches all of them through diverging paths (the base of a dimension-only
 	//! query across a bridge); INVALID_INDEX when there is none, throws when several qualify
 	idx_t CommonBase(const set<idx_t> &tables) const;
@@ -50,7 +55,10 @@ private:
 	                  SemanticBridge &result) const;
 	bool PathFrom(idx_t from, idx_t to, const vector<idx_t> &using_relationships, vector<SemanticEdge> &path) const;
 	bool IsSpecialJoin(const SemanticEdge &edge) const;
-	string TableList(const vector<idx_t> &tables) const;
+	template <class TABLES>
+	string TableList(const TABLES &tables) const;
+	BinderException AmbiguityError(idx_t home, const vector<idx_t> &far_tables,
+	                               const vector<SemanticBridge> &candidates) const;
 
 	const SemanticModel &model;
 };

@@ -10,16 +10,8 @@ SemanticBridgeResolver::SemanticBridgeResolver(const SemanticModel &model) : mod
 
 bool SemanticBridgeResolver::PathFrom(idx_t from, idx_t to, const vector<idx_t> &using_relationships,
                                       vector<SemanticEdge> &path) const {
-	if (!model.Reaches(from, to)) {
-		return false;
-	}
-	try {
-		path = model.Path(from, to, using_relationships);
-		return true;
-	} catch (BinderException &) {
-		// several paths, or none allowed by USING: not a usable bridge
-		return false;
-	}
+	// several paths, or none allowed by USING: not a usable bridge
+	return model.TryPath(from, to, using_relationships, path) == SemanticPathResult::FOUND;
 }
 
 bool SemanticBridgeResolver::IsSpecialJoin(const SemanticEdge &edge) const {
@@ -31,7 +23,8 @@ static bool SameEdge(const SemanticEdge &a, const SemanticEdge &b) {
 	return a.relationship == b.relationship && a.reversed == b.reversed;
 }
 
-string SemanticBridgeResolver::TableList(const vector<idx_t> &tables) const {
+template <class TABLES>
+string SemanticBridgeResolver::TableList(const TABLES &tables) const {
 	vector<string> names;
 	for (auto table : tables) {
 		names.push_back("\"" + model.tables[table].name + "\"");
@@ -91,8 +84,8 @@ bool SemanticBridgeResolver::TryCandidate(idx_t home, idx_t bridge, const set<id
 	return true;
 }
 
-bool SemanticBridgeResolver::Resolve(idx_t home, const set<idx_t> &tables, const vector<idx_t> &using_relationships,
-                                     SemanticBridge &result) const {
+vector<SemanticBridge> SemanticBridgeResolver::Candidates(idx_t home, const set<idx_t> &tables,
+                                                          const vector<idx_t> &using_relationships) const {
 	vector<SemanticBridge> candidates;
 	for (idx_t bridge = 0; bridge < model.tables.size(); bridge++) {
 		SemanticBridge candidate;
@@ -112,29 +105,61 @@ bool SemanticBridgeResolver::Resolve(idx_t home, const set<idx_t> &tables, const
 			}
 		}
 		if (!pinned.empty()) {
-			candidates = std::move(pinned);
+			return pinned;
 		}
 	}
-	if (candidates.empty()) {
-		return false;
+	return candidates;
+}
+
+BinderException SemanticBridgeResolver::AmbiguityError(idx_t home, const vector<idx_t> &far_tables,
+                                                       const vector<SemanticBridge> &candidates) const {
+	vector<idx_t> bridges;
+	for (auto &candidate : candidates) {
+		bridges.push_back(candidate.bridge);
 	}
+	return BinderException("Ambiguous many-to-many path from \"%s\" to %s: bridge tables %s both qualify; specify "
+	                       "USING (...) on the metric",
+	                       model.tables[home].name, TableList(far_tables), TableList(bridges));
+}
+
+SemanticBridge SemanticBridgeResolver::Resolve(idx_t home, const set<idx_t> &tables,
+                                               const vector<idx_t> &using_relationships, const string &what,
+                                               const string &hint) const {
+	auto candidates = Candidates(home, tables, using_relationships);
+	if (candidates.size() == 1) {
+		return std::move(candidates[0]);
+	}
+	vector<idx_t> far_tables;
+	for (auto table : tables) {
+		if (!model.Reaches(home, table)) {
+			far_tables.push_back(table);
+		}
+	}
+	D_ASSERT(!far_tables.empty());
 	if (candidates.size() > 1) {
-		vector<idx_t> far_tables;
-		for (auto table : tables) {
-			if (!model.Reaches(home, table)) {
-				far_tables.push_back(table);
-			}
-		}
-		vector<idx_t> bridges;
-		for (auto &candidate : candidates) {
-			bridges.push_back(candidate.bridge);
-		}
-		throw BinderException("Ambiguous many-to-many path from \"%s\" to %s: bridge tables %s both qualify; specify "
-		                      "USING (...) on the metric",
-		                      model.tables[home].name, TableList(far_tables), TableList(bridges));
+		throw AmbiguityError(home, far_tables, candidates);
 	}
-	result = std::move(candidates[0]);
-	return true;
+	// no single bridge relates all the tables: find the table without any, else the bridges the tables need
+	set<idx_t> bridges;
+	for (auto table : far_tables) {
+		auto single = Candidates(home, {table}, using_relationships);
+		if (single.empty()) {
+			throw BinderException("Invalid dimension specified: The dimension entity '%s' must be related to and have "
+			                      "an equal or lower level of granularity compared to the base metric or dimension "
+			                      "entity '%s'.",
+			                      model.tables[table].name, model.tables[home].name);
+		}
+		if (single.size() > 1) {
+			throw AmbiguityError(home, {table}, single);
+		}
+		bridges.insert(single[0].bridge);
+	}
+	if (bridges.size() == 1) {
+		throw BinderException("%s: combines tables that the many-to-many bridge %s does not relate%s", what,
+		                      TableList(bridges), hint);
+	}
+	throw BinderException("%s: combines tables reached through different many-to-many bridges (%s)%s", what,
+	                      TableList(bridges), hint);
 }
 
 idx_t SemanticBridgeResolver::CommonBase(const set<idx_t> &tables) const {

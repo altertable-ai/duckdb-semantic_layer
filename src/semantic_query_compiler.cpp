@@ -306,14 +306,16 @@ private:
 		vector<BridgeGroup> bridges;
 		vector<idx_t> dimension_bridge;
 		for (auto *dimension : dimensions) {
-			dimension_bridge.push_back(PlaceRowItem(block, *dimension->resolved, ItemWhat(*dimension), false, bridges));
+			dimension_bridge.push_back(
+			    PlaceRowItem(block, *dimension->resolved, ItemWhat(*dimension), string(), bridges));
 		}
 		vector<unique_ptr<ParsedExpression>> local_conjuncts;
 		if (spec.where) {
 			vector<const ParsedExpression *> conjuncts;
 			SplitConjuncts(*spec.where, conjuncts);
 			for (auto *conjunct : conjuncts) {
-				auto bridge = PlaceRowItem(block, *conjunct, "Invalid WHERE clause", true, bridges);
+				auto bridge = PlaceRowItem(block, *conjunct, "Invalid WHERE clause",
+				                           "; split it into separate conditions combined with AND", bridges);
 				if (bridge == DConstants::INVALID_INDEX) {
 					local_conjuncts.push_back(conjunct->Copy());
 				} else {
@@ -418,47 +420,20 @@ private:
 		return aggregate;
 	}
 
-	BinderException GranularityError(idx_t table, idx_t home) const {
-		return BinderException("Invalid dimension specified: The dimension entity '%s' must be related to and have an "
-		                       "equal or lower level of granularity compared to the base metric or dimension entity "
-		                       "'%s'.",
-		                       model.tables[table].name, model.tables[home].name);
-	}
-
 	//! Where a row-level item of the query is evaluated for `block`: INVALID_INDEX for the block's own rows (every
 	//! table it reads is reachable from the home table), else the index of its bridge group in `bridges`
-	idx_t PlaceRowItem(const Block &block, const ParsedExpression &expr, const string &what, bool is_condition,
+	idx_t PlaceRowItem(const Block &block, const ParsedExpression &expr, const string &what, const string &hint,
 	                   vector<BridgeGroup> &bridges) {
 		set<idx_t> tables;
 		analyzer.RowTables(expr, DConstants::INVALID_INDEX, tables, what);
-		vector<idx_t> far_tables;
+		bool local = true;
 		for (auto table : tables) {
-			if (!model.Reaches(block.home, table)) {
-				far_tables.push_back(table);
-			}
+			local = local && model.Reaches(block.home, table);
 		}
-		if (far_tables.empty()) {
+		if (local) {
 			return DConstants::INVALID_INDEX;
 		}
-		SemanticBridge bridge;
-		if (!resolver.Resolve(block.home, tables, block.using_relationships, bridge)) {
-			// every far table may still have its own bridge: the item mixes several of them
-			set<idx_t> bridge_tables;
-			for (auto table : far_tables) {
-				SemanticBridge single;
-				if (!resolver.Resolve(block.home, {table}, block.using_relationships, single)) {
-					throw GranularityError(table, block.home);
-				}
-				bridge_tables.insert(single.bridge);
-			}
-			vector<string> names;
-			for (auto table : bridge_tables) {
-				names.push_back("\"" + model.tables[table].name + "\"");
-			}
-			throw BinderException("%s: combines tables reached through different many-to-many bridges (%s)%s", what,
-			                      StringUtil::Join(names, ", "),
-			                      is_condition ? "; split it into separate conditions combined with AND" : "");
-		}
+		auto bridge = resolver.Resolve(block.home, tables, block.using_relationships, what, hint);
 		for (idx_t b = 0; b < bridges.size(); b++) {
 			if (bridges[b].bridge.SameAs(bridge)) {
 				return b;

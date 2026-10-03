@@ -107,14 +107,14 @@ optional_idx SemanticModel::FinestTable(const set<idx_t> &tables) const {
 	return optional_idx();
 }
 
-vector<SemanticEdge> SemanticModel::Path(idx_t from, idx_t to, const vector<idx_t> &using_relationships) const {
+SemanticPathResult SemanticModel::TryPath(idx_t from, idx_t to, const vector<idx_t> &using_relationships,
+                                          vector<SemanticEdge> &result) const {
+	result.clear();
 	if (from == to) {
-		return {};
+		return SemanticPathResult::FOUND;
 	}
 	if (path_count[from][to] == 0) {
-		throw BinderException("Semantic view \"%s\": logical table \"%s\" is not reachable from \"%s\" through "
-		                      "many-to-one relationships",
-		                      Name().name, tables[to].name, tables[from].name);
+		return SemanticPathResult::UNREACHABLE;
 	}
 	// an edge is allowed unless its target is the target of a USING relationship and it is not one of them
 	auto allowed = [&](const SemanticEdge &edge) {
@@ -152,16 +152,34 @@ vector<SemanticEdge> SemanticModel::Path(idx_t from, idx_t to, const vector<idx_
 	};
 	dfs(from);
 	if (found.empty()) {
+		return SemanticPathResult::EXCLUDED_BY_USING;
+	}
+	if (found.size() > 1) {
+		return SemanticPathResult::AMBIGUOUS;
+	}
+	result = std::move(found[0]);
+	return SemanticPathResult::FOUND;
+}
+
+vector<SemanticEdge> SemanticModel::Path(idx_t from, idx_t to, const vector<idx_t> &using_relationships) const {
+	vector<SemanticEdge> path;
+	switch (TryPath(from, to, using_relationships, path)) {
+	case SemanticPathResult::FOUND:
+		return path;
+	case SemanticPathResult::UNREACHABLE:
+		throw BinderException("Semantic view \"%s\": logical table \"%s\" is not reachable from \"%s\" through "
+		                      "many-to-one relationships",
+		                      Name().name, tables[to].name, tables[from].name);
+	case SemanticPathResult::EXCLUDED_BY_USING:
 		throw BinderException("Semantic view \"%s\": the USING relationships of the metric do not connect \"%s\" to "
 		                      "\"%s\"",
 		                      Name().name, tables[from].name, tables[to].name);
-	}
-	if (found.size() > 1) {
+	case SemanticPathResult::AMBIGUOUS:
 		throw BinderException("Semantic view \"%s\": multiple relationship paths from \"%s\" to \"%s\"; specify "
 		                      "USING (<relationship>) on the metric to choose one",
 		                      Name().name, tables[from].name, tables[to].name);
 	}
-	return found[0];
+	throw InternalException("unknown SemanticPathResult");
 }
 
 //===--------------------------------------------------------------------===//
