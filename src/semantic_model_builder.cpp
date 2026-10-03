@@ -201,52 +201,62 @@ private:
 			}
 			rel.from_columns = ResolveColumns(from, parsed.from_columns, "Relationship");
 			if (parsed.is_range) {
-				rel.is_range = true;
-				rel.range_start = ResolveColumn(to, parsed.range_start, "Relationship");
-				rel.range_end = ResolveColumn(to, parsed.range_end, "Relationship");
-				if (rel.from_columns.size() != 1) {
-					Fail("Relationship \"%s\": a range relationship takes exactly one column", rel.name);
-				}
-				bool has_constraint = false;
-				for (auto &range : to.range_constraints) {
-					if (StringUtil::CIEquals(range.start_column, rel.range_start) &&
-					    StringUtil::CIEquals(range.end_column, rel.range_end)) {
-						has_constraint = true;
-					}
-				}
-				if (!has_constraint) {
-					Fail("Relationship \"%s\": logical table \"%s\" needs a CONSTRAINT ... DISTINCT RANGE BETWEEN %s "
-					     "AND %s EXCLUSIVE",
-					     rel.name, to.name, rel.range_start, rel.range_end);
-				}
+				ResolveRangeReference(parsed, rel);
 			} else {
-				if (parsed.to_columns.empty()) {
-					if (!to.primary_key.empty()) {
-						rel.to_columns = to.primary_key;
-					} else if (to.unique_keys.size() == 1) {
-						rel.to_columns = to.unique_keys[0];
-					} else {
-						Fail("Relationship \"%s\": logical table \"%s\" has no PRIMARY KEY or single UNIQUE key; "
-						     "specify the referenced columns",
-						     rel.name, to.name);
-					}
-				} else {
-					rel.to_columns = ResolveColumns(to, parsed.to_columns, "Relationship");
-					rel.asof_index = parsed.asof_index;
-					if (rel.asof_index == DConstants::INVALID_INDEX && !to.IsKey(rel.to_columns)) {
-						Fail("Relationship \"%s\": referenced columns (%s) of logical table \"%s\" must be the "
-						     "PRIMARY KEY or a UNIQUE key",
-						     rel.name, StringUtil::Join(rel.to_columns, ", "), to.name);
-					}
-				}
-				if (rel.from_columns.size() != rel.to_columns.size()) {
-					Fail("Relationship \"%s\": column count mismatch between %s (%d) and %s (%d)", rel.name, from.name,
-					     rel.from_columns.size(), to.name, rel.to_columns.size());
-				}
+				ResolveKeyReference(parsed, rel);
 			}
 			rel.one_to_one =
 			    !rel.is_range && rel.asof_index == DConstants::INVALID_INDEX && from.IsKey(rel.from_columns);
 			model->relationships.push_back(std::move(rel));
+		}
+	}
+
+	//! REFERENCES t (BETWEEN start AND end EXCLUSIVE): needs a matching DISTINCT RANGE constraint on t
+	void ResolveRangeReference(const ParsedSemanticRelationship &parsed, SemanticRelationship &rel) {
+		auto &to = model->tables[rel.to_table];
+		rel.is_range = true;
+		rel.range_start = ResolveColumn(to, parsed.range_start, "Relationship");
+		rel.range_end = ResolveColumn(to, parsed.range_end, "Relationship");
+		if (rel.from_columns.size() != 1) {
+			Fail("Relationship \"%s\": a range relationship takes exactly one column", rel.name);
+		}
+		for (auto &range : to.range_constraints) {
+			if (StringUtil::CIEquals(range.start_column, rel.range_start) &&
+			    StringUtil::CIEquals(range.end_column, rel.range_end)) {
+				return;
+			}
+		}
+		Fail("Relationship \"%s\": logical table \"%s\" needs a CONSTRAINT ... DISTINCT RANGE BETWEEN %s AND %s "
+		     "EXCLUSIVE",
+		     rel.name, to.name, rel.range_start, rel.range_end);
+	}
+
+	//! REFERENCES t [(columns)]: the referenced columns default to t's key and must be a key unless ASOF
+	void ResolveKeyReference(const ParsedSemanticRelationship &parsed, SemanticRelationship &rel) {
+		auto &from = model->tables[rel.from_table];
+		auto &to = model->tables[rel.to_table];
+		if (parsed.to_columns.empty()) {
+			if (!to.primary_key.empty()) {
+				rel.to_columns = to.primary_key;
+			} else if (to.unique_keys.size() == 1) {
+				rel.to_columns = to.unique_keys[0];
+			} else {
+				Fail("Relationship \"%s\": logical table \"%s\" has no PRIMARY KEY or single UNIQUE key; specify the "
+				     "referenced columns",
+				     rel.name, to.name);
+			}
+		} else {
+			rel.to_columns = ResolveColumns(to, parsed.to_columns, "Relationship");
+			rel.asof_index = parsed.asof_index;
+			if (rel.asof_index == DConstants::INVALID_INDEX && !to.IsKey(rel.to_columns)) {
+				Fail("Relationship \"%s\": referenced columns (%s) of logical table \"%s\" must be the PRIMARY KEY or "
+				     "a UNIQUE key",
+				     rel.name, StringUtil::Join(rel.to_columns, ", "), to.name);
+			}
+		}
+		if (rel.from_columns.size() != rel.to_columns.size()) {
+			Fail("Relationship \"%s\": column count mismatch between %s (%d) and %s (%d)", rel.name, from.name,
+			     rel.from_columns.size(), to.name, rel.to_columns.size());
 		}
 	}
 
@@ -441,65 +451,77 @@ private:
 	void CheckMemberKinds() {
 		SemanticAnalyzer analyzer(*model, context);
 		for (idx_t m = 0; m < model->members.size(); m++) {
-			auto &member = model->members[m];
 			auto what = What(m);
-			// window-function metrics cannot be used by other semantic expressions
-			vector<idx_t> references;
-			CollectMemberRefs(*member.resolved, references);
-			for (auto reference : references) {
-				auto &target = model->members[reference];
-				if (target.Kind() == SemanticMemberKind::METRIC && SemanticAnalyzer::ContainsWindow(*target.resolved)) {
-					Fail("%s cannot reference window function metric \"%s\"", what,
-					     model->MemberDisplayName(reference));
+			CheckNoWindowMetricReferences(m, what);
+			if (model->members[m].IsRowLevel()) {
+				CheckRowLevelMember(analyzer, m, what);
+			} else {
+				CheckMetric(analyzer, m, what);
+			}
+		}
+	}
+
+	//! Window-function metrics cannot be used by other semantic expressions
+	void CheckNoWindowMetricReferences(idx_t member, const string &what) {
+		vector<idx_t> references;
+		CollectMemberRefs(*model->members[member].resolved, references);
+		for (auto reference : references) {
+			auto &target = model->members[reference];
+			if (target.Kind() == SemanticMemberKind::METRIC && SemanticAnalyzer::ContainsWindow(*target.resolved)) {
+				Fail("%s cannot reference window function metric \"%s\"", what, model->MemberDisplayName(reference));
+			}
+		}
+	}
+
+	//! Facts and dimensions read their own table and the tables it references
+	void CheckRowLevelMember(SemanticAnalyzer &analyzer, idx_t m, const string &what) {
+		auto &member = model->members[m];
+		CheckChildAggregations(analyzer, *member.resolved, member.table, what);
+		set<idx_t> tables;
+		analyzer.RowTables(*member.resolved, member.table, tables, what);
+		for (auto table : tables) {
+			if (!model->Reaches(member.table, table)) {
+				Fail("%s references logical table \"%s\", which is not reachable from \"%s\" through many-to-one "
+				     "relationships",
+				     what, model->tables[table].name, model->tables[member.table].name);
+			}
+		}
+	}
+
+	void CheckMetric(SemanticAnalyzer &analyzer, idx_t m, const string &what) {
+		auto &member = model->members[m];
+		if (SemanticAnalyzer::ContainsWindow(*member.resolved)) {
+			set<idx_t> dimensions;
+			analyzer.WindowDimensions(*member.resolved, dimensions);
+			for (auto dimension : dimensions) {
+				if (!member.IsDerived() && !model->Reaches(member.table, model->members[dimension].table)) {
+					Fail("%s: window dimension \"%s\" is not accessible from logical table \"%s\"", what,
+					     model->MemberDisplayName(dimension), model->tables[member.table].name);
 				}
 			}
-			if (member.Kind() == SemanticMemberKind::METRIC && SemanticAnalyzer::ContainsWindow(*member.resolved)) {
-				set<idx_t> dimensions;
-				analyzer.WindowDimensions(*member.resolved, dimensions);
-				for (auto dimension : dimensions) {
-					auto table = model->members[dimension].table;
-					if (!member.IsDerived() && !model->Reaches(member.table, table)) {
-						Fail("%s: window dimension \"%s\" is not accessible from logical table \"%s\"", what,
-						     model->MemberDisplayName(dimension), model->tables[member.table].name);
-					}
+		}
+		if (!analyzer.ContainsAggregateOrMetric(*member.resolved)) {
+			Fail("%s must use an aggregate function", what);
+		}
+		for (auto &entry : member.non_additive) {
+			set<idx_t> tables;
+			analyzer.RowTables(*entry.resolved, DConstants::INVALID_INDEX, tables, what + " NON ADDITIVE BY");
+			for (auto table : tables) {
+				if (member.IsDerived() || !model->Reaches(member.table, table)) {
+					Fail("%s: NON ADDITIVE BY dimensions must belong to its logical table or tables it references",
+					     what);
 				}
 			}
-			if (member.IsRowLevel()) {
-				CheckChildAggregations(analyzer, *member.resolved, member.table, what);
-				set<idx_t> tables;
-				analyzer.RowTables(*member.resolved, member.table, tables, what);
-				for (auto table : tables) {
-					if (!model->Reaches(member.table, table)) {
-						Fail("%s references logical table \"%s\", which is not reachable from \"%s\" through "
-						     "many-to-one relationships",
-						     what, model->tables[table].name, model->tables[member.table].name);
-					}
-				}
-				continue;
-			}
-			if (!analyzer.ContainsAggregateOrMetric(*member.resolved)) {
-				Fail("%s must use an aggregate function", what);
-			}
-			for (auto &entry : member.non_additive) {
-				set<idx_t> tables;
-				analyzer.RowTables(*entry.resolved, DConstants::INVALID_INDEX, tables, what + " NON ADDITIVE BY");
-				for (auto table : tables) {
-					if (member.IsDerived() || !model->Reaches(member.table, table)) {
-						Fail("%s: NON ADDITIVE BY dimensions must belong to its logical table or tables it references",
-						     what);
-					}
-				}
-			}
-			vector<SemanticAtom> atoms;
-			analyzer.DecomposeMetric(m, atoms, what);
-			if (member.IsDerived()) {
-				continue;
-			}
-			for (auto &atom : atoms) {
-				if (!model->Reaches(atom.home, member.table) && !model->Reaches(member.table, atom.home)) {
-					Fail("%s aggregates rows of logical table \"%s\", which is not related to \"%s\"", what,
-					     model->tables[atom.home].name, model->tables[member.table].name);
-				}
+		}
+		vector<SemanticAtom> atoms;
+		analyzer.DecomposeMetric(m, atoms, what);
+		if (member.IsDerived()) {
+			return;
+		}
+		for (auto &atom : atoms) {
+			if (!model->Reaches(atom.home, member.table) && !model->Reaches(member.table, atom.home)) {
+				Fail("%s aggregates rows of logical table \"%s\", which is not related to \"%s\"", what,
+				     model->tables[atom.home].name, model->tables[member.table].name);
 			}
 		}
 	}

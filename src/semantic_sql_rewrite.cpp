@@ -13,6 +13,7 @@
 #include "duckdb/parser/result_modifier.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
 #include "semantic_analysis.hpp"
+#include "semantic_ast_helpers.hpp"
 #include "semantic_lowering.hpp"
 #include "semantic_statement_visitor.hpp"
 #include "semantic_view_registry.hpp"
@@ -32,96 +33,17 @@ public:
 	}
 
 	void Rewrite(SelectNode &node) {
-		if (node.qualify) {
-			throw BinderException("QUALIFY is not supported when querying semantic view \"%s\" by name",
-			                      model.Name().name);
+		CheckSupported(node);
+		auto orders = OrderExpressions(node);
+		NormalizeClauses(node, orders);
+		CollectGroups(node);
+		auto aggregated = HasAggregation(orders);
+		// the items of the semantic query are registered in this order: groups, select list, HAVING, ORDER BY
+		node.select_list = aggregated ? AggregatedSelect() : FactSelect();
+		node.where_clause = aggregated && having ? Replace(*having, true) : nullptr;
+		for (auto order : orders) {
+			*order = aggregated ? Replace(**order, true) : MapToFacts(**order);
 		}
-		for (auto &expr : node.select_list) {
-			if (expr->GetExpressionClass() == ExpressionClass::STAR) {
-				throw BinderException("SELECT * is not supported when querying semantic view \"%s\" by name: list "
-				                      "dimensions and facts, and metrics with AGG(...)",
-				                      model.Name().name);
-			}
-		}
-		// normalized copies of every clause
-		for (auto &expr : node.select_list) {
-			select.push_back(Normalize(*expr));
-			select.back()->alias = expr->alias;
-			select_aliases.push_back(expr->alias);
-			original_text.push_back(expr->ToString());
-		}
-		auto having = node.having ? Normalize(*node.having) : nullptr;
-		auto where = node.where_clause ? Normalize(*node.where_clause) : nullptr;
-		for (auto &modifier : node.modifiers) {
-			if (modifier->type == ResultModifierType::ORDER_MODIFIER) {
-				for (auto &order : modifier->Cast<OrderModifier>().orders) {
-					order.expression = Normalize(*order.expression);
-				}
-			}
-		}
-		for (auto &expr : select) {
-			CheckNoWindow(*expr);
-		}
-		if (having) {
-			CheckNoWindow(*having);
-		}
-
-		// GROUP BY expressions (ordinals and select aliases resolve to select items)
-		if (node.aggregate_handling == AggregateHandling::FORCE_AGGREGATES) {
-			for (auto &expr : select) {
-				if (!ContainsAggregate(*expr)) {
-					groups.push_back(WithoutAlias(*expr));
-				}
-			}
-		} else {
-			for (auto &group : node.groups.group_expressions) {
-				groups.push_back(ResolveGroup(*group));
-			}
-		}
-		bool has_aggregation = !groups.empty() || (having && ContainsAggregate(*having));
-		for (auto &expr : select) {
-			has_aggregation = has_aggregation || ContainsAggregate(*expr);
-		}
-		for (auto &modifier : node.modifiers) {
-			if (modifier->type == ResultModifierType::ORDER_MODIFIER) {
-				for (auto &order : modifier->Cast<OrderModifier>().orders) {
-					has_aggregation = has_aggregation || ContainsAggregate(*order.expression);
-				}
-			}
-		}
-
-		vector<unique_ptr<ParsedExpression>> outer_select;
-		if (has_aggregation) {
-			for (idx_t g = 0; g < groups.size(); g++) {
-				CheckNotMetric(*groups[g]);
-				AddItem(SemanticMemberKind::DIMENSION, groups[g]->Copy(), GroupColumn(g));
-			}
-			for (idx_t i = 0; i < select.size(); i++) {
-				auto expr = Replace(*select[i], false);
-				expr->alias = OutputName(i);
-				outer_select.push_back(std::move(expr));
-			}
-			node.where_clause = having ? Replace(*having, true) : nullptr;
-		} else {
-			for (idx_t i = 0; i < select.size(); i++) {
-				CheckNotMetric(*select[i]);
-				AddItem(SemanticMemberKind::FACT, WithoutAlias(*select[i]), FactColumn(i));
-				auto expr = make_uniq<ColumnRefExpression>(FactColumn(i));
-				expr->alias = OutputName(i);
-				outer_select.push_back(std::move(expr));
-			}
-			node.where_clause = nullptr;
-		}
-		for (auto &modifier : node.modifiers) {
-			if (modifier->type == ResultModifierType::ORDER_MODIFIER) {
-				for (auto &order : modifier->Cast<OrderModifier>().orders) {
-					order.expression =
-					    has_aggregation ? Replace(*order.expression, true) : MapToFacts(*order.expression);
-				}
-			}
-		}
-		query.where = std::move(where);
-		node.select_list = std::move(outer_select);
 		node.having = nullptr;
 		node.groups = GroupByNode();
 		node.aggregate_handling = AggregateHandling::STANDARD_HANDLING;
@@ -138,6 +60,112 @@ private:
 	}
 	static string FactColumn(idx_t index) {
 		return "__sv_f" + to_string(index);
+	}
+
+	void CheckSupported(const SelectNode &node) const {
+		if (node.qualify) {
+			throw BinderException("QUALIFY is not supported when querying semantic view \"%s\" by name",
+			                      model.Name().name);
+		}
+		for (auto &expr : node.select_list) {
+			if (expr->GetExpressionClass() == ExpressionClass::STAR) {
+				throw BinderException("SELECT * is not supported when querying semantic view \"%s\" by name: list "
+				                      "dimensions and facts, and metrics with AGG(...)",
+				                      model.Name().name);
+			}
+		}
+	}
+
+	static vector<unique_ptr<ParsedExpression> *> OrderExpressions(SelectNode &node) {
+		vector<unique_ptr<ParsedExpression> *> result;
+		for (auto &modifier : node.modifiers) {
+			if (modifier->type == ResultModifierType::ORDER_MODIFIER) {
+				for (auto &order : modifier->Cast<OrderModifier>().orders) {
+					result.push_back(&order.expression);
+				}
+			}
+		}
+		return result;
+	}
+
+	//! Normalized copies of the select list, WHERE (the semantic query's filter) and HAVING; ORDER BY in place
+	void NormalizeClauses(const SelectNode &node, const vector<unique_ptr<ParsedExpression> *> &orders) {
+		for (auto &expr : node.select_list) {
+			select.push_back(Normalize(*expr));
+			select.back()->alias = expr->alias;
+			select_aliases.push_back(expr->alias);
+			original_text.push_back(expr->ToString());
+			CheckNoWindow(*select.back());
+		}
+		if (node.where_clause) {
+			query.where = Normalize(*node.where_clause);
+		}
+		if (node.having) {
+			having = Normalize(*node.having);
+			CheckNoWindow(*having);
+		}
+		for (auto order : orders) {
+			*order = Normalize(**order);
+		}
+	}
+
+	//! GROUP BY expressions (ordinals and select aliases resolve to select items)
+	void CollectGroups(const SelectNode &node) {
+		if (node.aggregate_handling == AggregateHandling::FORCE_AGGREGATES) {
+			for (auto &expr : select) {
+				if (!ContainsAggregate(*expr)) {
+					groups.push_back(WithoutAlias(*expr));
+				}
+			}
+			return;
+		}
+		for (auto &group : node.groups.group_expressions) {
+			groups.push_back(ResolveGroup(*group));
+		}
+	}
+
+	bool HasAggregation(const vector<unique_ptr<ParsedExpression> *> &orders) {
+		if (!groups.empty() || (having && ContainsAggregate(*having))) {
+			return true;
+		}
+		for (auto &expr : select) {
+			if (ContainsAggregate(*expr)) {
+				return true;
+			}
+		}
+		for (auto order : orders) {
+			if (ContainsAggregate(**order)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	//! Aggregated query: groups become dimensions, aggregate calls metrics; the select list reads their columns
+	vector<unique_ptr<ParsedExpression>> AggregatedSelect() {
+		for (idx_t g = 0; g < groups.size(); g++) {
+			CheckNotMetric(*groups[g]);
+			AddItem(SemanticMemberKind::DIMENSION, groups[g]->Copy(), GroupColumn(g));
+		}
+		vector<unique_ptr<ParsedExpression>> result;
+		for (idx_t i = 0; i < select.size(); i++) {
+			auto expr = Replace(*select[i], false);
+			expr->alias = OutputName(i);
+			result.push_back(std::move(expr));
+		}
+		return result;
+	}
+
+	//! Row-level query: every select item is a fact
+	vector<unique_ptr<ParsedExpression>> FactSelect() {
+		vector<unique_ptr<ParsedExpression>> result;
+		for (idx_t i = 0; i < select.size(); i++) {
+			CheckNotMetric(*select[i]);
+			AddItem(SemanticMemberKind::FACT, WithoutAlias(*select[i]), FactColumn(i));
+			result.push_back(ColumnRef(FactColumn(i)));
+			result.back()->alias = OutputName(i);
+		}
+		return result;
 	}
 
 	static unique_ptr<ParsedExpression> WithoutAlias(const ParsedExpression &expr) {
@@ -340,6 +368,7 @@ private:
 	vector<unique_ptr<ParsedExpression>> select;
 	vector<string> select_aliases;
 	vector<string> original_text;
+	unique_ptr<ParsedExpression> having;
 	vector<unique_ptr<ParsedExpression>> groups;
 	vector<unique_ptr<ParsedExpression>> metrics;
 	ParsedSemanticQuery query;
