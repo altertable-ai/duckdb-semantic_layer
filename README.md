@@ -462,4 +462,5 @@ Contributions are welcome: please open an issue or a pull request, with tests fo
 
 ## License
 
-MIT, see [LICENSE](LICENSE).
+MIT, see [LICENSE](LICENSE). The vendored DuckDB PEG parser in `third_party/duckdb_peg_parser` keeps DuckDB's MIT
+license ([third_party/duckdb_peg_parser/LICENSE](third_party/duckdb_peg_parser/LICENSE)).
