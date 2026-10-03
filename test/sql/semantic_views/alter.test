@@ -1,0 +1,64 @@
+# name: test/sql/semantic_views/alter.test
+# description: ALTER SEMANTIC VIEW (RENAME TO, SET / UNSET COMMENT)
+# group: [semantic_views]
+
+require semantic_views
+
+statement ok
+CREATE TABLE orders (id INTEGER, amount INTEGER);
+
+statement ok
+INSERT INTO orders VALUES (1, 10), (2, 20);
+
+statement ok
+CREATE SEMANTIC VIEW sv TABLES (o AS orders PRIMARY KEY (id)) METRICS (o.total AS SUM(amount)) COMMENT = 'first';
+
+statement ok
+CREATE SEMANTIC VIEW other TABLES (o AS orders PRIMARY KEY (id)) METRICS (o.n AS COUNT(*));
+
+statement ok
+ALTER SEMANTIC VIEW sv SET COMMENT = 'second';
+
+query I
+SELECT comment FROM (SHOW SEMANTIC VIEWS) WHERE name = 'sv';
+----
+second
+
+query I
+SELECT property_value FROM (DESCRIBE SEMANTIC VIEW sv) WHERE object_kind IS NULL AND property = 'COMMENT';
+----
+second
+
+statement ok
+ALTER SEMANTIC VIEW sv UNSET COMMENT;
+
+query I
+SELECT comment FROM (SHOW SEMANTIC VIEWS) WHERE name = 'sv';
+----
+NULL
+
+statement ok
+ALTER SEMANTIC VIEW sv RENAME TO renamed;
+
+query I
+SELECT * FROM SEMANTIC_VIEW(renamed METRICS o.total);
+----
+30
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(sv METRICS o.total);
+----
+Semantic view with name "sv" does not exist
+
+statement error
+ALTER SEMANTIC VIEW renamed RENAME TO other;
+----
+already exists
+
+statement ok
+ALTER SEMANTIC VIEW IF EXISTS missing SET COMMENT = 'x';
+
+statement error
+ALTER SEMANTIC VIEW missing SET COMMENT = 'x';
+----
+Semantic view with name "missing" does not exist
