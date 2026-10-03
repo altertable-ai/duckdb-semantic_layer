@@ -36,14 +36,20 @@ public:
 	void Rewrite(SelectNode &node) {
 		CheckSupported(node);
 		auto orders = ModifierExpressions(node);
+		vector<bool> modifier_aliases;
+		for (auto order : orders) {
+			modifier_aliases.push_back((*order)->GetExpressionClass() == ExpressionClass::COLUMN_REF &&
+			                           !(*order)->Cast<ColumnRefExpression>().IsQualified());
+		}
 		NormalizeClauses(node, orders);
 		CollectGroups(node);
 		auto aggregated = HasAggregation(orders);
 		// the items of the semantic query are registered in this order: groups, select list, HAVING, ORDER BY
 		node.select_list = aggregated ? AggregatedSelect() : FactSelect();
 		node.where_clause = aggregated && having ? Replace(*having, true) : nullptr;
-		for (auto order : orders) {
-			*order = aggregated ? Replace(**order, true) : MapToFacts(**order);
+		for (idx_t i = 0; i < orders.size(); i++) {
+			auto &order = *orders[i];
+			order = aggregated ? Replace(*order, true, modifier_aliases[i]) : MapToFacts(*order, modifier_aliases[i]);
 		}
 		node.having = nullptr;
 		node.groups = GroupByNode();
@@ -255,7 +261,7 @@ private:
 		}
 		if (normalized->GetExpressionClass() == ExpressionClass::COLUMN_REF) {
 			auto &colref = normalized->Cast<ColumnRefExpression>();
-			if (!colref.IsQualified()) {
+			if (!colref.IsQualified() && !HasInputName(colref.GetColumnName())) {
 				for (idx_t i = 0; i < select.size(); i++) {
 					if (!select_aliases[i].empty() && StringUtil::CIEquals(select_aliases[i], colref.GetColumnName())) {
 						return WithoutAlias(*select[i]);
@@ -264,6 +270,34 @@ private:
 			}
 		}
 		return normalized;
+	}
+
+	bool HasInputName(const string &name) const {
+		if (!model.FindMembersByName(name).empty()) {
+			return true;
+		}
+		for (auto &table : model.tables) {
+			if (table.columns.count(name)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	optional_idx OutputAlias(const ParsedExpression &expr) const {
+		if (expr.GetExpressionClass() != ExpressionClass::COLUMN_REF) {
+			return optional_idx();
+		}
+		auto &colref = expr.Cast<ColumnRefExpression>();
+		if (!colref.IsQualified()) {
+			for (idx_t i = select_aliases.size(); i > 0; i--) {
+				if (!select_aliases[i - 1].empty() &&
+				    StringUtil::CIEquals(select_aliases[i - 1], colref.GetColumnName())) {
+					return i - 1;
+				}
+			}
+		}
+		return optional_idx();
 	}
 
 	//! Rejects bare references to metrics (they must be wrapped in AGG)
@@ -317,7 +351,12 @@ private:
 		return column;
 	}
 
-	unique_ptr<ParsedExpression> Replace(const ParsedExpression &expr, bool allow_aliases) {
+	unique_ptr<ParsedExpression> Replace(const ParsedExpression &expr, bool allow_aliases,
+	                                     bool top_level_alias = false) {
+		auto alias = top_level_alias ? OutputAlias(expr) : optional_idx();
+		if (alias.IsValid()) {
+			return Replace(*select[alias.GetIndex()], false);
+		}
 		for (idx_t g = 0; g < groups.size(); g++) {
 			if (groups[g]->Equals(expr)) {
 				return make_uniq<ColumnRefExpression>(GroupColumn(g));
@@ -328,7 +367,7 @@ private:
 		}
 		if (expr.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
 			auto &colref = expr.Cast<ColumnRefExpression>();
-			if (allow_aliases && !colref.IsQualified()) {
+			if (allow_aliases && !colref.IsQualified() && !HasInputName(colref.GetColumnName())) {
 				for (auto &alias : select_aliases) {
 					if (!alias.empty() && StringUtil::CIEquals(alias, colref.GetColumnName())) {
 						return expr.Copy();
@@ -349,7 +388,11 @@ private:
 		return result;
 	}
 
-	unique_ptr<ParsedExpression> MapToFacts(const ParsedExpression &expr) {
+	unique_ptr<ParsedExpression> MapToFacts(const ParsedExpression &expr, bool top_level_alias = false) {
+		auto alias = top_level_alias ? OutputAlias(expr) : optional_idx();
+		if (alias.IsValid()) {
+			return ColumnRef(FactColumn(alias.GetIndex()));
+		}
 		for (idx_t i = 0; i < select.size(); i++) {
 			if (select[i]->Equals(expr)) {
 				return make_uniq<ColumnRefExpression>(FactColumn(i));
@@ -357,11 +400,10 @@ private:
 		}
 		if (expr.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
 			auto &colref = expr.Cast<ColumnRefExpression>();
-			if (!colref.IsQualified()) {
-				for (idx_t i = 0; i < select.size(); i++) {
-					if (StringUtil::CIEquals(OutputName(i), colref.GetColumnName())) {
-						return expr.Copy();
-					}
+			if (!HasInputName(colref.GetColumnName())) {
+				auto output = OutputAlias(expr);
+				if (output.IsValid()) {
+					return ColumnRef(FactColumn(output.GetIndex()));
 				}
 			}
 			CheckNotMetric(expr);
