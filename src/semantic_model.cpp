@@ -215,6 +215,14 @@ SemanticRef SemanticModel::Lookup(const vector<string> &names, const SemanticRes
 			if (member.IsValid() && member.GetIndex() != context.self_member) {
 				return member_ref(member.GetIndex());
 			}
+			// A self-named definition refers to its own physical column, even when another table defines
+			// a member of the same name (e.g. a.value AS value, b.value AS value).
+			if (member.IsValid() && member.GetIndex() == context.self_member) {
+				auto entry = tables[context.owner_table].columns.find(name);
+				if (entry != tables[context.owner_table].columns.end()) {
+					return column_ref(context.owner_table, entry->second);
+				}
+			}
 		}
 		// 2. a unique member name in the view
 		vector<idx_t> candidates;
