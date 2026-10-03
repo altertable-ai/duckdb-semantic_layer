@@ -64,23 +64,30 @@ static optional_ptr<CatalogEntry> ExistingEntry(ClientContext &context, const Qu
 	return Catalog::GetEntry(context, name.catalog, name.schema, lookup, OnEntryNotFound::RETURN_NULL);
 }
 
-void PrepareSemanticPlaceholder(ClientContext &context, optional_ptr<Binder> binder, const QualifiedName &name,
-                                bool check_conflict) {
-	auto catalog = PlaceholderCatalog(context, name);
-	if (!catalog) {
-		return;
-	}
-	if (check_conflict) {
-		auto entry = ExistingEntry(context, name);
-		if (entry && !IsSemanticPlaceholder(*entry)) {
-			throw CatalogException("Cannot create semantic view \"%s\": a table or view with that name already exists",
-			                       name.name);
+static bool SameView(const QualifiedName &a, const QualifiedName &b) {
+	return StringUtil::CIEquals(a.catalog, b.catalog) && StringUtil::CIEquals(a.schema, b.schema) &&
+	       StringUtil::CIEquals(a.name, b.name);
+}
+
+void BindSemanticViewChange(ClientContext &context, optional_ptr<Binder> binder, const QualifiedName &before,
+                            const QualifiedName &after) {
+	for (auto *name : {&before, &after}) {
+		auto catalog = name->name.empty() ? nullptr : PlaceholderCatalog(context, *name);
+		if (!catalog) {
+			continue;
 		}
-	}
-	if (binder) {
-		binder->GetStatementProperties().RegisterDBModify(*catalog, context,
-		                                                  DatabaseModificationType::CREATE_CATALOG_ENTRY |
-		                                                      DatabaseModificationType::DROP_CATALOG_ENTRY);
+		if (name == &after && !SameView(before, after)) {
+			auto entry = ExistingEntry(context, after);
+			if (entry && !IsSemanticPlaceholder(*entry)) {
+				throw CatalogException(
+				    "Cannot create semantic view \"%s\": a table or view with that name already exists", after.name);
+			}
+		}
+		if (binder) {
+			binder->GetStatementProperties().RegisterDBModify(*catalog, context,
+			                                                  DatabaseModificationType::CREATE_CATALOG_ENTRY |
+			                                                      DatabaseModificationType::DROP_CATALOG_ENTRY);
+		}
 	}
 }
 
@@ -98,7 +105,7 @@ static unique_ptr<SelectStatement> PlaceholderQuery(const QualifiedName &name) {
 	return MakeSelectStatement(std::move(node));
 }
 
-void CreateSemanticPlaceholder(ClientContext &context, const SemanticModel &model) {
+static void CreatePlaceholder(ClientContext &context, const SemanticModel &model) {
 	auto &name = model.Name();
 	auto catalog = PlaceholderCatalog(context, name);
 	if (!catalog) {
@@ -119,7 +126,7 @@ void CreateSemanticPlaceholder(ClientContext &context, const SemanticModel &mode
 	catalog->CreateView(context, info);
 }
 
-bool DropSemanticPlaceholder(ClientContext &context, const QualifiedName &name) {
+static bool DropPlaceholder(ClientContext &context, const QualifiedName &name) {
 	auto catalog = PlaceholderCatalog(context, name);
 	if (!catalog) {
 		return false;
@@ -136,6 +143,19 @@ bool DropSemanticPlaceholder(ClientContext &context, const QualifiedName &name) 
 	info.if_not_found = OnEntryNotFound::RETURN_NULL;
 	catalog->DropEntry(context, info);
 	return true;
+}
+
+bool ApplySemanticViewChange(ClientContext &context, const QualifiedName &before,
+                             optional_ptr<const SemanticModel> after) {
+	bool dropped = false;
+	if (!before.name.empty() && !(after && SameView(before, after->Name()))) {
+		dropped = DropPlaceholder(context, before);
+	}
+	if (after) {
+		// replaces the placeholder of the same name, if any
+		CreatePlaceholder(context, *after);
+	}
+	return dropped;
 }
 
 bool IsSemanticPlaceholder(const CatalogEntry &entry) {

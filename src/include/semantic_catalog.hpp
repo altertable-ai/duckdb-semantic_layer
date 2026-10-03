@@ -38,14 +38,17 @@ struct SemanticCatalogColumn {
 //! "table.name"
 vector<SemanticCatalogColumn> SemanticCatalogColumns(const SemanticModel &model);
 
-//! Called while binding DDL on `name` (fully qualified): fails when a table or view that is not a placeholder has the
-//! name (`check_conflict`), and declares the catalog modification on the statement
-void PrepareSemanticPlaceholder(ClientContext &context, optional_ptr<Binder> binder, const QualifiedName &name,
-                                bool check_conflict);
-//! Creates (or replaces) the placeholder of `model`
-void CreateSemanticPlaceholder(ClientContext &context, const SemanticModel &model);
-//! Drops the placeholder named `name` (fully qualified); false when there is none
-bool DropSemanticPlaceholder(ClientContext &context, const QualifiedName &name);
+//! A DDL statement turns the semantic view named `before` into `after` (fully qualified names): an empty `before` name
+//! creates it, an empty `after` name drops it, and both change it (ALTER, possibly renaming it).
+
+//! At bind time: a new name must not belong to a table or view, and the statement declares its catalog modifications
+void BindSemanticViewChange(ClientContext &context, optional_ptr<Binder> binder, const QualifiedName &before,
+                            const QualifiedName &after);
+//! At execution, before the registry changes: replaces the placeholder of `before` by the placeholder of `after`
+//! (nullptr when dropped). When the registry change then fails, the statement's rollback undoes this one. Returns
+//! whether a placeholder of `before` was dropped (one left in a database file by a previous session counts too).
+bool ApplySemanticViewChange(ClientContext &context, const QualifiedName &before,
+                             optional_ptr<const SemanticModel> after);
 //! Whether a catalog entry is the placeholder of a semantic view
 bool IsSemanticPlaceholder(const CatalogEntry &entry);
 //! SELECT CAST(NULL AS <type>) AS "<column>", ... LIMIT 0: the placeholder's columns, for DESCRIBE
