@@ -1,20 +1,27 @@
-# semantic_views — Snowflake-compatible semantic views for DuckDB
+# semantic_views
 
-`semantic_views` is a DuckDB extension that brings
-[Snowflake semantic views](https://docs.snowflake.com/en/user-guide/views-semantic/overview) to DuckDB. You describe
-your data once (logical tables, the relationships between them, and the facts, dimensions and metrics that matter to
-the business), then ask for any combination of dimensions and metrics. The extension writes the joins and the
-aggregations at the right grain, so metrics are never double counted and every consumer gets the same numbers.
+**A semantic layer inside DuckDB.** Define your business metrics once, in SQL, next to your data. Then query any
+combination of dimensions and metrics from SQL or from a BI tool, and get correct numbers every time.
 
-- **Snowflake syntax.** `CREATE SEMANTIC VIEW`, `SEMANTIC_VIEW(...)`, `SHOW SEMANTIC ...` and
-  `DESCRIBE SEMANTIC VIEW` follow Snowflake. A Snowflake definition can be pasted as is.
-- **Correct by construction.** Joins only follow many-to-one relationships, metrics of different grains are
-  aggregated separately, and queries that would fan out are rejected instead of returning inflated numbers.
+Aggregating across joined tables is where analytics quietly goes wrong. Join orders to their line items and every
+order total is counted once per line. Compute "revenue per customer" in two dashboards and the two rarely agree.
+`semantic_views` lets you describe your data once: logical tables, the relationships between them, and the facts,
+dimensions and metrics that matter to the business. Every query then gets its joins and aggregations generated at the
+right grain.
+
+- **Define once, reuse everywhere.** Each metric has a single definition, shared by every query, notebook and
+  dashboard.
+- **Correct by construction.** Joins only follow many-to-one relationships, and metrics of different grains are
+  aggregated separately. Queries that would fan out are rejected instead of returning inflated numbers.
 - **As fast as hand-written SQL.** Semantic queries are expanded into ordinary DuckDB SQL at bind time, with no
   custom operator. On a 100M-row fact table they run within a few percent of the equivalent hand-written query (see
   [benchmarks](docs/benchmarks.md)).
-- **Plays well with tools.** Semantic views appear in `information_schema` like regular views, with one typed
-  column per dimension, fact and metric. They can be queried with plain `SELECT ... GROUP BY`.
+- **Just SQL, no extra service.** Define views with `CREATE SEMANTIC VIEW` and query them with `SEMANTIC_VIEW(...)` or
+  a plain `SELECT ... GROUP BY`, all inside DuckDB. There are no YAML files and no separate semantic-layer server.
+- **Works with your tools.** Semantic views appear in `information_schema` like regular views, with one typed column
+  per dimension, fact and metric, so SQL clients and BI tools discover them.
+- **Real-world modeling.** Many-to-many relationships, semi-additive metrics (balances, inventory), role-playing
+  relationships, time-dependent and range joins, and window metrics such as rolling averages are all built in.
 
 ## Contents
 
@@ -25,10 +32,10 @@ aggregations at the right grain, so metrics are never double counted and every c
 - [Advanced modeling](#advanced-modeling)
 - [Managing and inspecting semantic views](#managing-and-inspecting-semantic-views)
 - [BI tools and the catalog](#bi-tools-and-the-catalog)
-- [Snowflake compatibility](#snowflake-compatibility)
 - [How it works](#how-it-works)
 - [Limitations](#limitations)
 - [Development](#development)
+- [Snowflake compatibility](#snowflake-compatibility)
 - [License](#license)
 
 ## Quick start
@@ -230,7 +237,7 @@ SELECT ... FROM SEMANTIC_VIEW(
   `INSERT ... SELECT`, views, `EXPLAIN` and prepared statements.
 
 A dimension can be combined with a metric only if it lies on the metric's table or on a table the metric's table
-references (Snowflake's *equal or lower granularity* rule), or across a
+references (the *equal or lower granularity* rule), or across a
 [many-to-many bridge](#many-to-many-relationships-bridge-tables). Otherwise the query is rejected.
 
 ### Querying by name
@@ -244,7 +251,7 @@ HAVING AGG(lines.revenue) > 1000
 ORDER BY 2 DESC;
 ```
 
-As in Snowflake:
+In this form:
 
 - `GROUP BY` expressions become dimensions.
 - Metrics are wrapped in `AGG(...)`; other aggregate functions over dimensions or facts are ad-hoc metrics.
@@ -340,7 +347,7 @@ query (`SHOW SEMANTIC DIMENSIONS IN <view> FOR METRIC <metric>` marks them as `r
 | `DROP SEMANTIC VIEW [IF EXISTS] <name>` | |
 | `ALTER SEMANTIC VIEW [IF EXISTS] <name> RENAME TO <new name>` | |
 | `ALTER SEMANTIC VIEW [IF EXISTS] <name> SET COMMENT = '<text>' \| UNSET COMMENT` | |
-| `DESCRIBE SEMANTIC VIEW <name>` | the definition, in Snowflake's layout (`object_kind, object_name, parent_entity, property, property_value`) |
+| `DESCRIBE SEMANTIC VIEW <name>` | the definition, one property per row (`object_kind, object_name, parent_entity, property, property_value`) |
 | `SHOW SEMANTIC VIEWS [LIKE '<pattern>'] [IN SCHEMA <schema> \| IN DATABASE <database>]` | |
 | `SHOW SEMANTIC DIMENSIONS \| FACTS \| METRICS [LIKE '<pattern>'] [IN <name>]` | defined members (including private ones), with their data types |
 | `SHOW SEMANTIC DIMENSIONS [LIKE '<pattern>'] IN <name> FOR METRIC <metric>` | the dimensions a metric can be grouped by |
@@ -359,32 +366,6 @@ Every semantic view is also listed as a view of the same name in `information_sc
 The catalog view is a placeholder, tagged `semantic_view` (see `duckdb_views().tags`). Reading it as a plain table
 fails with a message pointing to `SEMANTIC_VIEW(...)` and `AGG(...)`. Semantic views therefore share the namespace of
 tables and views: a semantic view cannot have the name of an existing table or view, and vice versa.
-
-## Snowflake compatibility
-
-The SQL surface follows Snowflake's
-[CREATE SEMANTIC VIEW](https://docs.snowflake.com/en/sql-reference/sql/create-semantic-view),
-[querying](https://docs.snowflake.com/en/user-guide/views-semantic/querying) and
-[validation rules](https://docs.snowflake.com/en/user-guide/views-semantic/validation-rules) documentation.
-
-**Accepted and kept as metadata** (shown by `DESCRIBE SEMANTIC VIEW`, otherwise ignored), so that Snowflake
-definitions can be pasted as is: `WITH SYNONYMS`, `LABELS = (FILTER)`, `SAMPLE_VALUES`, `IS_ENUM`, `WITH CORTEX SEARCH
-SERVICE`, `AI_SQL_GENERATION`, `AI_QUESTION_CATEGORIZATION`, `AI_VERIFIED_QUERIES`, `[WITH] TAG`, `COPY GRANTS`,
-`MAX_STALENESS`.
-
-**Not supported:**
-
-- materializations;
-- `GET_DDL` and YAML import/export;
-- window functions in fact and dimension definitions;
-- the `INFORMATION_SCHEMA.SEMANTIC_*` views (semantic views appear in the regular catalog instead, see above);
-- `SHOW ... TERSE / STARTS WITH / LIMIT`, and `ALTER ... SET TAG / MAX_STALENESS`;
-- privileges (DuckDB has none).
-
-**Differences:**
-
-- `CREATE OR ALTER` behaves like `CREATE OR REPLACE`.
-- Expressions may reference physical columns of other logical tables directly (Snowflake requires a fact).
 
 ## How it works
 
@@ -461,6 +442,34 @@ view grammar. After editing the grammar or the vendored files, use the scripts i
 for details and [docs/UPDATING.md](docs/UPDATING.md) for moving to a new DuckDB version.
 
 Contributions are welcome: please open an issue or a pull request, with tests for any behavior change.
+
+## Snowflake compatibility
+
+The syntax and semantics follow
+[Snowflake semantic views](https://docs.snowflake.com/en/user-guide/views-semantic/overview)
+([CREATE SEMANTIC VIEW](https://docs.snowflake.com/en/sql-reference/sql/create-semantic-view),
+[querying](https://docs.snowflake.com/en/user-guide/views-semantic/querying),
+[validation rules](https://docs.snowflake.com/en/user-guide/views-semantic/validation-rules)), so definitions and
+queries written for Snowflake run on DuckDB.
+
+**Accepted and kept as metadata** (shown by `DESCRIBE SEMANTIC VIEW`, otherwise ignored), so that Snowflake
+definitions can be pasted as is: `WITH SYNONYMS`, `LABELS = (FILTER)`, `SAMPLE_VALUES`, `IS_ENUM`, `WITH CORTEX SEARCH
+SERVICE`, `AI_SQL_GENERATION`, `AI_QUESTION_CATEGORIZATION`, `AI_VERIFIED_QUERIES`, `[WITH] TAG`, `COPY GRANTS`,
+`MAX_STALENESS`.
+
+**Not supported:**
+
+- materializations;
+- `GET_DDL` and YAML import/export;
+- window functions in fact and dimension definitions;
+- the `INFORMATION_SCHEMA.SEMANTIC_*` views (semantic views appear in the regular catalog instead, see above);
+- `SHOW ... TERSE / STARTS WITH / LIMIT`, and `ALTER ... SET TAG / MAX_STALENESS`;
+- privileges (DuckDB has none).
+
+**Differences:**
+
+- `CREATE OR ALTER` behaves like `CREATE OR REPLACE`.
+- Expressions may reference physical columns of other logical tables directly (Snowflake requires a fact).
 
 ## License
 
