@@ -129,3 +129,118 @@ statement error
 SELECT * FROM SEMANTIC_VIEW(library DIMENSIONS authors.author_name || genres.genre_name AS x METRICS books.total_pages);
 ----
 combines tables reached through different many-to-many bridges
+
+# filters on bridged tables are semi-joins: books with at least one French author, each counted once
+query II
+SELECT * FROM SEMANTIC_VIEW(library METRICS books.total_pages, books.book_count WHERE authors.country = 'FR');
+----
+300	2
+
+query II
+SELECT * FROM SEMANTIC_VIEW(library DIMENSIONS books.category METRICS books.total_pages WHERE authors.country = 'US') ORDER BY 1;
+----
+essay	300
+novel	200
+
+# a bridged and a local condition; only active authors are grouped
+query II
+SELECT * FROM SEMANTIC_VIEW(library DIMENSIONS authors.author_name METRICS books.total_pages WHERE authors.active AND books.category = 'novel') ORDER BY 1;
+----
+Ann	300
+Bob	100
+
+# a condition over the bridged table and the metric's table is evaluated per (book, author) pair
+query I
+SELECT * FROM SEMANTIC_VIEW(library METRICS books.total_pages WHERE authors.country = 'DE' OR books.category = 'novel');
+----
+300
+
+# documented: a filter on bridged tables drops books without any author, even IS NULL
+query II
+SELECT * FROM SEMANTIC_VIEW(library METRICS books.total_pages, books.book_count WHERE authors.author_name IS NULL);
+----
+NULL	0
+
+# a condition cannot need two different bridges
+statement error
+SELECT * FROM SEMANTIC_VIEW(library METRICS books.total_pages WHERE authors.country = 'FR' OR genres.genre_name = 'drama');
+----
+split it into separate conditions combined with AND
+
+# semi-additive metric grouped by a bridged dimension: the last author (by join date) of every category
+statement ok
+CREATE OR REPLACE SEMANTIC VIEW library_na
+  TABLES (authors PRIMARY KEY (author_id), books PRIMARY KEY (book_id), book_authors PRIMARY KEY (book_id, author_id))
+  RELATIONSHIPS (book_authors (author_id) REFERENCES authors, book_authors (book_id) REFERENCES books)
+  DIMENSIONS (books.category AS category, authors.joined_on AS joined)
+  METRICS (authors.latest_revenue NON ADDITIVE BY (authors.joined_on) AS SUM(author_revenue));
+
+query II
+SELECT * FROM SEMANTIC_VIEW(library_na DIMENSIONS books.category METRICS authors.latest_revenue) ORDER BY 1 NULLS LAST;
+----
+essay	30
+novel	30
+NULL	20
+
+# a fact table is a bridge too: customers who bought in each product category
+statement ok
+CREATE TABLE customers (customer_id INTEGER, segment VARCHAR);
+INSERT INTO customers VALUES (1, 'retail'), (2, 'retail'), (3, 'pro');
+CREATE TABLE products (product_id INTEGER, category VARCHAR);
+INSERT INTO products VALUES (10, 'toys'), (11, 'books');
+CREATE TABLE sales (sale_id INTEGER, customer_id INTEGER, product_id INTEGER, amount INTEGER);
+INSERT INTO sales VALUES (1, 1, 10, 5), (2, 1, 10, 7), (3, 1, 11, 3), (4, 2, 10, 4);
+
+statement ok
+CREATE SEMANTIC VIEW shop_m2m
+  TABLES (customers PRIMARY KEY (customer_id), products PRIMARY KEY (product_id), sales PRIMARY KEY (sale_id))
+  RELATIONSHIPS (sales (customer_id) REFERENCES customers, sales (product_id) REFERENCES products)
+  DIMENSIONS (products.category AS category, customers.segment AS segment)
+  METRICS (customers.customer_count AS COUNT(*), sales.revenue AS SUM(amount));
+
+query II
+SELECT * FROM SEMANTIC_VIEW(shop_m2m DIMENSIONS products.category METRICS customers.customer_count) ORDER BY 1 NULLS LAST;
+----
+books	1
+toys	2
+NULL	1
+
+query II
+SELECT p.category, COUNT(DISTINCT s.customer_id) FROM sales s JOIN products p USING (product_id) GROUP BY 1 ORDER BY 1;
+----
+books	1
+toys	2
+
+# several bridges between the same tables are ambiguous; USING on the metric picks one
+statement ok
+CREATE TABLE reviews (book_id INTEGER, author_id INTEGER);
+INSERT INTO reviews VALUES (3, 1), (4, 2);
+
+statement ok
+CREATE SEMANTIC VIEW library_reviews
+  TABLES (authors PRIMARY KEY (author_id), books PRIMARY KEY (book_id), book_authors PRIMARY KEY (book_id, author_id), reviews PRIMARY KEY (book_id, author_id))
+  RELATIONSHIPS (
+    wrote AS book_authors (author_id) REFERENCES authors,
+    written AS book_authors (book_id) REFERENCES books,
+    reviewed_by AS reviews (author_id) REFERENCES authors,
+    reviewed AS reviews (book_id) REFERENCES books
+  )
+  DIMENSIONS (authors.author_name AS author_name)
+  METRICS (
+    books.total_pages AS SUM(page_count),
+    books.written_pages USING (wrote) AS SUM(page_count),
+    books.reviewed_pages USING (reviewed_by) AS SUM(page_count)
+  );
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(library_reviews DIMENSIONS authors.author_name METRICS books.total_pages);
+----
+Ambiguous many-to-many path from "books" to "authors": bridge tables "book_authors", "reviews" both qualify
+
+query III
+SELECT * FROM SEMANTIC_VIEW(library_reviews DIMENSIONS authors.author_name METRICS books.written_pages, books.reviewed_pages) ORDER BY 1 NULLS LAST;
+----
+Ann	300	300
+Bob	100	400
+Cid	500	NULL
+NULL	400	300

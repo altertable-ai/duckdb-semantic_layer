@@ -237,7 +237,20 @@ struct Block {
 struct BridgeGroup {
 	SemanticBridge bridge;
 	vector<idx_t> dimensions;
+	//! WHERE conjuncts on the bridged side: the group becomes a semi-join
+	vector<const ParsedExpression *> conjuncts;
 };
+
+//! Top-level AND conjuncts of `expr`
+void SplitConjuncts(const ParsedExpression &expr, vector<const ParsedExpression *> &conjuncts) {
+	if (expr.GetExpressionType() == ExpressionType::CONJUNCTION_AND) {
+		for (auto &child : expr.Cast<ConjunctionExpression>().children) {
+			SplitConjuncts(*child, conjuncts);
+		}
+		return;
+	}
+	conjuncts.push_back(&expr);
+}
 
 class MetricQueryCompiler {
 public:
@@ -293,14 +306,18 @@ private:
 		vector<BridgeGroup> bridges;
 		vector<idx_t> dimension_bridge;
 		for (auto *dimension : dimensions) {
-			dimension_bridge.push_back(PlaceRowItem(block, *dimension->resolved, ItemWhat(*dimension), bridges));
+			dimension_bridge.push_back(PlaceRowItem(block, *dimension->resolved, ItemWhat(*dimension), false, bridges));
 		}
+		vector<unique_ptr<ParsedExpression>> local_conjuncts;
 		if (spec.where) {
-			set<idx_t> tables;
-			analyzer.RowTables(*spec.where, DConstants::INVALID_INDEX, tables, "Invalid WHERE clause");
-			for (auto table : tables) {
-				if (!model.Reaches(block.home, table)) {
-					throw GranularityError(table, block.home);
+			vector<const ParsedExpression *> conjuncts;
+			SplitConjuncts(*spec.where, conjuncts);
+			for (auto *conjunct : conjuncts) {
+				auto bridge = PlaceRowItem(block, *conjunct, "Invalid WHERE clause", true, bridges);
+				if (bridge == DConstants::INVALID_INDEX) {
+					local_conjuncts.push_back(conjunct->Copy());
+				} else {
+					bridges[bridge].conjuncts.push_back(conjunct);
 				}
 			}
 		}
@@ -362,8 +379,9 @@ private:
 			aggregate->where_clause =
 			    LastSnapshotFilter(model.members[block.non_additive_member], scope, std::move(groups), *rows);
 		}
-		if (spec.where) {
-			rows->where_clause = compiler.Row(*spec.where, scope, DConstants::INVALID_INDEX, "Invalid WHERE clause");
+		if (!local_conjuncts.empty()) {
+			rows->where_clause = compiler.Row(*AndAll(std::move(local_conjuncts)), scope, DConstants::INVALID_INDEX,
+			                                  "Invalid WHERE clause");
 		}
 		if (rows->select_list.empty()) {
 			// e.g. only COUNT(*): the rows still have to be produced
@@ -384,7 +402,7 @@ private:
 		rows->from_table = scope.BuildFrom();
 		for (idx_t b = 0; b < bridges.size(); b++) {
 			auto join = make_uniq<JoinRef>(JoinRefType::REGULAR);
-			join->type = JoinType::LEFT;
+			join->type = bridges[b].conjuncts.empty() ? JoinType::LEFT : JoinType::INNER;
 			join->left = std::move(rows->from_table);
 			join->right = MakeSubqueryRef(BridgeMap(block, bridges[b]), bridge_aliases[b]);
 			join->condition = AndAll(std::move(bridge_conditions[b]));
@@ -409,7 +427,7 @@ private:
 
 	//! Where a row-level item of the query is evaluated for `block`: INVALID_INDEX for the block's own rows (every
 	//! table it reads is reachable from the home table), else the index of its bridge group in `bridges`
-	idx_t PlaceRowItem(const Block &block, const ParsedExpression &expr, const string &what,
+	idx_t PlaceRowItem(const Block &block, const ParsedExpression &expr, const string &what, bool is_condition,
 	                   vector<BridgeGroup> &bridges) {
 		set<idx_t> tables;
 		analyzer.RowTables(expr, DConstants::INVALID_INDEX, tables, what);
@@ -437,8 +455,9 @@ private:
 			for (auto table : bridge_tables) {
 				names.push_back("\"" + model.tables[table].name + "\"");
 			}
-			throw BinderException("%s: combines tables reached through different many-to-many bridges (%s)", what,
-			                      StringUtil::Join(names, ", "));
+			throw BinderException("%s: combines tables reached through different many-to-many bridges (%s)%s", what,
+			                      StringUtil::Join(names, ", "),
+			                      is_condition ? "; split it into separate conditions combined with AND" : "");
 		}
 		for (idx_t b = 0; b < bridges.size(); b++) {
 			if (bridges[b].bridge.SameAs(bridge)) {
@@ -466,6 +485,11 @@ private:
 			expr->alias = DimensionColumn(d);
 			node->select_list.push_back(std::move(expr));
 		}
+		vector<unique_ptr<ParsedExpression>> conditions;
+		for (auto *conjunct : group.conjuncts) {
+			conditions.push_back(compiler.Row(*conjunct, scope, DConstants::INVALID_INDEX, "Invalid WHERE clause"));
+		}
+		node->where_clause = AndAll(std::move(conditions));
 		node->modifiers.push_back(make_uniq<DistinctModifier>());
 		node->from_table = scope.BuildFrom();
 		return std::move(node);
