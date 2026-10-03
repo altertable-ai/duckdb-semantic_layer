@@ -20,7 +20,8 @@ CREATE OR REPLACE SEMANTIC VIEW sales_sv
     c.segment AS c.segment,
     p.category AS p.category,
     s.sale_month AS DATE_TRUNC('month', sale_date),
-    s.sale_year AS YEAR(sale_date)
+    s.sale_year AS YEAR(sale_date),
+    s.sale_day AS sale_date
   )
   METRICS (
     s.revenue AS SUM(amount),
@@ -29,5 +30,6 @@ CREATE OR REPLACE SEMANTIC VIEW sales_sv
     s.net_revenue AS SUM(s.net),
     c.customer_count AS COUNT(*),
     c.avg_lifetime_revenue AS AVG(c.lifetime_revenue),
+    s.last_day_revenue NON ADDITIVE BY (s.sale_day) AS SUM(amount),
     revenue_per_customer AS s.revenue / c.customer_count
   );

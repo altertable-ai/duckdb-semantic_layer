@@ -5,6 +5,7 @@
 #include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/to_string.hpp"
+#include "duckdb/parser/expression/case_expression.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/expression/comparison_expression.hpp"
 #include "duckdb/parser/expression/conjunction_expression.hpp"
@@ -315,16 +316,57 @@ static unique_ptr<SelectNode> BuildNonAdditiveBlock(ExpressionCompiler &compiler
 		expr->alias = AtomColumn(a);
 		outer->select_list.push_back(std::move(expr));
 	}
-	for (auto &entry : metric.non_additive) {
-		// the last row in the requested order is the first one in the reversed order
-		auto type = entry.type == OrderType::ASCENDING ? OrderType::DESCENDING : OrderType::ASCENDING;
-		auto nulls = entry.null_order == OrderByNullType::NULLS_LAST ? OrderByNullType::NULLS_FIRST
-		                                                             : OrderByNullType::NULLS_LAST;
-		rank->orders.emplace_back(type, nulls,
-		                          compiler.Row(*entry.resolved, scope, DConstants::INVALID_INDEX, "NON ADDITIVE BY"));
+	unique_ptr<ParsedExpression> keep_condition;
+	if (metric.non_additive.size() == 1) {
+		// single non-additive dimension: compare every row with the last value of its group, computed with
+		// unordered window aggregates (no sort): max (ASC) / min (DESC), or NULL when NULLs sort last and exist
+		auto &entry = metric.non_additive[0];
+		auto value = compiler.Row(*entry.resolved, scope, DConstants::INVALID_INDEX, "NON ADDITIVE BY");
+		auto window = [&](const string &function, unique_ptr<ParsedExpression> child) {
+			auto result = make_uniq<WindowExpression>(ExpressionType::WINDOW_AGGREGATE, INVALID_CATALOG, INVALID_SCHEMA,
+			                                          function);
+			if (child) {
+				result->children.push_back(std::move(child));
+			}
+			for (auto &partition : rank->partitions) {
+				result->partitions.push_back(partition->Copy());
+			}
+			result->start = WindowBoundary::UNBOUNDED_PRECEDING;
+			result->end = WindowBoundary::UNBOUNDED_FOLLOWING;
+			return result;
+		};
+		unique_ptr<ParsedExpression> last = window(entry.type == OrderType::ASCENDING ? "max" : "min", value->Copy());
+		if (entry.null_order == OrderByNullType::NULLS_LAST) {
+			auto any_null = make_uniq<ComparisonExpression>(
+			    ExpressionType::COMPARE_GREATERTHAN, window("count_star", nullptr), window("count", value->Copy()));
+			auto case_expr = make_uniq<CaseExpression>();
+			CaseCheck check;
+			check.when_expr = std::move(any_null);
+			check.then_expr = make_uniq<ConstantExpression>(Value());
+			case_expr->case_checks.push_back(std::move(check));
+			case_expr->else_expr = std::move(last);
+			last = std::move(case_expr);
+		}
+		last->alias = "__sv_last";
+		value->alias = "__sv_na";
+		inner->select_list.push_back(std::move(value));
+		inner->select_list.push_back(std::move(last));
+		keep_condition = make_uniq<ComparisonExpression>(ExpressionType::COMPARE_NOT_DISTINCT_FROM,
+		                                                 ColumnRef("__sv_na"), ColumnRef("__sv_last"));
+	} else {
+		for (auto &entry : metric.non_additive) {
+			// the last row in the requested order is the first one in the reversed order
+			auto type = entry.type == OrderType::ASCENDING ? OrderType::DESCENDING : OrderType::ASCENDING;
+			auto nulls = entry.null_order == OrderByNullType::NULLS_LAST ? OrderByNullType::NULLS_FIRST
+			                                                             : OrderByNullType::NULLS_LAST;
+			rank->orders.emplace_back(
+			    type, nulls, compiler.Row(*entry.resolved, scope, DConstants::INVALID_INDEX, "NON ADDITIVE BY"));
+		}
+		rank->alias = "__sv_rank";
+		inner->select_list.push_back(std::move(rank));
+		keep_condition = make_uniq<ComparisonExpression>(ExpressionType::COMPARE_EQUAL, ColumnRef("__sv_rank"),
+		                                                 make_uniq<ConstantExpression>(Value::BIGINT(1)));
 	}
-	rank->alias = "__sv_rank";
-	inner->select_list.push_back(std::move(rank));
 	if (where) {
 		inner->where_clause = compiler.Row(*where, scope, DConstants::INVALID_INDEX, "Invalid WHERE clause");
 	}
@@ -341,8 +383,7 @@ static unique_ptr<SelectNode> BuildNonAdditiveBlock(ExpressionCompiler &compiler
 		}
 		outer->groups.grouping_sets.push_back(std::move(set));
 	}
-	outer->where_clause = make_uniq<ComparisonExpression>(ExpressionType::COMPARE_EQUAL, ColumnRef("__sv_rank"),
-	                                                      make_uniq<ConstantExpression>(Value::BIGINT(1)));
+	outer->where_clause = std::move(keep_condition);
 	auto inner_statement = make_uniq<SelectStatement>();
 	inner_statement->node = std::move(inner);
 	outer->from_table = make_uniq<SubqueryRef>(std::move(inner_statement), "__sv_snapshot");

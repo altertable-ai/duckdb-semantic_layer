@@ -356,7 +356,8 @@ facts must all live on the same logical table (Snowflake rule).
   non-additive dimensions `N`: rank the block's rows with
   `rank() OVER (PARTITION BY Q ORDER BY N <reversed>)`, keep rank 1 (the last snapshot of every group), then
   aggregate. When a dimension of `N` is also in `Q`, every group has a single value of it and the aggregation is a
-  plain one. (A single-column max/min + semi-join fast path is a possible later optimization.)
+  plain one. With a single non-additive dimension the last value comes from unordered window aggregates
+  (`max` for ASC / `min` for DESC, NULL when NULLs sort last and exist) instead of a sorted `rank()`.
 - **Window metrics.** Computed in the final projection layer over the combined result:
   `fn(<post-expr of inner metric>) OVER (PARTITION BY ... ORDER BY ... frame)`;
   `PARTITION BY EXCLUDING d` = all query dimensions except `d`. Referenced dimensions must be in the

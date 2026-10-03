@@ -105,3 +105,34 @@ statement error
 CREATE SEMANTIC VIEW bad TABLES (b AS balances PRIMARY KEY (account_id, snapshot_date)) DIMENSIONS (b.d AS snapshot_date) METRICS (b.m NON ADDITIVE BY (b.nope) AS SUM(balance));
 ----
 Unknown column or semantic expression "b.nope"
+
+# NULL snapshots follow the requested NULL ordering (ASC defaults to NULLS LAST: the NULL snapshot is the last one)
+statement ok
+CREATE TABLE readings (sensor INTEGER, ts INTEGER, val INTEGER);
+
+statement ok
+INSERT INTO readings VALUES (1, 1, 10), (1, 2, 20), (1, NULL, 99), (2, 1, 5), (2, 3, 7);
+
+statement ok
+CREATE SEMANTIC VIEW meters
+  TABLES (r AS readings)
+  DIMENSIONS (r.sensor AS sensor, r.ts AS ts)
+  METRICS (
+    r.last_default NON ADDITIVE BY (r.ts) AS SUM(val),
+    r.last_non_null NON ADDITIVE BY (r.ts ASC NULLS FIRST) AS SUM(val),
+    r.first_value NON ADDITIVE BY (r.ts DESC) AS SUM(val),
+    r.first_or_null NON ADDITIVE BY (r.ts DESC NULLS LAST) AS SUM(val),
+    r.multi NON ADDITIVE BY (r.sensor, r.ts) AS SUM(val)
+  );
+
+query IIIII
+SELECT * FROM SEMANTIC_VIEW(meters DIMENSIONS r.sensor METRICS r.last_default, r.last_non_null, r.first_value, r.first_or_null) ORDER BY 1;
+----
+1	99	20	10	99
+2	7	7	5	5
+
+# several NON ADDITIVE BY dimensions: the last (sensor, ts) pair
+query I
+SELECT * FROM SEMANTIC_VIEW(meters METRICS r.multi);
+----
+7

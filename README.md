@@ -63,6 +63,8 @@ sense in Snowflake (`AI_SQL_GENERATION`, `AI_VERIFIED_QUERIES`, `WITH CORTEX SEA
 | `SHOW SEMANTIC VIEWS [LIKE 'pattern'] [IN SCHEMA s \| IN DATABASE d]` | |
 | `SHOW SEMANTIC DIMENSIONS \| METRICS \| FACTS [LIKE 'pattern'] [IN name]` | includes the data type of every member |
 | `SELECT ... FROM SEMANTIC_VIEW(name [DIMENSIONS ...] [METRICS ...] [FACTS ...] [WHERE ...]) [AS alias]` | composes with the rest of the query (joins, CTEs, `CREATE TABLE AS`, `EXPLAIN`, prepared statements) |
+| `SELECT dim, AGG(metric) FROM name [WHERE ...] GROUP BY dim [HAVING ...]` | the semantic view queried by name, like a regular view |
+| `SHOW SEMANTIC DIMENSIONS [LIKE ...] IN name FOR METRIC m` | dimensions `m` can be grouped by; `required` marks dimensions a window metric needs |
 | `SELECT sql FROM semantic_view_sql('<query>')` | shows the SQL a query compiles to |
 
 All statements can be used as table expressions, e.g. `SELECT name FROM (SHOW SEMANTIC METRICS IN sales)`.
@@ -80,6 +82,34 @@ All statements can be used as table expressions, e.g. `SELECT name FROM (SHOW SE
 - `FACTS` without `DIMENSIONS` return row-level values. `FACTS` and `METRICS` cannot be combined.
 - `PRIVATE` facts and metrics can be used in definitions but not queried.
 
+### Querying by name
+
+```sql
+SELECT customers.segment, AGG(lines.revenue), AGG(orders.avg_order) * 2 AS double_avg
+FROM sales
+WHERE orders.order_year >= 1995
+GROUP BY customers.segment
+HAVING AGG(lines.revenue) > 1000
+ORDER BY 2 DESC;
+```
+
+`GROUP BY` expressions become dimensions, metrics must be wrapped in `AGG(...)`, other aggregate functions over
+dimensions or facts are ad-hoc metrics, `WHERE` filters before aggregation and `HAVING` after. Without aggregation the
+select list is evaluated as facts, row by row. Names can be bare, qualified (`customers.segment`) or quoted as BI tools
+do (`"customers.segment"`). A table or view with the same name takes precedence. Not supported in this form (as in
+Snowflake): joins with the semantic view, window functions, `QUALIFY`, `SELECT *`.
+
+### Advanced metrics
+
+- `USING (relationship, ...)` picks the relationship used to reach a table when several connect the same tables
+  (role-playing dimensions, e.g. departure vs arrival airport). Without it such queries are rejected as ambiguous.
+- `NON ADDITIVE BY (dimension [ASC|DESC] [NULLS FIRST|LAST], ...)` makes a metric semi-additive: within every group,
+  only the rows of the last snapshot in that order are aggregated (balances, inventory levels).
+- Window function metrics, e.g.
+  `AVG(total_sales_quantity) OVER (PARTITION BY EXCLUDING date.date ORDER BY date.date RANGE BETWEEN INTERVAL '6 days'
+  PRECEDING AND CURRENT ROW)`, are evaluated over the aggregated rows; the dimensions they use must be requested in
+  the query. `PARTITION BY EXCLUDING d` partitions by every requested dimension except `d`.
+
 ## How queries are evaluated (and why they scale)
 
 A `SEMANTIC_VIEW(...)` clause is expanded at bind time into an ordinary DuckDB query; there is no custom
@@ -96,7 +126,10 @@ operator, so the optimizer and the parallel hash aggregates/joins apply unchange
    (Snowflake's "equal or lower granularity" rule); otherwise the query is rejected instead of silently fanning out.
 4. Blocks are merged on the dimension values (`UNION ALL` + `GROUP BY`, NULL dimension values match), and derived
    metrics are computed on the merged rows.
-5. Facts or dimensions that aggregate finer rows (`orders.line_count AS COUNT(lines.l_linenumber)`) and nested
+5. Semi-additive metrics get their own block that keeps the last snapshot of every group before aggregating (an
+   unordered window `max`/`min` for one non-additive dimension, `rank()` for several); window function metrics are
+   evaluated last, over the merged rows.
+6. Facts or dimensions that aggregate finer rows (`orders.line_count AS COUNT(lines.l_linenumber)`) and nested
    aggregates (`AVG(SUM(orders.o_totalprice))` on customers) become correlated scalar subqueries, which DuckDB
    decorrelates into a hash aggregate + join.
 
@@ -107,9 +140,7 @@ On a 100M-row fact table the generated queries run within a few percent of equiv
 
 - Semantic views live in memory, per database instance: they are not persisted in the database file and are
   not transactional (a `CREATE` inside a rolled-back transaction stays). Re-create them after restarting.
-- Not supported yet: the `SELECT dim, AGG(metric) FROM semantic_view GROUP BY dim` query form, `USING (...)`
-  relationship selection, `NON ADDITIVE BY`, window-function metrics, `ASOF` and range relationships,
-  `SHOW SEMANTIC DIMENSIONS ... FOR METRIC`. These are parsed and rejected with a clear error.
+- Not supported yet: `ASOF` and range relationships (parsed and rejected with a clear error).
 - A single statement cannot combine `SEMANTIC_VIEW(...)` with syntax of another parser extension such as
   `MATCH_RECOGNIZE`.
 - Physical columns of another logical table can be referenced directly in expressions (Snowflake requires a fact).
