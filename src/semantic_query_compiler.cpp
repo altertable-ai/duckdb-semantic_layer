@@ -30,10 +30,6 @@ string AtomColumn(idx_t index) {
 	return "__sv_a" + to_string(index);
 }
 
-string BridgeKeyColumn(idx_t index) {
-	return "__sv_k" + to_string(index);
-}
-
 constexpr const char *BLOCK_COLUMN = "__sv_block";
 
 string ItemWhat(const SemanticQueryItem &item) {
@@ -232,25 +228,141 @@ struct Block {
 	}
 };
 
-//! Dimensions of a block reached through the same many-to-many bridge: they come from one de-duplicated
-//! (anchor key, dimensions) mapping subquery joined to the block's rows
-struct BridgeGroup {
-	SemanticBridge bridge;
-	vector<idx_t> dimensions;
-	//! WHERE conjuncts on the bridged side: the group becomes a semi-join
-	vector<const ParsedExpression *> conjuncts;
-};
-
-//! Top-level AND conjuncts of `expr`
-void SplitConjuncts(const ParsedExpression &expr, vector<const ParsedExpression *> &conjuncts) {
-	if (expr.GetExpressionType() == ExpressionType::CONJUNCTION_AND) {
-		for (auto &child : expr.Cast<ConjunctionExpression>().children) {
-			SplitConjuncts(*child, conjuncts);
-		}
-		return;
+//! The many-to-many bridges of one aggregation block. Row-level items (dimensions, WHERE conjuncts) that the home table
+//! does not reach come from one de-duplicated mapping subquery per bridge,
+//!   SELECT DISTINCT <anchor key>, <bridged dimensions> FROM <bridge> [joins] WHERE <bridged conjuncts>
+//! joined to the block's rows on the anchor key: each home row joins at most once per combination of bridged dimension
+//! values, so nothing is counted twice within a group.
+class BlockBridges {
+public:
+	BlockBridges(const SemanticModel &model, SemanticAnalyzer &analyzer, SemanticExpressionCompiler &compiler,
+	             SemanticAliasGenerator &aliases, idx_t home, const vector<idx_t> &using_relationships)
+	    : model(model), analyzer(analyzer), compiler(compiler), aliases(aliases), resolver(model), home(home),
+	      using_relationships(using_relationships) {
 	}
-	conjuncts.push_back(&expr);
-}
+
+	//! The reference, in the block's rows, to dimension `expr` (output column `column`) when it is reached through a
+	//! bridge; nullptr when the home table reaches it
+	unique_ptr<ParsedExpression> Dimension(const ParsedExpression &expr, const string &column, const string &what) {
+		auto group = Place(expr, what, string());
+		if (!group) {
+			return nullptr;
+		}
+		group->dimensions.push_back(BridgedDimension {&expr, column, what});
+		return ColumnRef(column, group->alias);
+	}
+
+	//! Whether WHERE conjunct `expr` is reached through a bridge: it then filters the bridge's mapping subquery,
+	//! which becomes a semi-join
+	bool Condition(const ParsedExpression &expr) {
+		auto group = Place(expr, WHERE_WHAT, "; split it into separate conditions combined with AND");
+		if (!group) {
+			return false;
+		}
+		group->conditions.push_back(&expr);
+		return true;
+	}
+
+	//! The block's FROM clause: `scope` joined with the mapping subquery of every bridge
+	unique_ptr<TableRef> Join(SemanticJoinScope &scope) {
+		// the anchor keys join their tables into `scope`, so they come before its FROM clause is built
+		vector<unique_ptr<ParsedExpression>> conditions;
+		for (auto &group : groups) {
+			vector<unique_ptr<ParsedExpression>> keys;
+			for (idx_t c = 0; c < group.bridge.anchor_key.size(); c++) {
+				keys.push_back(Compare(ExpressionType::COMPARE_EQUAL,
+				                       scope.ColumnReference(group.bridge.anchor, group.bridge.anchor_key[c]),
+				                       ColumnRef(KeyColumn(c), group.alias)));
+			}
+			conditions.push_back(AndAll(std::move(keys)));
+		}
+		auto result = scope.BuildFrom();
+		for (idx_t g = 0; g < groups.size(); g++) {
+			auto join = make_uniq<JoinRef>(JoinRefType::REGULAR);
+			// home rows without a bridge row keep NULL bridged dimensions, unless bridged conditions filter them out
+			join->type = groups[g].conditions.empty() ? JoinType::LEFT : JoinType::INNER;
+			join->left = std::move(result);
+			join->right = MakeSubqueryRef(MappingQuery(groups[g]), groups[g].alias);
+			join->condition = std::move(conditions[g]);
+			result = std::move(join);
+		}
+		return result;
+	}
+
+private:
+	static constexpr const char *WHERE_WHAT = "Invalid WHERE clause";
+
+	struct BridgedDimension {
+		const ParsedExpression *expr;
+		string column;
+		string what;
+	};
+	//! Items reached through the same bridge, read from one mapping subquery
+	struct Group {
+		SemanticBridge bridge;
+		string alias;
+		vector<BridgedDimension> dimensions;
+		vector<const ParsedExpression *> conditions;
+	};
+
+	static string KeyColumn(idx_t index) {
+		return "__sv_k" + to_string(index);
+	}
+
+	//! The group of the bridge `expr` is reached through; nullptr when the home table reaches it
+	optional_ptr<Group> Place(const ParsedExpression &expr, const string &what, const string &hint) {
+		set<idx_t> tables;
+		analyzer.RowTables(expr, DConstants::INVALID_INDEX, tables, what);
+		bool local = true;
+		for (auto table : tables) {
+			local = local && model.Reaches(home, table);
+		}
+		if (local) {
+			return nullptr;
+		}
+		auto bridge = resolver.Resolve(home, tables, using_relationships, what, hint);
+		for (auto &group : groups) {
+			if (group.bridge.SameAs(bridge)) {
+				return &group;
+			}
+		}
+		groups.push_back(Group {std::move(bridge), aliases.NestedPrefix() + "bridge", {}, {}});
+		return &groups.back();
+	}
+
+	unique_ptr<QueryNode> MappingQuery(const Group &group) {
+		auto &bridge = group.bridge;
+		SemanticJoinScope scope(model, aliases, bridge.bridge, using_relationships, aliases.NestedPrefix());
+		auto node = make_uniq<SelectNode>();
+		for (idx_t c = 0; c < bridge.key_source_columns.size(); c++) {
+			auto key = scope.ColumnReference(bridge.key_source, bridge.key_source_columns[c]);
+			key->alias = KeyColumn(c);
+			node->select_list.push_back(std::move(key));
+		}
+		for (auto &dimension : group.dimensions) {
+			auto expr = compiler.Row(*dimension.expr, scope, DConstants::INVALID_INDEX, dimension.what);
+			expr->alias = dimension.column;
+			node->select_list.push_back(std::move(expr));
+		}
+		vector<unique_ptr<ParsedExpression>> conditions;
+		for (auto *condition : group.conditions) {
+			conditions.push_back(compiler.Row(*condition, scope, DConstants::INVALID_INDEX, WHERE_WHAT));
+		}
+		node->where_clause = AndAll(std::move(conditions));
+		node->modifiers.push_back(make_uniq<DistinctModifier>());
+		node->from_table = scope.BuildFrom();
+		return std::move(node);
+	}
+
+	const SemanticModel &model;
+	SemanticAnalyzer &analyzer;
+	SemanticExpressionCompiler &compiler;
+	SemanticAliasGenerator &aliases;
+	SemanticBridgeResolver resolver;
+	idx_t home;
+	const vector<idx_t> &using_relationships;
+	vector<Group> groups;
+};
 
 class MetricQueryCompiler {
 public:
@@ -258,8 +370,7 @@ public:
 	                    SemanticAliasGenerator &aliases, const SemanticQuerySpec &spec,
 	                    const vector<const SemanticQueryItem *> &dimensions,
 	                    const vector<const SemanticQueryItem *> &metrics)
-	    : model(model), analyzer(analyzer), compiler(compiler), aliases(aliases), spec(spec), dimensions(dimensions),
-	      resolver(model) {
+	    : model(model), analyzer(analyzer), compiler(compiler), aliases(aliases), spec(spec), dimensions(dimensions) {
 		for (auto *item : metrics) {
 			posts.push_back(analyzer.Decompose(*item->resolved, SemanticMetricContext(), atoms, ItemWhat(*item)));
 		}
@@ -303,42 +414,16 @@ private:
 	//! (optionally restricted to the last snapshot); the outer select aggregates them by dimension. With `tag`,
 	//! every atom of the query gets a column (NULL when not owned) plus the block tag, for the UNION ALL merge.
 	unique_ptr<SelectNode> BuildBlock(const Block &block, optional_idx tag) {
-		vector<BridgeGroup> bridges;
-		vector<idx_t> dimension_bridge;
-		for (auto *dimension : dimensions) {
-			dimension_bridge.push_back(
-			    PlaceRowItem(block, *dimension->resolved, ItemWhat(*dimension), string(), bridges));
-		}
-		vector<unique_ptr<ParsedExpression>> local_conjuncts;
-		if (spec.where) {
-			vector<const ParsedExpression *> conjuncts;
-			SplitConjuncts(*spec.where, conjuncts);
-			for (auto *conjunct : conjuncts) {
-				auto bridge = PlaceRowItem(block, *conjunct, "Invalid WHERE clause",
-				                           "; split it into separate conditions combined with AND", bridges);
-				if (bridge == DConstants::INVALID_INDEX) {
-					local_conjuncts.push_back(conjunct->Copy());
-				} else {
-					bridges[bridge].conjuncts.push_back(conjunct);
-				}
-			}
-		}
-		vector<string> bridge_aliases;
-		for (idx_t b = 0; b < bridges.size(); b++) {
-			bridge_aliases.push_back(aliases.NestedPrefix() + "bridge");
-		}
 		SemanticJoinScope scope(model, aliases, block.home, block.using_relationships);
+		BlockBridges bridges(model, analyzer, compiler, aliases, block.home, block.using_relationships);
 		auto rows = make_uniq<SelectNode>();
 		auto aggregate = make_uniq<SelectNode>();
 		vector<unique_ptr<ParsedExpression>> groups;
 		for (idx_t d = 0; d < dimensions.size(); d++) {
-			unique_ptr<ParsedExpression> expr;
-			if (dimension_bridge[d] == DConstants::INVALID_INDEX) {
-				expr =
-				    compiler.Row(*dimensions[d]->resolved, scope, DConstants::INVALID_INDEX, ItemWhat(*dimensions[d]));
-			} else {
-				bridges[dimension_bridge[d]].dimensions.push_back(d);
-				expr = ColumnRef(DimensionColumn(d), bridge_aliases[dimension_bridge[d]]);
+			auto what = ItemWhat(*dimensions[d]);
+			auto expr = bridges.Dimension(*dimensions[d]->resolved, DimensionColumn(d), what);
+			if (!expr) {
+				expr = compiler.Row(*dimensions[d]->resolved, scope, DConstants::INVALID_INDEX, what);
 			}
 			groups.push_back(expr->Copy());
 			expr->alias = DimensionColumn(d);
@@ -381,35 +466,25 @@ private:
 			aggregate->where_clause =
 			    LastSnapshotFilter(model.members[block.non_additive_member], scope, std::move(groups), *rows);
 		}
-		if (!local_conjuncts.empty()) {
-			rows->where_clause = compiler.Row(*AndAll(std::move(local_conjuncts)), scope, DConstants::INVALID_INDEX,
-			                                  "Invalid WHERE clause");
+		if (spec.where) {
+			vector<const ParsedExpression *> conjuncts;
+			SplitConjuncts(*spec.where, conjuncts);
+			vector<unique_ptr<ParsedExpression>> local_conjuncts;
+			for (auto *conjunct : conjuncts) {
+				if (!bridges.Condition(*conjunct)) {
+					local_conjuncts.push_back(conjunct->Copy());
+				}
+			}
+			if (!local_conjuncts.empty()) {
+				rows->where_clause = compiler.Row(*AndAll(std::move(local_conjuncts)), scope, DConstants::INVALID_INDEX,
+				                                  "Invalid WHERE clause");
+			}
 		}
 		if (rows->select_list.empty()) {
 			// e.g. only COUNT(*): the rows still have to be produced
 			rows->select_list.push_back(make_uniq<ConstantExpression>(Value::BOOLEAN(true)));
 		}
-		// the anchor key of every bridge on the home side, before the joins of the scope are built
-		vector<vector<unique_ptr<ParsedExpression>>> bridge_conditions;
-		for (idx_t b = 0; b < bridges.size(); b++) {
-			auto &bridge = bridges[b].bridge;
-			vector<unique_ptr<ParsedExpression>> conditions;
-			for (idx_t c = 0; c < bridge.anchor_key.size(); c++) {
-				conditions.push_back(Compare(ExpressionType::COMPARE_EQUAL,
-				                             scope.ColumnReference(bridge.anchor, bridge.anchor_key[c]),
-				                             ColumnRef(BridgeKeyColumn(c), bridge_aliases[b])));
-			}
-			bridge_conditions.push_back(std::move(conditions));
-		}
-		rows->from_table = scope.BuildFrom();
-		for (idx_t b = 0; b < bridges.size(); b++) {
-			auto join = make_uniq<JoinRef>(JoinRefType::REGULAR);
-			join->type = bridges[b].conjuncts.empty() ? JoinType::LEFT : JoinType::INNER;
-			join->left = std::move(rows->from_table);
-			join->right = MakeSubqueryRef(BridgeMap(block, bridges[b]), bridge_aliases[b]);
-			join->condition = AndAll(std::move(bridge_conditions[b]));
-			rows->from_table = std::move(join);
-		}
+		rows->from_table = bridges.Join(scope);
 		if (tag.IsValid()) {
 			auto tag_value = make_uniq<ConstantExpression>(Value::BIGINT(NumericCast<int64_t>(tag.GetIndex())));
 			tag_value->alias = BLOCK_COLUMN;
@@ -418,56 +493,6 @@ private:
 		GroupByAll(*aggregate);
 		aggregate->from_table = MakeSubqueryRef(std::move(rows), "__sv_rows");
 		return aggregate;
-	}
-
-	//! Where a row-level item of the query is evaluated for `block`: INVALID_INDEX for the block's own rows (every
-	//! table it reads is reachable from the home table), else the index of its bridge group in `bridges`
-	idx_t PlaceRowItem(const Block &block, const ParsedExpression &expr, const string &what, const string &hint,
-	                   vector<BridgeGroup> &bridges) {
-		set<idx_t> tables;
-		analyzer.RowTables(expr, DConstants::INVALID_INDEX, tables, what);
-		bool local = true;
-		for (auto table : tables) {
-			local = local && model.Reaches(block.home, table);
-		}
-		if (local) {
-			return DConstants::INVALID_INDEX;
-		}
-		auto bridge = resolver.Resolve(block.home, tables, block.using_relationships, what, hint);
-		for (idx_t b = 0; b < bridges.size(); b++) {
-			if (bridges[b].bridge.SameAs(bridge)) {
-				return b;
-			}
-		}
-		bridges.push_back(BridgeGroup {std::move(bridge), {}});
-		return bridges.size() - 1;
-	}
-
-	//! SELECT DISTINCT <anchor key>, <bridged dimensions> FROM <bridge> [joins]: each row of the home table joins
-	//! at most one row per combination of bridged dimension values, so nothing is counted twice within a group
-	unique_ptr<QueryNode> BridgeMap(const Block &block, const BridgeGroup &group) {
-		auto &bridge = group.bridge;
-		SemanticJoinScope scope(model, aliases, bridge.bridge, block.using_relationships, aliases.NestedPrefix());
-		auto node = make_uniq<SelectNode>();
-		for (idx_t c = 0; c < bridge.key_source_columns.size(); c++) {
-			auto key = scope.ColumnReference(bridge.key_source, bridge.key_source_columns[c]);
-			key->alias = BridgeKeyColumn(c);
-			node->select_list.push_back(std::move(key));
-		}
-		for (auto d : group.dimensions) {
-			auto expr =
-			    compiler.Row(*dimensions[d]->resolved, scope, DConstants::INVALID_INDEX, ItemWhat(*dimensions[d]));
-			expr->alias = DimensionColumn(d);
-			node->select_list.push_back(std::move(expr));
-		}
-		vector<unique_ptr<ParsedExpression>> conditions;
-		for (auto *conjunct : group.conjuncts) {
-			conditions.push_back(compiler.Row(*conjunct, scope, DConstants::INVALID_INDEX, "Invalid WHERE clause"));
-		}
-		node->where_clause = AndAll(std::move(conditions));
-		node->modifiers.push_back(make_uniq<DistinctModifier>());
-		node->from_table = scope.BuildFrom();
-		return std::move(node);
 	}
 
 	//! Semi-additive metrics keep, within every group of dimension values (`partitions`), the rows of the last
@@ -561,7 +586,6 @@ private:
 	SemanticAliasGenerator &aliases;
 	const SemanticQuerySpec &spec;
 	const vector<const SemanticQueryItem *> &dimensions;
-	SemanticBridgeResolver resolver;
 	vector<SemanticAtom> atoms;
 	vector<unique_ptr<ParsedExpression>> posts;
 	vector<Block> blocks;

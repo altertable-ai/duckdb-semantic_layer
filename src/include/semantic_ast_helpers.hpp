@@ -39,6 +39,17 @@ inline unique_ptr<ParsedExpression> AndAll(vector<unique_ptr<ParsedExpression>> 
 	return result;
 }
 
+//! Top-level AND conjuncts of `expr` (pointers into it)
+inline void SplitConjuncts(const ParsedExpression &expr, vector<const ParsedExpression *> &conjuncts) {
+	if (expr.GetExpressionType() == ExpressionType::CONJUNCTION_AND) {
+		for (auto &child : expr.Cast<ConjunctionExpression>().children) {
+			SplitConjuncts(*child, conjuncts);
+		}
+		return;
+	}
+	conjuncts.push_back(&expr);
+}
+
 inline unique_ptr<SelectStatement> MakeSelectStatement(unique_ptr<QueryNode> node) {
 	auto statement = make_uniq<SelectStatement>();
 	statement->node = std::move(node);
