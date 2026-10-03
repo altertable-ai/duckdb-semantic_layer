@@ -1,0 +1,88 @@
+# name: test/sql/semantic_views/ddl_properties.test
+# description: every optional table / member / view property of CREATE SEMANTIC VIEW is accepted and kept
+# group: [semantic_views]
+
+require semantic_views
+
+statement ok
+CREATE TABLE products (id INTEGER, sku VARCHAR, category VARCHAR, price DECIMAL(10, 2));
+
+statement ok
+INSERT INTO products VALUES (1, 'A-1', 'toys', 10), (2, 'B-2', 'toys', 5), (3, 'C-3', 'books', 20);
+
+query I
+CREATE OR ALTER SEMANTIC VIEW catalog_view
+  TABLES (
+    p AS products PRIMARY KEY (id) UNIQUE (sku) WITH SYNONYMS = ('items', 'goods') COMMENT = 'Products'
+      WITH TAG (governance.owner = 'catalog-team', tier = 'gold')
+  )
+  DIMENSIONS (
+    PUBLIC p.category LABELS = (department) AS category
+      WITH SYNONYMS ('kind') COMMENT = 'Product category' WITH TAG (pii = 'no')
+      SAMPLE_VALUES ('toys', 'books') IS_ENUM,
+    p.sku AS sku WITH CORTEX SEARCH SERVICE search_db.search_schema.sku_search USING sku
+  )
+  METRICS (
+    p.total_price AS SUM(price) SYNONYMS ('revenue'),
+    PRIVATE p.max_price AS MAX(price)
+  )
+  COMMENT = 'Product catalog'
+  MAX_STALENESS = 3600
+  AI_SQL_GENERATION 'Prefer the category dimension'
+  AI_QUESTION_CATEGORIZATION 'Only answer catalog questions'
+  AI_VERIFIED_QUERIES (
+    toys_total AS (
+      QUESTION 'What is the total price of toys?'
+      VERIFIED_AT 1700000000
+      ONBOARDING_QUESTION TRUE
+      VERIFIED_BY 'analyst'
+      SQL 'SELECT * FROM SEMANTIC_VIEW(catalog_view DIMENSIONS p.category METRICS p.total_price)'
+    )
+  )
+  WITH TAG (domain = 'commerce')
+  COPY GRANTS;
+----
+Semantic view CATALOG_VIEW successfully created.
+
+query II
+SELECT * FROM SEMANTIC_VIEW(catalog_view DIMENSIONS p.category METRICS p.total_price) ORDER BY ALL;
+----
+books	20.00
+toys	15.00
+
+query IIIII
+SELECT object_kind, object_name, parent_entity, property, property_value FROM (DESCRIBE SEMANTIC VIEW catalog_view)
+WHERE property IN ('COMMENT', 'SYNONYMS', 'UNIQUE_KEY', 'ACCESS_MODIFIER')
+ORDER BY ALL;
+----
+DIMENSION	category	p	ACCESS_MODIFIER	PUBLIC
+DIMENSION	category	p	COMMENT	Product category
+DIMENSION	category	p	SYNONYMS	[kind]
+DIMENSION	sku	p	ACCESS_MODIFIER	PUBLIC
+METRIC	max_price	p	ACCESS_MODIFIER	PRIVATE
+METRIC	total_price	p	ACCESS_MODIFIER	PUBLIC
+METRIC	total_price	p	SYNONYMS	[revenue]
+TABLE	p	NULL	COMMENT	Products
+TABLE	p	NULL	SYNONYMS	[items, goods]
+TABLE	p	NULL	UNIQUE_KEY	[sku]
+NULL	NULL	NULL	COMMENT	Product catalog
+
+# ALTER copies the definition (a serialization round trip of every property) and rebuilds the view
+statement ok
+ALTER SEMANTIC VIEW catalog_view SET COMMENT = 'Products, altered';
+
+query II
+SELECT name, comment FROM (SHOW SEMANTIC VIEWS IN DATABASE memory);
+----
+catalog_view	Products, altered
+
+query II
+SELECT name, comment FROM (SHOW SEMANTIC VIEWS LIKE 'CATALOG%' IN SCHEMA memory.main);
+----
+catalog_view	Products, altered
+
+query II
+SELECT * FROM SEMANTIC_VIEW(catalog_view DIMENSIONS p.category METRICS p.total_price) ORDER BY ALL;
+----
+books	20.00
+toys	15.00
