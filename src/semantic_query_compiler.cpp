@@ -98,15 +98,24 @@ public:
 			right->alias = AliasOf(join.table);
 			auto &parent_columns = join.edge.reversed ? rel.to_columns : rel.from_columns;
 			auto &child_columns = join.edge.reversed ? rel.from_columns : rel.to_columns;
-			if (rel.asof_index != DConstants::INVALID_INDEX || rel.is_range) {
-				throw NotImplementedException("ASOF and range relationships are not supported yet");
+			if (rel.is_range) {
+				throw NotImplementedException("range relationships are not supported yet");
 			}
 			vector<unique_ptr<ParsedExpression>> conditions;
 			for (idx_t c = 0; c < parent_columns.size(); c++) {
+				if (c == rel.asof_index) {
+					// ASOF: the latest row of the referenced table at or before the referencing value
+					conditions.push_back(make_uniq<ComparisonExpression>(
+					    ExpressionType::COMPARE_GREATERTHANOREQUALTO,
+					    make_uniq<ColumnRefExpression>(parent_columns[c], AliasOf(join.parent_table)),
+					    make_uniq<ColumnRefExpression>(child_columns[c], AliasOf(join.table))));
+					continue;
+				}
 				conditions.push_back(
 				    Equals(AliasOf(join.parent_table), parent_columns[c], AliasOf(join.table), child_columns[c]));
 			}
-			auto join_ref = make_uniq<JoinRef>(JoinRefType::REGULAR);
+			auto join_ref = make_uniq<JoinRef>(rel.asof_index != DConstants::INVALID_INDEX ? JoinRefType::ASOF
+			                                                                               : JoinRefType::REGULAR);
 			join_ref->type = JoinType::LEFT;
 			join_ref->left = std::move(result);
 			join_ref->right = std::move(right);
@@ -228,6 +237,11 @@ private:
 		auto &last = path.back();
 		auto source = path.size() >= 2 ? path[path.size() - 2].target : atom.home;
 		auto &rel = model.relationships[last.relationship];
+		if (rel.asof_index != DConstants::INVALID_INDEX || rel.is_range) {
+			throw BinderException("%s: aggregating the rows of \"%s\" through the ASOF / range relationship \"%s\" "
+			                      "is not supported",
+			                      what, model.tables[atom.home].name, rel.name);
+		}
 		auto &inner_columns = last.reversed ? rel.to_columns : rel.from_columns;
 		auto &outer_columns = last.reversed ? rel.from_columns : rel.to_columns;
 		auto inner_alias = inner.Ensure(source);
