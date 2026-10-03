@@ -53,3 +53,9 @@ SELECT category, SUM(amount) AS last_day_revenue FROM (SELECT p.category, s.amou
 SELECT * FROM SEMANTIC_VIEW(sales_sv DIMENSIONS f.fiscal_quarter METRICS s.revenue)
 -- handwritten
 SELECT f.name AS fiscal_quarter, SUM(s.amount) AS revenue FROM sales s LEFT JOIN fiscal_periods f ON s.sale_date >= f.start_date AND s.sale_date < f.end_date GROUP BY 1
+
+-- name: q10_many_to_many
+-- semantic
+SELECT * FROM SEMANTIC_VIEW(sales_sv DIMENSIONS p.category METRICS c.customer_count)
+-- handwritten
+SELECT p.category, COUNT(DISTINCT s.customer_id) AS customer_count FROM sales s LEFT JOIN products p ON s.product_id = p.id GROUP BY 1

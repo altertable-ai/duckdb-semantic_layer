@@ -105,6 +105,14 @@ Snowflake): joins with the semantic view, window functions, `QUALIFY`, `SELECT *
   (role-playing dimensions, e.g. departure vs arrival airport). Without it such queries are rejected as ambiguous.
 - `NON ADDITIVE BY (dimension [ASC|DESC] [NULLS FIRST|LAST], ...)` makes a metric semi-additive: within every group,
   only the rows of the last snapshot in that order are aggregated (balances, inventory levels).
+- Many-to-many relationships through a bridge table: with `book_authors (author_id) REFERENCES authors` and
+  `book_authors (book_id) REFERENCES books`, `books.total_pages` can be grouped or filtered by `authors.country`. Every
+  book counts once per group (a book with two French authors counts once for `FR`), and totals without bridged
+  dimensions are unchanged. Any table with relationships to both sides acts as a bridge, including fact tables
+  (`customers.customer_count` by `products.category` through `sales` counts the customers who bought in each
+  category); a dimension stored on the bridge itself is still rejected. When several bridges connect the same tables,
+  `USING (relationship)` on the metric picks one. Rows without any bridge row get NULL bridged dimensions, and a
+  `WHERE` condition on bridged tables keeps only rows with a matching bridge row.
 - `ASOF` relationships, `orders (o_cust_id, o_ord_date) REFERENCES addresses (ca_cust_id, ASOF ca_start_date)`, join
   each row to the latest referenced row at or before its value (`ASOF LEFT JOIN`).
 - Range relationships, `events (ts) REFERENCES periods (BETWEEN start_time AND end_time EXCLUSIVE)` with
@@ -129,13 +137,17 @@ operator, so the optimizer and the parallel hash aggregates/joins apply unchange
    Joins only follow relationships towards the "one" side, so they can never multiply the home table's rows, and
    only the tables actually referenced are joined.
 3. A dimension (or filter) must be reachable from every metric's home table through many-to-one relationships
-   (Snowflake's "equal or lower granularity" rule); otherwise the query is rejected instead of silently fanning out.
-4. Blocks are merged on the dimension values (`UNION ALL` + `GROUP BY`, NULL dimension values match), and derived
+   (Snowflake's "equal or lower granularity" rule), or through a bridge table (step 4); otherwise the query is
+   rejected instead of silently fanning out.
+4. Dimensions and filters reached through a many-to-many bridge come from a `SELECT DISTINCT (key, dimensions)`
+   subquery over the bridge, joined to the home table on the key they share: each home row joins at most once per
+   group of dimension values, so nothing is double counted.
+5. Blocks are merged on the dimension values (`UNION ALL` + `GROUP BY`, NULL dimension values match), and derived
    metrics are computed on the merged rows.
-5. Semi-additive metrics get their own block that keeps the last snapshot of every group before aggregating (an
+6. Semi-additive metrics get their own block that keeps the last snapshot of every group before aggregating (an
    unordered window `max`/`min` for one non-additive dimension, `rank()` for several); window function metrics are
    evaluated last, over the merged rows.
-6. Facts or dimensions that aggregate finer rows (`orders.line_count AS COUNT(lines.l_linenumber)`) and nested
+7. Facts or dimensions that aggregate finer rows (`orders.line_count AS COUNT(lines.l_linenumber)`) and nested
    aggregates (`AVG(SUM(orders.o_totalprice))` on customers) become correlated scalar subqueries, which DuckDB
    decorrelates into a hash aggregate + join.
 
