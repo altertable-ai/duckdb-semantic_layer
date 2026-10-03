@@ -20,6 +20,35 @@ SELECT a AS b, b AS z FROM alias_view ORDER BY b, z;
 1	20
 2	10
 
+# A view-qualified name can only refer to an input, never to an output alias.
+statement error
+SELECT a AS x FROM alias_view ORDER BY alias_view.x;
+----
+Unknown column or semantic expression "x"
+
+statement error
+SELECT a AS x FROM alias_view ORDER BY alias_view.x + 0;
+----
+Unknown column or semantic expression "x"
+
+statement error
+SELECT a AS x, AGG(n) FROM alias_view GROUP BY alias_view.x;
+----
+Unknown column or semantic expression "x"
+
+statement error
+SELECT a AS x, AGG(n) FROM alias_view GROUP BY a ORDER BY alias_view.x + 0;
+----
+Unknown column or semantic expression "x"
+
+# Repeated GROUP BY aliases also resolve to the last output expression.
+query III
+SELECT 0 AS x, b AS x, AGG(n) FROM alias_view GROUP BY x ORDER BY 2;
+----
+0	5	1
+0	10	1
+0	20	1
+
 # Inside an expression (or with qualification), input names take precedence.
 query II
 SELECT a AS b, b AS z FROM alias_view ORDER BY b + 0;

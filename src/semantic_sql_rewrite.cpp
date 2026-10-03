@@ -205,7 +205,8 @@ private:
 			if (node->GetExpressionClass() == ExpressionClass::COLUMN_REF) {
 				auto &colref = node->Cast<ColumnRefExpression>();
 				auto names = colref.column_names;
-				if (names.size() >= 2 && IsViewQualifier(names[0])) {
+				auto view_qualified = names.size() >= 2 && IsViewQualifier(names[0]);
+				if (view_qualified) {
 					names.erase(names.begin());
 				}
 				if (names.size() == 1 && StringUtil::Contains(names[0], ".")) {
@@ -213,6 +214,13 @@ private:
 					auto table = names[0].substr(0, dot);
 					if (model.FindTable(table).IsValid()) {
 						names = {table, names[0].substr(dot + 1)};
+					}
+				}
+				if (view_qualified) {
+					// Qualifying a name with the view excludes output aliases, including inside scalar expressions.
+					string error;
+					if (model.Lookup(names, SemanticResolveContext(), error).Is(SemanticRefKind::NONE)) {
+						throw BinderException("%s", error);
 					}
 				}
 				auto alias = node->alias;
@@ -267,10 +275,9 @@ private:
 		if (normalized->GetExpressionClass() == ExpressionClass::COLUMN_REF) {
 			auto &colref = normalized->Cast<ColumnRefExpression>();
 			if (!colref.IsQualified() && !HasInputName(colref.GetColumnName())) {
-				for (idx_t i = 0; i < select.size(); i++) {
-					if (!select_aliases[i].empty() && StringUtil::CIEquals(select_aliases[i], colref.GetColumnName())) {
-						return WithoutAlias(*select[i]);
-					}
+				auto alias = OutputAlias(*normalized);
+				if (alias.IsValid()) {
+					return WithoutAlias(*select[alias.GetIndex()]);
 				}
 			}
 		}
