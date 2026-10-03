@@ -25,7 +25,9 @@ struct SemanticBridge {
 	idx_t anchor = DConstants::INVALID_INDEX;
 	//! Key columns of the anchor (a primary or unique key)
 	vector<string> anchor_key;
-	//! Table on the bridge's path to the anchor whose columns reference the anchor key, and those columns
+	//! Table on the bridge's path to the anchor whose columns reference the anchor key, and those columns. The mapping
+	//! subquery reads the key there rather than from the anchor itself, so it never joins the anchor (which can be a
+	//! large fact table, e.g. customers through sales).
 	idx_t key_source = DConstants::INVALID_INDEX;
 	vector<string> key_source_columns;
 
