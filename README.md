@@ -342,7 +342,7 @@ query (`SHOW SEMANTIC DIMENSIONS IN <view> FOR METRIC <metric>` marks them as `r
 | `ALTER SEMANTIC VIEW [IF EXISTS] <name> SET COMMENT = '<text>' \| UNSET COMMENT` | |
 | `DESCRIBE SEMANTIC VIEW <name>` | the definition, in Snowflake's layout (`object_kind, object_name, parent_entity, property, property_value`) |
 | `SHOW SEMANTIC VIEWS [LIKE '<pattern>'] [IN SCHEMA <schema> \| IN DATABASE <database>]` | |
-| `SHOW SEMANTIC DIMENSIONS \| FACTS \| METRICS [LIKE '<pattern>'] [IN <name>]` | public members, with their data types |
+| `SHOW SEMANTIC DIMENSIONS \| FACTS \| METRICS [LIKE '<pattern>'] [IN <name>]` | defined members (including private ones), with their data types |
 | `SHOW SEMANTIC DIMENSIONS [LIKE '<pattern>'] IN <name> FOR METRIC <metric>` | the dimensions a metric can be grouped by |
 
 Every statement can be used as a table expression: `SELECT name FROM (SHOW SEMANTIC METRICS IN sales)`.

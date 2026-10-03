@@ -1,5 +1,6 @@
 #include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/to_string.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "semantic_analysis.hpp"
@@ -169,6 +170,14 @@ static string BracketList(const vector<string> &values) {
 	return "[" + StringUtil::Join(values, ", ") + "]";
 }
 
+static string TagList(const vector<ParsedSemanticTag> &tags) {
+	vector<string> values;
+	for (auto &tag : tags) {
+		values.push_back(tag.name + "=" + tag.value);
+	}
+	return tags.empty() ? string() : BracketList(values);
+}
+
 static unique_ptr<FunctionData> DescribeBind(ClientContext &context, TableFunctionBindInput &input,
                                              vector<LogicalType> &return_types, vector<string> &names) {
 	names = {"object_kind", "object_name", "parent_entity", "property", "property_value"};
@@ -183,7 +192,28 @@ static unique_ptr<FunctionData> DescribeBind(ClientContext &context, TableFuncti
 		}
 	};
 	add(null_value, null_value, null_value, "COMMENT", model->Comment());
-	for (auto &table : model->tables) {
+	auto &definition = *model->definition;
+	add(null_value, null_value, null_value, "TAGS", TagList(definition.tags));
+	if (definition.has_max_staleness) {
+		add(null_value, null_value, null_value, "MAX_STALENESS", to_string(definition.max_staleness));
+	}
+	if (definition.copy_grants) {
+		add(null_value, null_value, null_value, "COPY_GRANTS", "true");
+	}
+	Value instructions("CUSTOM_INSTRUCTIONS");
+	add(instructions, null_value, null_value, "AI_SQL_GENERATION", definition.ai_sql_generation);
+	add(instructions, null_value, null_value, "AI_QUESTION_CATEGORIZATION", definition.ai_question_categorization);
+	for (auto &query : definition.verified_queries) {
+		Value kind("AI_VERIFIED_QUERY");
+		Value object(query.name);
+		add(kind, object, null_value, "QUESTION", query.question);
+		add(kind, object, null_value, "VERIFIED_AT", query.verified_at);
+		add(kind, object, null_value, "ONBOARDING_QUESTION", query.onboarding_question ? "true" : "false");
+		add(kind, object, null_value, "VERIFIED_BY", query.verified_by);
+		add(kind, object, null_value, "SQL", query.sql);
+	}
+	for (idx_t t = 0; t < model->tables.size(); t++) {
+		auto &table = model->tables[t];
 		Value kind("TABLE");
 		Value object(table.name);
 		if (table.IsBaseTable()) {
@@ -203,6 +233,7 @@ static unique_ptr<FunctionData> DescribeBind(ClientContext &context, TableFuncti
 			add(kind, object, null_value, "SYNONYMS", BracketList(table.synonyms));
 		}
 		add(kind, object, null_value, "COMMENT", table.comment);
+		add(kind, object, null_value, "TAGS", TagList(definition.tables[t].tags));
 	}
 	for (auto &rel : model->relationships) {
 		Value kind("RELATIONSHIP");
@@ -217,6 +248,7 @@ static unique_ptr<FunctionData> DescribeBind(ClientContext &context, TableFuncti
 		}
 	}
 	for (auto &member : model->members) {
+		auto &parsed = *member.parsed;
 		Value kind(member.IsDerived() ? "DERIVED_METRIC" : SemanticMemberKindToString(member.Kind()));
 		Value object(member.Name());
 		auto parent = TableName(*model, member);
@@ -231,6 +263,20 @@ static unique_ptr<FunctionData> DescribeBind(ClientContext &context, TableFuncti
 			add(kind, object, parent, "SYNONYMS", BracketList(member.parsed->synonyms));
 		}
 		add(kind, object, parent, "COMMENT", member.parsed->comment);
+		add(kind, object, parent, "TAGS", TagList(parsed.tags));
+		if (!parsed.labels.empty()) {
+			add(kind, object, parent, "LABELS", BracketList(parsed.labels));
+		}
+		if (!parsed.sample_values.empty()) {
+			add(kind, object, parent, "SAMPLE_VALUES", BracketList(parsed.sample_values));
+		}
+		if (parsed.is_enum) {
+			add(kind, object, parent, "IS_ENUM", "true");
+		}
+		if (!parsed.cortex_search_service.empty()) {
+			add(kind, object, parent, "CORTEX_SEARCH_SERVICE", parsed.cortex_search_service);
+			add(kind, object, parent, "CORTEX_SEARCH_SERVICE_COLUMN_NAME", parsed.cortex_search_column);
+		}
 		if (!member.IsDerived()) {
 			add(kind, object, parent, "ACCESS_MODIFIER", member.IsPrivate() ? "PRIVATE" : "PUBLIC");
 		}

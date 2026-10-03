@@ -50,6 +50,32 @@ SELECT * FROM SEMANTIC_VIEW(catalog_view DIMENSIONS p.category METRICS p.total_p
 books	20.00
 toys	15.00
 
+# Retained metadata must remain inspectable.
+query IIIII
+SELECT * FROM (DESCRIBE SEMANTIC VIEW catalog_view)
+WHERE property IN ('LABELS', 'SAMPLE_VALUES', 'IS_ENUM', 'TAGS', 'MAX_STALENESS', 'COPY_GRANTS',
+                   'AI_SQL_GENERATION', 'AI_QUESTION_CATEGORIZATION', 'QUESTION', 'VERIFIED_AT',
+                   'ONBOARDING_QUESTION', 'VERIFIED_BY', 'SQL', 'CORTEX_SEARCH_SERVICE', 'CORTEX_SEARCH_SERVICE_COLUMN_NAME')
+ORDER BY ALL;
+----
+AI_VERIFIED_QUERY	toys_total	NULL	ONBOARDING_QUESTION	true
+AI_VERIFIED_QUERY	toys_total	NULL	QUESTION	What is the total price of toys?
+AI_VERIFIED_QUERY	toys_total	NULL	SQL	SELECT * FROM SEMANTIC_VIEW(catalog_view DIMENSIONS p.category METRICS p.total_price)
+AI_VERIFIED_QUERY	toys_total	NULL	VERIFIED_AT	1700000000
+AI_VERIFIED_QUERY	toys_total	NULL	VERIFIED_BY	analyst
+CUSTOM_INSTRUCTIONS	NULL	NULL	AI_QUESTION_CATEGORIZATION	Only answer catalog questions
+CUSTOM_INSTRUCTIONS	NULL	NULL	AI_SQL_GENERATION	Prefer the category dimension
+DIMENSION	category	p	IS_ENUM	true
+DIMENSION	category	p	LABELS	[department]
+DIMENSION	category	p	SAMPLE_VALUES	[toys, books]
+DIMENSION	category	p	TAGS	[pii=no]
+DIMENSION	sku	p	CORTEX_SEARCH_SERVICE	search_db.search_schema.sku_search
+DIMENSION	sku	p	CORTEX_SEARCH_SERVICE_COLUMN_NAME	sku
+TABLE	p	NULL	TAGS	[governance.owner=catalog-team, tier=gold]
+NULL	NULL	NULL	COPY_GRANTS	true
+NULL	NULL	NULL	MAX_STALENESS	3600
+NULL	NULL	NULL	TAGS	[domain=commerce]
+
 query IIIII
 SELECT object_kind, object_name, parent_entity, property, property_value FROM (DESCRIBE SEMANTIC VIEW catalog_view)
 WHERE property IN ('COMMENT', 'SYNONYMS', 'UNIQUE_KEY', 'ACCESS_MODIFIER')
@@ -66,6 +92,9 @@ TABLE	p	NULL	COMMENT	Products
 TABLE	p	NULL	SYNONYMS	[items, goods]
 TABLE	p	NULL	UNIQUE_KEY	[sku]
 NULL	NULL	NULL	COMMENT	Product catalog
+
+statement ok
+CREATE TEMP TABLE metadata_before_alter AS SELECT * FROM (DESCRIBE SEMANTIC VIEW catalog_view) WHERE property <> 'COMMENT';
 
 # ALTER copies the definition (a serialization round trip of every property) and rebuilds the view
 statement ok
@@ -86,3 +115,13 @@ SELECT * FROM SEMANTIC_VIEW(catalog_view DIMENSIONS p.category METRICS p.total_p
 ----
 books	20.00
 toys	15.00
+
+query I
+WITH after_alter AS (SELECT * FROM (DESCRIBE SEMANTIC VIEW catalog_view) WHERE property <> 'COMMENT')
+SELECT count(*) FROM (
+  (SELECT * FROM metadata_before_alter EXCEPT ALL SELECT * FROM after_alter)
+  UNION ALL
+  (SELECT * FROM after_alter EXCEPT ALL SELECT * FROM metadata_before_alter)
+);
+----
+0
