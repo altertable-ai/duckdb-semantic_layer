@@ -35,14 +35,8 @@ public:
 	//! belongs to) resolve in this scope instead
 	SemanticJoinScope Nested(idx_t base, idx_t outer_context);
 
-	idx_t Base() const {
-		return base;
-	}
 	const vector<idx_t> &UsingRelationships() const {
 		return using_relationships;
-	}
-	SemanticAliasGenerator &Aliases() {
-		return aliases;
 	}
 
 	//! Joins `table` (and the tables on its path) into this scope; returns its alias

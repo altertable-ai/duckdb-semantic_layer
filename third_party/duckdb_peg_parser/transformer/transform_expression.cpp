@@ -3,6 +3,7 @@
 #include "duckdb/parser/expression/subquery_expression.hpp"
 #include "duckdb/optimizer/rule/date_trunc_simplification.hpp"
 #include "transformer/peg_transformer.hpp"
+#include "semantic_markers.hpp"
 #include "duckdb/parser/expression/comparison_expression.hpp"
 #include "duckdb/parser/expression/between_expression.hpp"
 #include "duckdb/parser/expression/operator_expression.hpp"
@@ -2214,7 +2215,7 @@ PEGTransformerFactory::TransformWindowPartition(PEGTransformer &transformer, opt
 	}
 	if (list_pr.Child<OptionalParseResult>(2).HasResult()) {
 		// semantic_views: PARTITION BY EXCLUDING a, b -> PARTITION BY __sv_excluding(a, b)
-		auto excluding = make_uniq<FunctionExpression>("__sv_excluding", std::move(result));
+		auto excluding = make_uniq<FunctionExpression>(SEMANTIC_EXCLUDING_FUNCTION, std::move(result));
 		result.clear();
 		result.push_back(std::move(excluding));
 	}

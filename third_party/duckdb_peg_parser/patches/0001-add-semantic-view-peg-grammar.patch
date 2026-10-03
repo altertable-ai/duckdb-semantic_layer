@@ -63,7 +63,15 @@
  vector<optional_ptr<ParseResult>>
 --- a/transformer/transform_expression.cpp
 +++ b/transformer/transform_expression.cpp
-@@ -2207,10 +2207,16 @@
+@@ -3,6 +3,7 @@
+ #include "duckdb/parser/expression/subquery_expression.hpp"
+ #include "duckdb/optimizer/rule/date_trunc_simplification.hpp"
+ #include "transformer/peg_transformer.hpp"
++#include "semantic_markers.hpp"
+ #include "duckdb/parser/expression/comparison_expression.hpp"
+ #include "duckdb/parser/expression/between_expression.hpp"
+ #include "duckdb/parser/expression/operator_expression.hpp"
+@@ -2207,11 +2208,17 @@
  vector<unique_ptr<ParsedExpression>>
  PEGTransformerFactory::TransformWindowPartition(PEGTransformer &transformer, optional_ptr<ParseResult> parse_result) {
  	auto &list_pr = parse_result->Cast<ListParseResult>();
@@ -72,12 +80,13 @@
  	vector<unique_ptr<ParsedExpression>> result;
  	for (auto expression : expression_list) {
  		result.push_back(transformer.Transform<unique_ptr<ParsedExpression>>(expression));
-+	}
+ 	}
 +	if (list_pr.Child<OptionalParseResult>(2).HasResult()) {
 +		// semantic_views: PARTITION BY EXCLUDING a, b -> PARTITION BY __sv_excluding(a, b)
-+		auto excluding = make_uniq<FunctionExpression>("__sv_excluding", std::move(result));
++		auto excluding = make_uniq<FunctionExpression>(SEMANTIC_EXCLUDING_FUNCTION, std::move(result));
 +		result.clear();
 +		result.push_back(std::move(excluding));
- 	}
++	}
  	return result;
  }
+ 
