@@ -82,29 +82,37 @@ struct SemanticNonAdditive {
 };
 
 struct SemanticMember {
-	SemanticMemberKind kind;
+	//! Definition entry, owned by SemanticModel::definition
+	const ParsedSemanticMember *parsed;
 	//! Owning logical table, DConstants::INVALID_INDEX for derived metrics
 	idx_t table;
-	string name;
-	bool is_private = false;
-	//! Expression as written in the definition
-	unique_ptr<ParsedExpression> expression;
 	//! Expression with every column reference replaced by a marker reference
 	unique_ptr<ParsedExpression> resolved;
 	//! Output type, computed by binding a probe query
 	LogicalType type = LogicalType::UNKNOWN;
-	//! Parsed definition entry (metadata: synonyms, comment, labels, USING, NON ADDITIVE BY, ...)
-	ParsedSemanticMember parsed;
 	//! Relationships pinned with USING (...) (metrics only)
 	vector<idx_t> using_relationships;
 	//! NON ADDITIVE BY (...) (metrics only)
 	vector<SemanticNonAdditive> non_additive;
 
+	SemanticMemberKind Kind() const {
+		return parsed->kind;
+	}
+	const string &Name() const {
+		return parsed->name;
+	}
+	bool IsPrivate() const {
+		return parsed->is_private;
+	}
+	//! Expression as written in the definition
+	const ParsedExpression &Expression() const {
+		return *parsed->expression;
+	}
 	bool IsDerived() const {
 		return table == DConstants::INVALID_INDEX;
 	}
 	bool IsRowLevel() const {
-		return kind != SemanticMemberKind::METRIC;
+		return Kind() != SemanticMemberKind::METRIC;
 	}
 };
 
@@ -122,12 +130,9 @@ struct SemanticResolveContext {
 
 class SemanticModel {
 public:
-	QualifiedName name;
-	//! Canonical CREATE statement (DESCRIBE / debugging)
-	string definition_sql;
+	//! The validated definition (its name is fully qualified). Never modified after building: members point into it.
 	unique_ptr<ParsedSemanticView> definition;
 	timestamp_tz_t created_on;
-	string comment;
 
 	vector<SemanticTable> tables;
 	vector<SemanticRelationship> relationships;
@@ -139,7 +144,12 @@ public:
 	vector<vector<idx_t>> path_count;
 
 public:
-	shared_ptr<SemanticModel> Copy() const;
+	const QualifiedName &Name() const {
+		return definition->name;
+	}
+	const string &Comment() const {
+		return definition->comment;
+	}
 
 	optional_idx FindTable(const string &table_name) const;
 	optional_idx FindMember(idx_t table, const string &member_name) const;
@@ -156,7 +166,6 @@ public:
 	//! Resolves every column reference of `expr` to a marker reference
 	unique_ptr<ParsedExpression> Resolve(const ParsedExpression &expr, const SemanticResolveContext &context) const;
 
-	string QualifiedViewName() const;
 	string MemberDisplayName(idx_t member) const;
 	static string KindDisplayName(SemanticMemberKind kind);
 

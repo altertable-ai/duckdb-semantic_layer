@@ -240,42 +240,8 @@ RebindQueryInfo SemanticViewsRebindState::OnPlanningError(ClientContext &context
 	return RebindQueryInfo::ATTEMPT_TO_REBIND;
 }
 
-//! Re-parses a statement from its SQL text (EXPLAIN wrappers created internally have no text of their own)
-static unique_ptr<SQLStatement> ReparseStatement(SQLStatement &statement) {
-	if (statement.query.empty()) {
-		if (statement.type != StatementType::EXPLAIN_STATEMENT) {
-			return nullptr;
-		}
-		auto &explain = statement.Cast<ExplainStatement>();
-		auto inner = ReparseStatement(*explain.stmt);
-		if (!inner) {
-			return nullptr;
-		}
-		return make_uniq<ExplainStatement>(std::move(inner), explain.explain_type, explain.explain_format);
-	}
-	if (!StringUtil::Contains(StringUtil::Lower(statement.query), "from")) {
-		return nullptr;
-	}
-	try {
-		ParserOptions options;
-		Parser parser(options);
-		parser.ParseQuery(statement.query);
-		if (parser.statements.size() != 1) {
-			return nullptr;
-		}
-		auto result = std::move(parser.statements[0]);
-		if (statement.type == StatementType::EXPLAIN_STATEMENT && result->type != StatementType::EXPLAIN_STATEMENT) {
-			auto &explain = statement.Cast<ExplainStatement>();
-			result = make_uniq<ExplainStatement>(std::move(result), explain.explain_type, explain.explain_format);
-		}
-		return result;
-	} catch (std::exception &) {
-		return nullptr;
-	}
-}
-
 static BoundStatement SemanticViewsBindStatement(ClientContext &context, Binder &binder, OperatorExtensionInfo *info,
-                                                 SQLStatement &statement) {
+                                                 SQLStatement &) {
 	auto &state = *static_cast<SemanticViewsOperatorInfo &>(*info).state;
 	auto pending = SemanticViewsPendingBind::Take(context);
 	if (pending) {
@@ -284,23 +250,9 @@ static BoundStatement SemanticViewsBindStatement(ClientContext &context, Binder 
 		EnsureExplainAnalyzeProfiler(context, *pending);
 		return binder.Bind(*pending);
 	}
-	if (context.registered_state->Get<SemanticViewsRebindState>(SemanticViewsRebindState::KEY)) {
-		// SemanticViewsRebindState::OnPlanningError rewrites queries over semantic views on the untouched statement
-		return BoundStatement();
-	}
-	// Connection opened before the extension was loaded: register the rebind state for the next statements and,
-	// for this one, start again from the statement's text (the failed bind may have consumed parts of the AST).
-	SemanticViewsRebindState::Register(context, static_cast<SemanticViewsOperatorInfo &>(*info).state);
-	auto rewritten = ReparseStatement(statement);
-	if (!rewritten) {
-		return BoundStatement();
-	}
-	rewritten->named_param_map = statement.named_param_map;
-	if (!RewriteSemanticViewReferences(context, state, *rewritten)) {
-		// unrelated binder failure: an empty plan makes DuckDB rethrow the original error
-		return BoundStatement();
-	}
-	return binder.Bind(*rewritten);
+	// unrelated binder failure (queries over semantic views by name are rewritten by SemanticViewsRebindState):
+	// an empty plan makes DuckDB rethrow the original error
+	return BoundStatement();
 }
 
 SemanticViewsOperatorExtension::SemanticViewsOperatorExtension(shared_ptr<SemanticViewsState> state) {

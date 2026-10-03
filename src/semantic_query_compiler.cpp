@@ -85,7 +85,7 @@ public:
 			if (model.relationships[edge.relationship].is_range) {
 				throw BinderException("Semantic view \"%s\": logical table \"%s\" is reached through the range "
 				                      "relationship \"%s\" and cannot be used here",
-				                      model.QualifiedViewName(), model.tables[table].name,
+				                      model.Name().name, model.tables[table].name,
 				                      model.relationships[edge.relationship].name);
 			}
 			if (!present.count(edge.target)) {
@@ -552,13 +552,13 @@ SemanticQuerySpec SemanticQueryCompiler::Resolve(const vector<ParsedSemanticQuer
 			}
 			for (idx_t m = 0; m < model.members.size(); m++) {
 				auto &member = model.members[m];
-				if (member.table != table.GetIndex() || member.kind != item.kind || member.is_private) {
+				if (member.table != table.GetIndex() || member.Kind() != item.kind || member.IsPrivate()) {
 					continue;
 				}
 				SemanticQueryItem resolved;
 				resolved.kind = item.kind;
 				resolved.resolved = SemanticModel::MakeMemberMarker(m);
-				resolved.output_name = member.name;
+				resolved.output_name = member.Name();
 				spec.items.push_back(std::move(resolved));
 			}
 			continue;
@@ -577,7 +577,7 @@ SemanticQuerySpec SemanticQueryCompiler::Resolve(const vector<ParsedSemanticQuer
 			idx_t table;
 			string column;
 			if (SemanticModel::IsMemberMarker(*resolved.resolved, member)) {
-				resolved.output_name = model.members[member].name;
+				resolved.output_name = model.members[member].Name();
 			} else if (SemanticModel::IsColumnMarker(*resolved.resolved, table, column)) {
 				resolved.output_name = column;
 			} else {
@@ -848,7 +848,7 @@ unique_ptr<SelectStatement> SemanticQueryCompiler::Compile(const SemanticQuerySp
 unique_ptr<SelectStatement> SemanticQueryCompiler::CompileMemberProbe(idx_t member, idx_t &column) {
 	auto &entry = model.members[member];
 	SemanticQuerySpec spec;
-	if (entry.kind == SemanticMemberKind::METRIC) {
+	if (entry.Kind() == SemanticMemberKind::METRIC) {
 		// window-function metrics can only be evaluated together with their window dimensions
 		set<idx_t> window_dimensions;
 		analyzer.WindowDimensions(*SemanticModel::MakeMemberMarker(member), window_dimensions);
@@ -861,9 +861,9 @@ unique_ptr<SelectStatement> SemanticQueryCompiler::CompileMemberProbe(idx_t memb
 		}
 	}
 	SemanticQueryItem item;
-	item.kind = entry.kind == SemanticMemberKind::METRIC ? SemanticMemberKind::METRIC : SemanticMemberKind::FACT;
+	item.kind = entry.Kind() == SemanticMemberKind::METRIC ? SemanticMemberKind::METRIC : SemanticMemberKind::FACT;
 	item.resolved = SemanticModel::MakeMemberMarker(member);
-	item.output_name = entry.name;
+	item.output_name = entry.Name();
 	spec.items.push_back(std::move(item));
 	column = spec.items.size() - 1;
 	return Compile(spec);
@@ -881,8 +881,8 @@ void ProbeSemanticModelTypes(ClientContext &context, SemanticModel &model) {
 			member.type = bound.types[column];
 		} catch (std::exception &ex) {
 			ErrorData error(ex);
-			throw BinderException("Invalid semantic view \"%s\": %s \"%s\": %s", model.name.name,
-			                      SemanticModel::KindDisplayName(member.kind), model.MemberDisplayName(m),
+			throw BinderException("Invalid semantic view \"%s\": %s \"%s\": %s", model.Name().name,
+			                      SemanticModel::KindDisplayName(member.Kind()), model.MemberDisplayName(m),
 			                      error.RawMessage());
 		}
 	}

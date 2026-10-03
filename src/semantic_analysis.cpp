@@ -46,7 +46,7 @@ bool SemanticAnalyzer::ContainsAggregateOrMetric(const ParsedExpression &expr) {
 	}
 	idx_t member;
 	if (SemanticModel::IsMemberMarker(expr, member)) {
-		return model.members[member].kind == SemanticMemberKind::METRIC;
+		return model.members[member].Kind() == SemanticMemberKind::METRIC;
 	}
 	bool found = false;
 	ParsedExpressionIterator::EnumerateChildren(expr, [&](const ParsedExpression &child) {
@@ -174,7 +174,7 @@ void SemanticAnalyzer::WindowDimensions(const ParsedExpression &expr, set<idx_t>
 		}
 	}
 	idx_t member;
-	if (SemanticModel::IsMemberMarker(expr, member) && model.members[member].kind == SemanticMemberKind::METRIC) {
+	if (SemanticModel::IsMemberMarker(expr, member) && model.members[member].Kind() == SemanticMemberKind::METRIC) {
 		WindowDimensions(*model.members[member].resolved, dimensions);
 		return;
 	}
@@ -222,7 +222,7 @@ unique_ptr<ParsedExpression> SemanticAnalyzer::Decompose(const ParsedExpression 
 		idx_t member;
 		if (SemanticModel::IsMemberMarker(*node, member)) {
 			auto &entry = model.members[member];
-			if (entry.kind == SemanticMemberKind::METRIC) {
+			if (entry.Kind() == SemanticMemberKind::METRIC) {
 				auto alias = node->alias;
 				auto &member_using =
 				    entry.using_relationships.empty() ? using_relationships : entry.using_relationships;

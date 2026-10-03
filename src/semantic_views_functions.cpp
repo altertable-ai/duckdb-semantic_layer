@@ -124,8 +124,20 @@ static unique_ptr<FunctionData> SemanticDDLBind(ClientContext &context, TableFun
 			auto definition = SemanticViewsRewriter::ParseDefinition(result->arg);
 			result->model = BuildSemanticModel(context, *definition, result->name);
 		}
-	} else if (result->action != "drop" && result->action != "rename" && result->action != "set_comment" &&
-	           result->action != "unset_comment") {
+	} else if (result->action == "rename" || result->action == "set_comment" || result->action == "unset_comment") {
+		// ALTER: rebuild the view from its edited definition, swapped in atomically at execution
+		auto existing = result->state->registry.Get(result->name);
+		if (existing) {
+			auto definition = existing->definition->Copy();
+			if (result->action == "rename") {
+				definition->name.name = result->arg;
+			} else {
+				definition->comment = result->action == "set_comment" ? result->arg : string();
+			}
+			result->model = BuildSemanticModel(context, *definition, definition->name);
+			result->model->created_on = existing->created_on;
+		}
+	} else if (result->action != "drop") {
 		throw InternalException("unknown semantic view DDL action '%s'", result->action);
 	}
 	return std::move(result);
@@ -159,22 +171,12 @@ static string ExecuteSemanticDDL(const SemanticDDLData &data) {
 		}
 		return display_name + " successfully dropped.";
 	}
-	auto existing = registry.Get(data.name);
-	if (!existing) {
+	if (!data.model || !registry.Replace(data.name, data.model)) {
 		if (data.flag == "if_exists") {
 			return "Statement executed successfully.";
 		}
 		throw CatalogException("Semantic view with name \"%s\" does not exist!", data.name.name);
 	}
-	if (data.action == "rename") {
-		registry.Rename(data.name, data.arg);
-		return "Statement executed successfully.";
-	}
-	auto altered = existing->Copy();
-	altered->comment = data.action == "set_comment" ? data.arg : string();
-	altered->definition->comment = altered->comment;
-	altered->definition_sql = altered->definition->ToSQL();
-	registry.Replace(std::move(altered));
 	return "Statement executed successfully.";
 }
 
@@ -243,7 +245,8 @@ static bool InDefaultSchema(ClientContext &context, const SemanticModel &model) 
 	auto catalog = entry.catalog.empty() || entry.catalog == INVALID_CATALOG
 	                   ? DatabaseManager::GetDefaultDatabase(context)
 	                   : entry.catalog;
-	return StringUtil::CIEquals(model.name.catalog, catalog) && StringUtil::CIEquals(model.name.schema, entry.schema);
+	return StringUtil::CIEquals(model.Name().catalog, catalog) &&
+	       StringUtil::CIEquals(model.Name().schema, entry.schema);
 }
 
 static void ShowViews(ClientContext &context, TableFunctionBindInput &input, RowsFunctionData &result,
@@ -264,18 +267,19 @@ static void ShowViews(ClientContext &context, TableFunctionBindInput &input, Row
 		scope_schema = resolved.schema;
 	}
 	for (auto &model : GetState(input).registry.List()) {
-		if (scope == "database" && !StringUtil::CIEquals(model->name.catalog, scope_catalog)) {
+		if (scope == "database" && !StringUtil::CIEquals(model->Name().catalog, scope_catalog)) {
 			continue;
 		}
-		if (scope == "schema" && (!StringUtil::CIEquals(model->name.catalog, scope_catalog) ||
-		                          !StringUtil::CIEquals(model->name.schema, scope_schema))) {
+		if (scope == "schema" && (!StringUtil::CIEquals(model->Name().catalog, scope_catalog) ||
+		                          !StringUtil::CIEquals(model->Name().schema, scope_schema))) {
 			continue;
 		}
-		if (!like.empty() && !LikeMatch(model->name.name, like)) {
+		if (!like.empty() && !LikeMatch(model->Name().name, like)) {
 			continue;
 		}
-		result.rows.push_back({Value::TIMESTAMPTZ(model->created_on), Value(model->name.name),
-		                       Value(model->name.catalog), Value(model->name.schema), OptionalString(model->comment)});
+		result.rows.push_back({Value::TIMESTAMPTZ(model->created_on), Value(model->Name().name),
+		                       Value(model->Name().catalog), Value(model->Name().schema),
+		                       OptionalString(model->Comment())});
 	}
 }
 
@@ -294,13 +298,13 @@ static void ShowDimensionsForMetric(ClientContext &context, shared_ptr<SemanticM
 	idx_t metric = DConstants::INVALID_INDEX;
 	for (idx_t m = 0; m < model->members.size(); m++) {
 		auto &member = model->members[m];
-		if (member.kind != SemanticMemberKind::METRIC) {
+		if (member.Kind() != SemanticMemberKind::METRIC) {
 			continue;
 		}
 		bool matches = parts.size() == 1
-		                   ? StringUtil::CIEquals(member.name, parts[0])
+		                   ? StringUtil::CIEquals(member.Name(), parts[0])
 		                   : !member.IsDerived() && StringUtil::CIEquals(model->tables[member.table].name, parts[0]) &&
-		                         StringUtil::CIEquals(member.name, parts[1]);
+		                         StringUtil::CIEquals(member.Name(), parts[1]);
 		if (matches) {
 			if (metric != DConstants::INVALID_INDEX) {
 				throw BinderException("Ambiguous metric name \"%s\"; qualify it with its logical table", metric_name);
@@ -309,7 +313,7 @@ static void ShowDimensionsForMetric(ClientContext &context, shared_ptr<SemanticM
 		}
 	}
 	if (metric == DConstants::INVALID_INDEX) {
-		throw BinderException("Unknown metric \"%s\" in semantic view \"%s\"", metric_name, model->name.name);
+		throw BinderException("Unknown metric \"%s\" in semantic view \"%s\"", metric_name, model->Name().name);
 	}
 	SemanticAnalyzer analyzer(*model, context);
 	vector<SemanticAtom> atoms;
@@ -321,23 +325,23 @@ static void ShowDimensionsForMetric(ClientContext &context, shared_ptr<SemanticM
 	analyzer.WindowDimensions(*SemanticModel::MakeMemberMarker(metric), required);
 	for (idx_t d = 0; d < model->members.size(); d++) {
 		auto &dimension = model->members[d];
-		if (dimension.kind != SemanticMemberKind::DIMENSION) {
+		if (dimension.Kind() != SemanticMemberKind::DIMENSION) {
 			continue;
 		}
 		bool valid = true;
 		for (auto &atom : atoms) {
 			valid = valid && model->Reaches(atom.home, dimension.table);
 		}
-		if (!valid || (!like.empty() && !LikeMatch(dimension.name, like))) {
+		if (!valid || (!like.empty() && !LikeMatch(dimension.Name(), like))) {
 			continue;
 		}
-		result.rows.push_back({Value(model->tables[dimension.table].name), Value(dimension.name),
+		result.rows.push_back({Value(model->tables[dimension.table].name), Value(dimension.Name()),
 		                       dimension.type.id() == LogicalTypeId::UNKNOWN ? Value(LogicalType::VARCHAR)
 		                                                                     : Value(dimension.type.ToString()),
 		                       Value::BOOLEAN(required.count(d) > 0),
-		                       dimension.parsed.synonyms.empty() ? Value(LogicalType::LIST(LogicalType::VARCHAR))
-		                                                         : ListValue(dimension.parsed.synonyms),
-		                       OptionalString(dimension.parsed.comment)});
+		                       dimension.parsed->synonyms.empty() ? Value(LogicalType::LIST(LogicalType::VARCHAR))
+		                                                          : ListValue(dimension.parsed->synonyms),
+		                       OptionalString(dimension.parsed->comment)});
 	}
 }
 
@@ -374,21 +378,21 @@ static void ShowMembers(ClientContext &context, TableFunctionBindInput &input, R
 	}
 	for (auto &model : models) {
 		for (auto &member : model->members) {
-			if (member.kind != kind) {
+			if (member.Kind() != kind) {
 				continue;
 			}
-			if (!like.empty() && !LikeMatch(member.name, like)) {
+			if (!like.empty() && !LikeMatch(member.Name(), like)) {
 				continue;
 			}
 			result.rows.push_back(
-			    {Value(model->name.catalog), Value(model->name.schema), Value(model->name.name),
+			    {Value(model->Name().catalog), Value(model->Name().schema), Value(model->Name().name),
 			     member.IsDerived() ? Value(LogicalType::VARCHAR) : Value(model->tables[member.table].name),
-			     Value(member.name),
+			     Value(member.Name()),
 			     member.type.id() == LogicalTypeId::UNKNOWN ? Value(LogicalType::VARCHAR)
 			                                                : Value(member.type.ToString()),
-			     member.parsed.synonyms.empty() ? Value(LogicalType::LIST(LogicalType::VARCHAR))
-			                                    : ListValue(member.parsed.synonyms),
-			     OptionalString(member.parsed.comment)});
+			     member.parsed->synonyms.empty() ? Value(LogicalType::LIST(LogicalType::VARCHAR))
+			                                     : ListValue(member.parsed->synonyms),
+			     OptionalString(member.parsed->comment)});
 		}
 	}
 }
@@ -404,8 +408,8 @@ static void DescribeView(ClientContext &context, TableFunctionBindInput &input, 
 	               const string &value) {
 		result.rows.push_back({kind, object, parent, Value(property), Value(value)});
 	};
-	if (!model->comment.empty()) {
-		add(null_value, null_value, null_value, "COMMENT", model->comment);
+	if (!model->Comment().empty()) {
+		add(null_value, null_value, null_value, "COMMENT", model->Comment());
 	}
 	for (auto &table : model->tables) {
 		Value kind("TABLE");
@@ -443,28 +447,28 @@ static void DescribeView(ClientContext &context, TableFunctionBindInput &input, 
 		}
 	}
 	for (auto &member : model->members) {
-		string kind_name = SemanticMemberKindToString(member.kind);
+		string kind_name = SemanticMemberKindToString(member.Kind());
 		if (member.IsDerived()) {
 			kind_name = "DERIVED_METRIC";
 		}
 		Value kind(kind_name);
-		Value object(member.name);
+		Value object(member.Name());
 		Value parent = member.IsDerived() ? null_value : Value(model->tables[member.table].name);
 		if (!member.IsDerived()) {
 			add(kind, object, parent, "TABLE", model->tables[member.table].name);
 		}
-		add(kind, object, parent, "EXPRESSION", member.expression->ToString());
+		add(kind, object, parent, "EXPRESSION", member.Expression().ToString());
 		if (member.type.id() != LogicalTypeId::UNKNOWN) {
 			add(kind, object, parent, "DATA_TYPE", member.type.ToString());
 		}
-		if (!member.parsed.synonyms.empty()) {
-			add(kind, object, parent, "SYNONYMS", BracketList(member.parsed.synonyms));
+		if (!member.parsed->synonyms.empty()) {
+			add(kind, object, parent, "SYNONYMS", BracketList(member.parsed->synonyms));
 		}
-		if (!member.parsed.comment.empty()) {
-			add(kind, object, parent, "COMMENT", member.parsed.comment);
+		if (!member.parsed->comment.empty()) {
+			add(kind, object, parent, "COMMENT", member.parsed->comment);
 		}
 		if (!member.IsDerived()) {
-			add(kind, object, parent, "ACCESS_MODIFIER", member.is_private ? "PRIVATE" : "PUBLIC");
+			add(kind, object, parent, "ACCESS_MODIFIER", member.IsPrivate() ? "PRIVATE" : "PUBLIC");
 		}
 	}
 }
@@ -499,7 +503,7 @@ static unique_ptr<SelectStatement> CompileSemanticQuery(ClientContext &context, 
 	name.schema = args[1].IsNull() ? string() : StringValue::Get(args[1]);
 	name.name = args[2].IsNull() ? string() : StringValue::Get(args[2]);
 	auto model = state.registry.GetOrThrow(context, name);
-	view_name = model->name.name;
+	view_name = model->Name().name;
 	auto items = ParsedSemanticQuery::ItemsFromValue(args[3]);
 	unique_ptr<ParsedExpression> where;
 	if (!args[4].IsNull() && !StringValue::Get(args[4]).empty()) {

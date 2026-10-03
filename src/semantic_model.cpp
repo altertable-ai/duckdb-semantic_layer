@@ -41,55 +41,6 @@ bool SemanticTable::IsKey(const vector<string> &cols) const {
 }
 
 //===--------------------------------------------------------------------===//
-// Copy
-//===--------------------------------------------------------------------===//
-shared_ptr<SemanticModel> SemanticModel::Copy() const {
-	auto result = make_shared_ptr<SemanticModel>();
-	result->name = name;
-	result->definition = definition ? definition->Copy() : nullptr;
-	result->definition_sql = definition_sql;
-	result->created_on = created_on;
-	result->comment = comment;
-	for (auto &table : tables) {
-		SemanticTable copy;
-		copy.name = table.name;
-		copy.source = table.source->Copy();
-		copy.catalog_name = table.catalog_name;
-		copy.schema_name = table.schema_name;
-		copy.table_name = table.table_name;
-		copy.column_names = table.column_names;
-		copy.column_types = table.column_types;
-		copy.columns = table.columns;
-		copy.primary_key = table.primary_key;
-		copy.unique_keys = table.unique_keys;
-		copy.range_constraints = table.range_constraints;
-		copy.synonyms = table.synonyms;
-		copy.comment = table.comment;
-		result->tables.push_back(std::move(copy));
-	}
-	result->relationships = relationships;
-	for (auto &member : members) {
-		SemanticMember copy;
-		copy.kind = member.kind;
-		copy.table = member.table;
-		copy.name = member.name;
-		copy.is_private = member.is_private;
-		copy.expression = member.expression->Copy();
-		copy.resolved = member.resolved ? member.resolved->Copy() : nullptr;
-		copy.type = member.type;
-		copy.parsed = member.parsed.Copy();
-		copy.using_relationships = member.using_relationships;
-		for (auto &entry : member.non_additive) {
-			copy.non_additive.push_back(SemanticNonAdditive {entry.resolved->Copy(), entry.type, entry.null_order});
-		}
-		result->members.push_back(std::move(copy));
-	}
-	result->edges = edges;
-	result->path_count = path_count;
-	return result;
-}
-
-//===--------------------------------------------------------------------===//
 // Lookups
 //===--------------------------------------------------------------------===//
 optional_idx SemanticModel::FindTable(const string &table_name) const {
@@ -103,7 +54,7 @@ optional_idx SemanticModel::FindTable(const string &table_name) const {
 
 optional_idx SemanticModel::FindMember(idx_t table, const string &member_name) const {
 	for (idx_t i = 0; i < members.size(); i++) {
-		if (members[i].table == table && StringUtil::CIEquals(members[i].name, member_name)) {
+		if (members[i].table == table && StringUtil::CIEquals(members[i].Name(), member_name)) {
 			return i;
 		}
 	}
@@ -113,15 +64,11 @@ optional_idx SemanticModel::FindMember(idx_t table, const string &member_name) c
 vector<idx_t> SemanticModel::FindMembersByName(const string &member_name) const {
 	vector<idx_t> result;
 	for (idx_t i = 0; i < members.size(); i++) {
-		if (StringUtil::CIEquals(members[i].name, member_name)) {
+		if (StringUtil::CIEquals(members[i].Name(), member_name)) {
 			result.push_back(i);
 		}
 	}
 	return result;
-}
-
-string SemanticModel::QualifiedViewName() const {
-	return name.name;
 }
 
 string SemanticModel::KindDisplayName(SemanticMemberKind kind) {
@@ -139,9 +86,9 @@ string SemanticModel::KindDisplayName(SemanticMemberKind kind) {
 string SemanticModel::MemberDisplayName(idx_t member_idx) const {
 	auto &member = members[member_idx];
 	if (member.IsDerived()) {
-		return member.name;
+		return member.Name();
 	}
-	return tables[member.table].name + "." + member.name;
+	return tables[member.table].name + "." + member.Name();
 }
 
 //===--------------------------------------------------------------------===//
@@ -154,7 +101,7 @@ vector<SemanticEdge> SemanticModel::Path(idx_t from, idx_t to, const vector<idx_
 	if (path_count[from][to] == 0) {
 		throw BinderException("Semantic view \"%s\": logical table \"%s\" is not reachable from \"%s\" through "
 		                      "many-to-one relationships",
-		                      QualifiedViewName(), tables[to].name, tables[from].name);
+		                      Name().name, tables[to].name, tables[from].name);
 	}
 	// an edge is allowed unless its target is the target of a USING relationship and it is not one of them
 	auto allowed = [&](const SemanticEdge &edge) {
@@ -194,12 +141,12 @@ vector<SemanticEdge> SemanticModel::Path(idx_t from, idx_t to, const vector<idx_
 	if (found.empty()) {
 		throw BinderException("Semantic view \"%s\": the USING relationships of the metric do not connect \"%s\" to "
 		                      "\"%s\"",
-		                      QualifiedViewName(), tables[from].name, tables[to].name);
+		                      Name().name, tables[from].name, tables[to].name);
 	}
 	if (found.size() > 1) {
 		throw BinderException("Semantic view \"%s\": multiple relationship paths from \"%s\" to \"%s\"; specify "
 		                      "USING (<relationship>) on the metric to choose one",
-		                      QualifiedViewName(), tables[from].name, tables[to].name);
+		                      Name().name, tables[from].name, tables[to].name);
 	}
 	return found[0];
 }
@@ -252,7 +199,7 @@ static string ErrorPrefix(const SemanticResolveContext &context) {
 static unique_ptr<ParsedExpression> ResolveColumnRef(const SemanticModel &model, const ColumnRefExpression &colref,
                                                      const SemanticResolveContext &context) {
 	auto check_private = [&](idx_t member) {
-		if (!context.allow_private && model.members[member].is_private) {
+		if (!context.allow_private && model.members[member].IsPrivate()) {
 			throw BinderException("%sSemantic expression \"%s\" is PRIVATE and cannot be queried", ErrorPrefix(context),
 			                      model.MemberDisplayName(member));
 		}

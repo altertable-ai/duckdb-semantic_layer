@@ -48,13 +48,13 @@ public:
 	void Rewrite(SelectNode &node) {
 		if (node.qualify) {
 			throw BinderException("QUALIFY is not supported when querying semantic view \"%s\" by name",
-			                      model.name.name);
+			                      model.Name().name);
 		}
 		for (auto &expr : node.select_list) {
 			if (expr->GetExpressionClass() == ExpressionClass::STAR) {
 				throw BinderException("SELECT * is not supported when querying semantic view \"%s\" by name: list "
 				                      "dimensions and facts, and metrics with AGG(...)",
-				                      model.name.name);
+				                      model.Name().name);
 			}
 		}
 		// normalized copies of every clause
@@ -198,7 +198,7 @@ private:
 		if (ContainsWindowFunction(expr)) {
 			throw BinderException("Window functions are not supported when querying semantic view \"%s\" by name; "
 			                      "define a window function metric instead",
-			                      model.name.name);
+			                      model.Name().name);
 		}
 	}
 
@@ -253,7 +253,7 @@ private:
 				auto resolved = model.Resolve(expr, resolve_context);
 				idx_t member;
 				if (SemanticModel::IsMemberMarker(*resolved, member) &&
-				    model.members[member].kind == SemanticMemberKind::METRIC) {
+				    model.members[member].Kind() == SemanticMemberKind::METRIC) {
 					throw BinderException("Metric \"%s\" must be used with AGG()", expr.ToString());
 				}
 			} catch (BinderException &ex) {

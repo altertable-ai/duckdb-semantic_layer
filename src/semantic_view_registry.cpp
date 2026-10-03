@@ -53,7 +53,7 @@ string SemanticViewRegistry::Key(const QualifiedName &name) {
 
 bool SemanticViewRegistry::Create(shared_ptr<SemanticModel> model, bool replace) {
 	lock_guard<mutex> guard(lock);
-	auto key = Key(model->name);
+	auto key = Key(model->Name());
 	if (!replace && views.find(key) != views.end()) {
 		return false;
 	}
@@ -66,29 +66,19 @@ bool SemanticViewRegistry::Drop(const QualifiedName &name) {
 	return views.erase(Key(name)) > 0;
 }
 
-bool SemanticViewRegistry::Rename(const QualifiedName &name, const string &new_name) {
+bool SemanticViewRegistry::Replace(const QualifiedName &name, shared_ptr<SemanticModel> model) {
 	lock_guard<mutex> guard(lock);
-	auto entry = views.find(Key(name));
-	if (entry == views.end()) {
+	auto old_key = Key(name);
+	auto new_key = Key(model->Name());
+	if (views.find(old_key) == views.end()) {
 		return false;
 	}
-	QualifiedName target = name;
-	target.name = new_name;
-	if (views.find(Key(target)) != views.end()) {
-		throw CatalogException("Semantic view with name \"%s\" already exists", new_name);
+	if (new_key != old_key && views.find(new_key) != views.end()) {
+		throw CatalogException("Semantic view with name \"%s\" already exists", model->Name().name);
 	}
-	auto renamed = entry->second->Copy();
-	renamed->name = target;
-	renamed->definition->name = target;
-	renamed->definition_sql = renamed->definition->ToSQL();
-	views.erase(entry);
-	views[Key(target)] = std::move(renamed);
+	views.erase(old_key);
+	views[new_key] = std::move(model);
 	return true;
-}
-
-void SemanticViewRegistry::Replace(shared_ptr<SemanticModel> model) {
-	lock_guard<mutex> guard(lock);
-	views[Key(model->name)] = std::move(model);
 }
 
 shared_ptr<SemanticModel> SemanticViewRegistry::Get(const QualifiedName &fully_qualified) const {

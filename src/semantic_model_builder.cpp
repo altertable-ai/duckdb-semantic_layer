@@ -25,19 +25,14 @@ namespace {
 
 class SemanticModelBuilder {
 public:
-	SemanticModelBuilder(ClientContext &context, const ParsedSemanticView &definition, const QualifiedName &name)
-	    : context(context), definition(definition), model(make_shared_ptr<SemanticModel>()) {
-		model->name = name;
+	SemanticModelBuilder(ClientContext &context, const ParsedSemanticView &parsed, const QualifiedName &name)
+	    : context(context), model(NewModel(parsed, name)), definition(*model->definition) {
 	}
 
 	shared_ptr<SemanticModel> Build() {
 		if (definition.dimensions.empty() && definition.metrics.empty()) {
 			Fail("A semantic view must define at least one dimension or metric");
 		}
-		model->definition = definition.Copy();
-		model->definition->name = model->name;
-		model->definition_sql = definition.ToSQL();
-		model->comment = definition.comment;
 		model->created_on = timestamp_tz_t(Timestamp::GetCurrentTimestamp());
 		BuildTables();
 		BuildRelationships();
@@ -51,9 +46,16 @@ public:
 	}
 
 private:
+	static shared_ptr<SemanticModel> NewModel(const ParsedSemanticView &parsed, const QualifiedName &name) {
+		auto result = make_shared_ptr<SemanticModel>();
+		result->definition = parsed.Copy();
+		result->definition->name = name;
+		return result;
+	}
+
 	template <typename... ARGS>
 	[[noreturn]] void Fail(const string &message, ARGS... params) {
-		throw BinderException("Invalid semantic view \"%s\": " + message, model->name.name, params...);
+		throw BinderException("Invalid semantic view \"%s\": " + message, model->Name().name, params...);
 	}
 
 	string ResolveColumn(const SemanticTable &table, const string &column, const string &what) {
@@ -292,33 +294,29 @@ private:
 	void AddMembers(const vector<ParsedSemanticMember> &parsed_members) {
 		for (auto &parsed : parsed_members) {
 			SemanticMember member;
-			member.kind = parsed.kind;
-			member.name = parsed.name;
-			member.is_private = parsed.is_private;
-			member.expression = parsed.expression->Copy();
-			member.parsed = parsed.Copy();
+			member.parsed = &parsed;
 			if (parsed.table.empty()) {
 				member.table = DConstants::INVALID_INDEX;
 				for (auto &existing : model->members) {
-					if (existing.kind == SemanticMemberKind::METRIC &&
-					    StringUtil::CIEquals(existing.name, member.name)) {
-						Fail("Derived metric \"%s\" has the same name as another metric", member.name);
+					if (existing.Kind() == SemanticMemberKind::METRIC &&
+					    StringUtil::CIEquals(existing.Name(), member.Name())) {
+						Fail("Derived metric \"%s\" has the same name as another metric", member.Name());
 					}
 				}
 			} else {
 				member.table = RequireTable(parsed.table, "\"" + parsed.FullName() + "\"");
 			}
 			for (auto &existing : model->members) {
-				if (existing.table == member.table && StringUtil::CIEquals(existing.name, member.name)) {
+				if (existing.table == member.table && StringUtil::CIEquals(existing.Name(), member.Name())) {
 					Fail("Duplicate semantic expression \"%s\"", parsed.FullName());
 				}
-				if (existing.IsDerived() && member.kind == SemanticMemberKind::METRIC &&
-				    StringUtil::CIEquals(existing.name, member.name)) {
+				if (existing.IsDerived() && member.Kind() == SemanticMemberKind::METRIC &&
+				    StringUtil::CIEquals(existing.Name(), member.Name())) {
 					Fail("Metric \"%s\" has the same name as a derived metric", parsed.FullName());
 				}
 			}
 			for (auto &rel_name : parsed.using_relationships) {
-				if (member.kind != SemanticMemberKind::METRIC) {
+				if (member.Kind() != SemanticMemberKind::METRIC) {
 					Fail("USING is only allowed on metrics (\"%s\")", parsed.FullName());
 				}
 				idx_t found = DConstants::INVALID_INDEX;
@@ -332,7 +330,7 @@ private:
 				}
 				member.using_relationships.push_back(found);
 			}
-			if (!parsed.non_additive_by.empty() && member.kind != SemanticMemberKind::METRIC) {
+			if (!parsed.non_additive_by.empty() && member.Kind() != SemanticMemberKind::METRIC) {
 				Fail("NON ADDITIVE BY is only allowed on metrics (\"%s\")", parsed.FullName());
 			}
 			model->members.push_back(std::move(member));
@@ -347,7 +345,7 @@ private:
 
 	string What(idx_t member_idx) {
 		auto &member = model->members[member_idx];
-		auto kind = SemanticModel::KindDisplayName(member.kind);
+		auto kind = SemanticModel::KindDisplayName(member.Kind());
 		if (member.IsDerived()) {
 			kind = "Derived metric";
 		}
@@ -361,8 +359,8 @@ private:
 			resolve_context.owner_table = member.table;
 			resolve_context.self_member = m;
 			resolve_context.what = What(m);
-			member.resolved = model->Resolve(*member.expression, resolve_context);
-			for (auto &order : member.parsed.non_additive_by) {
+			member.resolved = model->Resolve(member.Expression(), resolve_context);
+			for (auto &order : member.parsed->non_additive_by) {
 				SemanticNonAdditive entry;
 				resolve_context.self_member = DConstants::INVALID_INDEX;
 				entry.resolved = model->Resolve(*order.expression, resolve_context);
@@ -441,7 +439,7 @@ private:
 		idx_t member;
 		if (SemanticModel::IsMemberMarker(expr, member)) {
 			auto &entry = model->members[member];
-			if (entry.kind == SemanticMemberKind::METRIC) {
+			if (entry.Kind() == SemanticMemberKind::METRIC) {
 				vector<SemanticAtom> atoms;
 				analyzer.Decompose(*entry.resolved, entry.table, atoms, what);
 				for (auto &atom : atoms) {
@@ -468,12 +466,12 @@ private:
 			CollectMemberRefs(*member.resolved, references);
 			for (auto reference : references) {
 				auto &target = model->members[reference];
-				if (target.kind == SemanticMemberKind::METRIC && SemanticAnalyzer::ContainsWindow(*target.resolved)) {
+				if (target.Kind() == SemanticMemberKind::METRIC && SemanticAnalyzer::ContainsWindow(*target.resolved)) {
 					Fail("%s cannot reference window function metric \"%s\"", what,
 					     model->MemberDisplayName(reference));
 				}
 			}
-			if (member.kind == SemanticMemberKind::METRIC && SemanticAnalyzer::ContainsWindow(*member.resolved)) {
+			if (member.Kind() == SemanticMemberKind::METRIC && SemanticAnalyzer::ContainsWindow(*member.resolved)) {
 				set<idx_t> dimensions;
 				analyzer.WindowDimensions(*member.resolved, dimensions);
 				for (auto dimension : dimensions) {
@@ -526,8 +524,9 @@ private:
 
 private:
 	ClientContext &context;
-	const ParsedSemanticView &definition;
 	shared_ptr<SemanticModel> model;
+	//! The model's own copy of the definition (members point into it)
+	ParsedSemanticView &definition;
 };
 
 } // namespace

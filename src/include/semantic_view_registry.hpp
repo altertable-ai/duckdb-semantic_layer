@@ -26,10 +26,9 @@ public:
 	bool Create(shared_ptr<SemanticModel> model, bool replace);
 	//! Returns false when the view does not exist
 	bool Drop(const QualifiedName &name);
-	//! Returns false when the view does not exist; throws when `new_name` is taken
-	bool Rename(const QualifiedName &name, const string &new_name);
-	//! Replaces an existing entry (same name) - used by ALTER
-	void Replace(shared_ptr<SemanticModel> model);
+	//! Atomically replaces the view `name` with `model` (ALTER), which may have a different name; throws when the new
+	//! name is taken by another view. Returns false when `name` does not exist.
+	bool Replace(const QualifiedName &name, shared_ptr<SemanticModel> model);
 
 	shared_ptr<SemanticModel> Get(const QualifiedName &fully_qualified) const;
 	//! Looks up a name as used in a query (unqualified names follow the search path); nullptr when missing
