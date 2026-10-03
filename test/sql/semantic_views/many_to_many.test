@@ -1,0 +1,131 @@
+# name: test/sql/semantic_views/many_to_many.test
+# description: many-to-many relationships through bridge tables, without double counting
+# group: [semantic_views]
+
+require semantic_views
+
+statement ok
+PRAGMA enable_verification
+
+# book 1 has two French authors (must count once for FR), book 4 has no author, author 5 (Eve) has no book
+statement ok
+CREATE TABLE authors (author_id INTEGER, author_name VARCHAR, country VARCHAR, active BOOLEAN, joined DATE, author_revenue INTEGER);
+INSERT INTO authors VALUES (1, 'Ann', 'FR', true, '2020-01-01', 100), (2, 'Bob', 'FR', true, '2021-01-01', 50), (3, 'Cid', 'US', false, '2022-01-01', 30), (5, 'Eve', 'DE', true, '2023-01-01', 20);
+CREATE TABLE books (book_id INTEGER, title VARCHAR, category VARCHAR, page_count INTEGER);
+INSERT INTO books VALUES (1, 'B1', 'novel', 100), (2, 'B2', 'novel', 200), (3, 'B3', 'essay', 300), (4, 'B4', 'essay', 400);
+CREATE TABLE book_authors (book_id INTEGER, author_id INTEGER, role VARCHAR);
+INSERT INTO book_authors VALUES (1, 1, 'main'), (1, 2, 'co'), (2, 1, 'main'), (2, 3, 'co'), (3, 3, 'main');
+CREATE TABLE genres (genre_id INTEGER, genre_name VARCHAR);
+INSERT INTO genres VALUES (1, 'drama'), (2, 'history');
+CREATE TABLE book_genres (book_id INTEGER, genre_id INTEGER);
+INSERT INTO book_genres VALUES (1, 1), (2, 1), (2, 2), (3, 2);
+
+statement ok
+CREATE SEMANTIC VIEW library
+  TABLES (
+    authors PRIMARY KEY (author_id),
+    books PRIMARY KEY (book_id),
+    book_authors PRIMARY KEY (book_id, author_id),
+    genres PRIMARY KEY (genre_id),
+    book_genres PRIMARY KEY (book_id, genre_id)
+  )
+  RELATIONSHIPS (
+    book_authors_to_authors AS book_authors (author_id) REFERENCES authors,
+    book_authors_to_books AS book_authors (book_id) REFERENCES books,
+    book_genres (book_id) REFERENCES books,
+    book_genres (genre_id) REFERENCES genres
+  )
+  DIMENSIONS (
+    books.category AS category,
+    authors.author_name AS author_name,
+    authors.country AS country,
+    authors.active AS active,
+    genres.genre_name AS genre_name,
+    book_authors.role AS role
+  )
+  METRICS (
+    books.total_pages AS SUM(page_count),
+    books.book_count AS COUNT(*),
+    authors.total_revenue AS SUM(author_revenue),
+    pages_per_revenue AS books.total_pages / authors.total_revenue
+  );
+
+# every author gets the pages of the books they wrote; the book without author gets a NULL author
+query II
+SELECT * FROM SEMANTIC_VIEW(library DIMENSIONS authors.author_name METRICS books.total_pages) ORDER BY 1 NULLS LAST;
+----
+Ann	300
+Bob	100
+Cid	500
+NULL	400
+
+# book 1 counts once for FR although both its authors are French
+query III
+SELECT * FROM SEMANTIC_VIEW(library DIMENSIONS authors.country METRICS books.total_pages, books.book_count) ORDER BY 1 NULLS LAST;
+----
+FR	300	2
+US	500	2
+NULL	400	1
+
+# without bridged dimensions every book counts once
+query II
+SELECT * FROM SEMANTIC_VIEW(library METRICS books.total_pages, books.book_count);
+----
+1000	4
+
+# the other direction: authors by the category of their books; Eve has no book
+query II
+SELECT * FROM SEMANTIC_VIEW(library DIMENSIONS books.category METRICS authors.total_revenue) ORDER BY 1 NULLS LAST;
+----
+essay	30
+novel	180
+NULL	20
+
+# a local and a bridged dimension
+query III
+SELECT * FROM SEMANTIC_VIEW(library DIMENSIONS books.category, authors.country METRICS books.total_pages) ORDER BY 1, 2 NULLS LAST;
+----
+essay	US	300
+essay	NULL	400
+novel	FR	300
+novel	US	200
+
+# two bridges: every book counts once per (country, genre) combination
+query III
+SELECT * FROM SEMANTIC_VIEW(library DIMENSIONS authors.country, genres.genre_name METRICS books.total_pages) ORDER BY 1 NULLS LAST, 2 NULLS LAST;
+----
+FR	drama	300
+FR	history	200
+US	drama	200
+US	history	500
+NULL	NULL	400
+
+# metrics of two blocks (books through the bridge, authors locally) merged on the dimension, and a derived metric
+query IIII
+SELECT country, total_pages, total_revenue, round(pages_per_revenue, 2) FROM SEMANTIC_VIEW(library DIMENSIONS authors.country METRICS books.total_pages, authors.total_revenue, pages_per_revenue) ORDER BY 1 NULLS LAST;
+----
+DE	NULL	20	NULL
+FR	300	150	2.0
+US	500	30	16.67
+NULL	400	NULL	NULL
+
+# an ad-hoc dimension combining the metric's table and the bridged table
+query II
+SELECT * FROM SEMANTIC_VIEW(library DIMENSIONS books.category || '/' || authors.country AS k METRICS books.total_pages) ORDER BY 1 NULLS LAST;
+----
+essay/US	300
+novel/FR	300
+novel/US	200
+NULL	400
+
+# a dimension stored on the bridge itself is not reachable from books
+statement error
+SELECT * FROM SEMANTIC_VIEW(library DIMENSIONS book_authors.role METRICS books.total_pages);
+----
+must be related to and have an equal or lower level of granularity
+
+# one dimension cannot need two different bridges
+statement error
+SELECT * FROM SEMANTIC_VIEW(library DIMENSIONS authors.author_name || genres.genre_name AS x METRICS books.total_pages);
+----
+combines tables reached through different many-to-many bridges
