@@ -204,9 +204,11 @@ void MapWindowDimensions(const SemanticModel &model, unique_ptr<ParsedExpression
 	for (auto &order : window.orders) {
 		map_key(order.expression);
 	}
-	for (auto &child : window.children) {
-		MapWindowDimensions(model, child, dimensions);
+	for (auto &order : window.arg_orders) {
+		map_key(order.expression);
 	}
+	ParsedExpressionIterator::EnumerateChildren(
+	    *expr, [&](unique_ptr<ParsedExpression> &child) { MapWindowDimensions(model, child, dimensions); });
 }
 
 //===--------------------------------------------------------------------===//

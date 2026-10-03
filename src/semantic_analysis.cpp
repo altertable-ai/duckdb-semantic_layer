@@ -149,6 +149,9 @@ void SemanticAnalyzer::WindowDimensions(const ParsedExpression &expr, set<idx_t>
 		for (auto &order : window.orders) {
 			collect(*order.expression);
 		}
+		for (auto &order : window.arg_orders) {
+			collect(*order.expression);
+		}
 	}
 	auto ref = SemanticMarkers::Classify(expr);
 	if (ref.Is(SemanticRefKind::MEMBER) && model.members[ref.index].Kind() == SemanticMemberKind::METRIC) {
@@ -213,13 +216,19 @@ unique_ptr<ParsedExpression> SemanticAnalyzer::Decompose(const ParsedExpression 
 			for (auto &child : window.children) {
 				rewrite(child);
 			}
-			if (window.filter_expr) {
-				rewrite(window.filter_expr);
+			for (auto *argument : {&window.filter_expr, &window.start_expr, &window.end_expr, &window.offset_expr,
+			                       &window.default_expr}) {
+				if (*argument) {
+					rewrite(*argument);
+				}
 			}
 			for (auto &partition : window.partitions) {
 				rewrite_window_key(partition);
 			}
 			for (auto &order : window.orders) {
+				rewrite_window_key(order.expression);
+			}
+			for (auto &order : window.arg_orders) {
 				rewrite_window_key(order.expression);
 			}
 			return;
