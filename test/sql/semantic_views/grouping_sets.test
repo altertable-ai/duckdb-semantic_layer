@@ -1,0 +1,53 @@
+# name: test/sql/semantic_views/grouping_sets.test
+# description: reject grouping sets that cannot be preserved by the semantic query-by-name rewrite
+# group: [semantic_views]
+
+require semantic_views
+
+statement ok
+CREATE TABLE grouping_values (category VARCHAR, value INTEGER);
+INSERT INTO grouping_values VALUES ('A', 10), ('A', 20), ('B', 30);
+CREATE SEMANTIC VIEW grouping_view TABLES (t AS grouping_values) DIMENSIONS (t.category AS category) METRICS (t.total AS SUM(value));
+
+statement error
+SELECT category, AGG(total) FROM grouping_view GROUP BY ROLLUP(category);
+----
+Multiple grouping sets are not supported
+
+statement error
+SELECT category, AGG(total) FROM grouping_view GROUP BY CUBE(category);
+----
+Multiple grouping sets are not supported
+
+statement error
+SELECT category, AGG(total) FROM grouping_view GROUP BY GROUPING SETS ((category), ());
+----
+Multiple grouping sets are not supported
+
+# Repeated grouping sets produce repeated groups in SQL; they cannot be collapsed either.
+statement error
+SELECT category, AGG(total) FROM grouping_view GROUP BY GROUPING SETS ((category), (category));
+----
+Multiple grouping sets are not supported
+
+# A single grouping set is still an ordinary semantic aggregation.
+query II
+SELECT category, AGG(total) FROM grouping_view GROUP BY GROUPING SETS ((category)) ORDER BY category;
+----
+A	30
+B	30
+
+query I
+SELECT AGG(total) FROM grouping_view GROUP BY ();
+----
+60
+
+# Explicit UNION ALL evaluates totals at their own grain.
+query II
+SELECT category, AGG(total) FROM grouping_view GROUP BY category
+UNION ALL SELECT NULL, AGG(total) FROM grouping_view
+ORDER BY category NULLS LAST;
+----
+A	30
+B	30
+NULL	60

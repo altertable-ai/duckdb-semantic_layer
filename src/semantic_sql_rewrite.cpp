@@ -70,6 +70,11 @@ private:
 	}
 
 	void CheckSupported(const SelectNode &node) const {
+		if (node.groups.grouping_sets.size() > 1) {
+			throw BinderException("Multiple grouping sets are not supported when querying semantic view \"%s\" by "
+			                      "name; use UNION ALL of separately grouped queries",
+			                      model.Name().name);
+		}
 		if (node.qualify) {
 			throw BinderException("QUALIFY is not supported when querying semantic view \"%s\" by name",
 			                      model.Name().name);

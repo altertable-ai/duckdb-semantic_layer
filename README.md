@@ -251,7 +251,9 @@ As in Snowflake:
 - `WHERE` filters before aggregation, `HAVING` after.
 - Without aggregation, the select list is evaluated as facts, row by row.
 - Names can be bare, qualified (`customers.segment`) or quoted as BI tools write them (`"customers.segment"`).
-- Joins with the semantic view, window functions, `QUALIFY` and `SELECT *` are not supported in this form.
+- Joins with the semantic view, window functions, `QUALIFY`, `SELECT *`, and multiple grouping sets (`ROLLUP`,
+  `CUBE`, or `GROUPING SETS`) are not supported in this form. For subtotals, use `UNION ALL` of separately grouped
+  semantic queries so each metric is evaluated at the appropriate grain.
 
 ### Seeing the generated SQL
 
