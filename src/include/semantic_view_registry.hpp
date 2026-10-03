@@ -19,7 +19,9 @@ class ClientContext;
 
 class SemanticViewRegistry {
 public:
-	//! Resolves (catalog, schema) of a name used in DDL: missing parts default to the client's search path
+	//! Resolves a (catalog, schema) pair: missing parts default to the client's search path; `name` is left empty
+	static QualifiedName ResolveSchema(ClientContext &context, const string &catalog, const string &schema);
+	//! Resolves (catalog, schema) of a name used in DDL
 	static QualifiedName ResolveDDLName(ClientContext &context, const QualifiedName &name);
 
 	//! Registers `model`; returns false when a view with the same name exists and `replace` is false

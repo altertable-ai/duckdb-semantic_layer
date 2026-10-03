@@ -4,34 +4,43 @@
 // parsed_semantic_view.hpp
 //
 // Parsed (unvalidated) semantic view definitions and SEMANTIC_VIEW(...) query
-// specifications, as produced by the PEG transformers.
+// specifications, as produced by the PEG transformers. Both are serializable:
+// statements are lowered onto internal table functions that receive them as
+// BLOB payloads (semantic_lowering.hpp).
 //
 //===----------------------------------------------------------------------===//
 
 #pragma once
 
-#include "duckdb/common/types/value.hpp"
 #include "duckdb/parser/parsed_expression.hpp"
 #include "duckdb/parser/qualified_name.hpp"
-#include "duckdb/parser/query_node.hpp"
 #include "duckdb/parser/result_modifier.hpp"
 #include "duckdb/parser/tableref.hpp"
 
 namespace duckdb {
 
-//! Internal table functions the parser lowers semantic-view statements onto
-static constexpr const char *SEMANTIC_VIEW_DDL_FUNCTION = "__semantic_view_ddl";
-static constexpr const char *SEMANTIC_VIEW_SHOW_FUNCTION = "__semantic_view_show";
-static constexpr const char *SEMANTIC_VIEW_QUERY_FUNCTION = "__semantic_view_query";
+class Serializer;
+class Deserializer;
 
 enum class SemanticMemberKind : uint8_t { FACT = 0, DIMENSION = 1, METRIC = 2 };
 
 string SemanticMemberKindToString(SemanticMemberKind kind);
 
+struct ParsedSemanticTag {
+	string name;
+	string value;
+
+	void Serialize(Serializer &serializer) const;
+	static ParsedSemanticTag Deserialize(Deserializer &deserializer);
+};
+
 struct ParsedSemanticRangeConstraint {
 	string name;
 	string start_column;
 	string end_column;
+
+	void Serialize(Serializer &serializer) const;
+	static ParsedSemanticRangeConstraint Deserialize(Deserializer &deserializer);
 };
 
 struct ParsedSemanticTable {
@@ -44,9 +53,10 @@ struct ParsedSemanticTable {
 	vector<ParsedSemanticRangeConstraint> range_constraints;
 	vector<string> synonyms;
 	string comment;
-	vector<pair<string, string>> tags;
+	vector<ParsedSemanticTag> tags;
 
-	ParsedSemanticTable Copy() const;
+	void Serialize(Serializer &serializer) const;
+	static ParsedSemanticTable Deserialize(Deserializer &deserializer);
 };
 
 struct ParsedSemanticRelationship {
@@ -63,6 +73,9 @@ struct ParsedSemanticRelationship {
 	bool is_range = false;
 	string range_start;
 	string range_end;
+
+	void Serialize(Serializer &serializer) const;
+	static ParsedSemanticRelationship Deserialize(Deserializer &deserializer);
 };
 
 struct ParsedSemanticMember {
@@ -77,20 +90,27 @@ struct ParsedSemanticMember {
 	unique_ptr<ParsedExpression> expression;
 	vector<string> synonyms;
 	string comment;
-	vector<pair<string, string>> tags;
+	vector<ParsedSemanticTag> tags;
 	vector<string> sample_values;
 	bool is_enum = false;
 	string cortex_search_service;
 	string cortex_search_column;
 
-	ParsedSemanticMember Copy() const;
 	string FullName() const;
+	void Serialize(Serializer &serializer) const;
+	static ParsedSemanticMember Deserialize(Deserializer &deserializer);
 };
 
 struct ParsedSemanticVerifiedQuery {
 	string name;
-	//! (property keyword, rendered value) pairs in definition order
-	vector<pair<string, string>> properties;
+	string question;
+	string verified_at;
+	bool onboarding_question = false;
+	string verified_by;
+	string sql;
+
+	void Serialize(Serializer &serializer) const;
+	static ParsedSemanticVerifiedQuery Deserialize(Deserializer &deserializer);
 };
 
 struct ParsedSemanticView {
@@ -106,12 +126,12 @@ struct ParsedSemanticView {
 	string ai_sql_generation;
 	string ai_question_categorization;
 	vector<ParsedSemanticVerifiedQuery> verified_queries;
-	vector<pair<string, string>> tags;
+	vector<ParsedSemanticTag> tags;
 	bool copy_grants = false;
 
 	unique_ptr<ParsedSemanticView> Copy() const;
-	//! Canonical, re-parseable `CREATE SEMANTIC VIEW` statement (without OR REPLACE / IF NOT EXISTS)
-	string ToSQL() const;
+	void Serialize(Serializer &serializer) const;
+	static unique_ptr<ParsedSemanticView> Deserialize(Deserializer &deserializer);
 };
 
 //! One entry of a DIMENSIONS / METRICS / FACTS list in SEMANTIC_VIEW(...)
@@ -123,7 +143,8 @@ struct ParsedSemanticQueryItem {
 	string star_table;
 	string alias;
 
-	ParsedSemanticQueryItem Copy() const;
+	void Serialize(Serializer &serializer) const;
+	static ParsedSemanticQueryItem Deserialize(Deserializer &deserializer);
 };
 
 struct ParsedSemanticQuery {
@@ -131,18 +152,8 @@ struct ParsedSemanticQuery {
 	vector<ParsedSemanticQueryItem> items;
 	unique_ptr<ParsedExpression> where;
 
-	//! Encodes the items as LIST(STRUCT(kind VARCHAR, expr VARCHAR, alias VARCHAR)) for the internal function
-	Value ItemsToValue() const;
-	//! Decodes ItemsToValue() output (expressions are re-parsed)
-	static vector<ParsedSemanticQueryItem> ItemsFromValue(const Value &value);
-	static LogicalType ItemsType();
-	//! Renders the SEMANTIC_VIEW(...) clause (used in error messages and debugging)
-	string ToString() const;
+	void Serialize(Serializer &serializer) const;
+	static unique_ptr<ParsedSemanticQuery> Deserialize(Deserializer &deserializer);
 };
-
-//! Quotes an identifier when needed
-string SemanticQuoteIdentifier(const string &identifier);
-//! Renders a SQL string literal
-string SemanticQuoteString(const string &text);
 
 } // namespace duckdb

@@ -1,15 +1,9 @@
 #include "parsed_semantic_view.hpp"
 
 #include "duckdb/common/exception.hpp"
-#include "duckdb/common/exception/binder_exception.hpp"
-#include "duckdb/common/exception/catalog_exception.hpp"
-#include "duckdb/common/to_string.hpp"
-#include "duckdb/common/string_util.hpp"
-#include "duckdb/common/types/value.hpp"
-#include "duckdb/parser/keyword_helper.hpp"
-#include "duckdb/parser/parser.hpp"
-#include "duckdb/parser/tableref/basetableref.hpp"
-#include "duckdb/parser/tableref/subqueryref.hpp"
+#include "duckdb/common/serializer/binary_deserializer.hpp"
+#include "duckdb/common/serializer/binary_serializer.hpp"
+#include "duckdb/common/serializer/memory_stream.hpp"
 
 namespace duckdb {
 
@@ -25,408 +19,234 @@ string SemanticMemberKindToString(SemanticMemberKind kind) {
 	throw InternalException("unknown SemanticMemberKind");
 }
 
-static SemanticMemberKind SemanticMemberKindFromString(const string &text) {
-	if (StringUtil::CIEquals(text, "FACT")) {
-		return SemanticMemberKind::FACT;
-	}
-	if (StringUtil::CIEquals(text, "DIMENSION")) {
-		return SemanticMemberKind::DIMENSION;
-	}
-	if (StringUtil::CIEquals(text, "METRIC")) {
-		return SemanticMemberKind::METRIC;
-	}
-	throw InternalException("unknown semantic member kind '%s'", text);
-}
-
-string SemanticQuoteIdentifier(const string &identifier) {
-	return KeywordHelper::WriteOptionallyQuoted(identifier);
-}
-
-string SemanticQuoteString(const string &text) {
-	return KeywordHelper::WriteQuoted(text, '\'');
-}
-
-//===--------------------------------------------------------------------===//
-// Copy
-//===--------------------------------------------------------------------===//
-ParsedSemanticTable ParsedSemanticTable::Copy() const {
-	ParsedSemanticTable result;
-	result.alias = alias;
-	result.source = source ? source->Copy() : nullptr;
-	result.primary_key = primary_key;
-	result.unique_keys = unique_keys;
-	result.range_constraints = range_constraints;
-	result.synonyms = synonyms;
-	result.comment = comment;
-	result.tags = tags;
-	return result;
-}
-
-ParsedSemanticMember ParsedSemanticMember::Copy() const {
-	ParsedSemanticMember result;
-	result.kind = kind;
-	result.table = table;
-	result.name = name;
-	result.is_private = is_private;
-	result.labels = labels;
-	result.using_relationships = using_relationships;
-	for (auto &order : non_additive_by) {
-		result.non_additive_by.emplace_back(order.type, order.null_order, order.expression->Copy());
-	}
-	result.expression = expression ? expression->Copy() : nullptr;
-	result.synonyms = synonyms;
-	result.comment = comment;
-	result.tags = tags;
-	result.sample_values = sample_values;
-	result.is_enum = is_enum;
-	result.cortex_search_service = cortex_search_service;
-	result.cortex_search_column = cortex_search_column;
-	return result;
-}
-
 string ParsedSemanticMember::FullName() const {
 	return table.empty() ? name : table + "." + name;
 }
 
 unique_ptr<ParsedSemanticView> ParsedSemanticView::Copy() const {
+	// a serialization round trip: the field list lives in Serialize / Deserialize only
+	MemoryStream stream;
+	BinarySerializer::Serialize(*this, stream);
+	stream.Rewind();
+	return BinaryDeserializer::Deserialize<ParsedSemanticView>(stream);
+}
+
+//===--------------------------------------------------------------------===//
+// Serialization
+//===--------------------------------------------------------------------===//
+static void WriteName(Serializer &serializer, field_id_t first_field, const QualifiedName &name) {
+	serializer.WriteProperty(first_field, "catalog", name.catalog);
+	serializer.WriteProperty(first_field + 1, "schema", name.schema);
+	serializer.WriteProperty(first_field + 2, "name", name.name);
+}
+
+static QualifiedName ReadName(Deserializer &deserializer, field_id_t first_field) {
+	QualifiedName name;
+	name.catalog = deserializer.ReadProperty<string>(first_field, "catalog");
+	name.schema = deserializer.ReadProperty<string>(first_field + 1, "schema");
+	name.name = deserializer.ReadProperty<string>(first_field + 2, "name");
+	return name;
+}
+
+void ParsedSemanticTag::Serialize(Serializer &serializer) const {
+	serializer.WriteProperty(100, "name", name);
+	serializer.WriteProperty(101, "value", value);
+}
+
+ParsedSemanticTag ParsedSemanticTag::Deserialize(Deserializer &deserializer) {
+	ParsedSemanticTag result;
+	result.name = deserializer.ReadProperty<string>(100, "name");
+	result.value = deserializer.ReadProperty<string>(101, "value");
+	return result;
+}
+
+void ParsedSemanticRangeConstraint::Serialize(Serializer &serializer) const {
+	serializer.WriteProperty(100, "name", name);
+	serializer.WriteProperty(101, "start_column", start_column);
+	serializer.WriteProperty(102, "end_column", end_column);
+}
+
+ParsedSemanticRangeConstraint ParsedSemanticRangeConstraint::Deserialize(Deserializer &deserializer) {
+	ParsedSemanticRangeConstraint result;
+	result.name = deserializer.ReadProperty<string>(100, "name");
+	result.start_column = deserializer.ReadProperty<string>(101, "start_column");
+	result.end_column = deserializer.ReadProperty<string>(102, "end_column");
+	return result;
+}
+
+void ParsedSemanticTable::Serialize(Serializer &serializer) const {
+	serializer.WriteProperty(100, "alias", alias);
+	serializer.WritePropertyWithDefault(101, "source", source);
+	serializer.WriteProperty(102, "primary_key", primary_key);
+	serializer.WriteProperty(103, "unique_keys", unique_keys);
+	serializer.WriteProperty(104, "range_constraints", range_constraints);
+	serializer.WriteProperty(105, "synonyms", synonyms);
+	serializer.WriteProperty(106, "comment", comment);
+	serializer.WriteProperty(107, "tags", tags);
+}
+
+ParsedSemanticTable ParsedSemanticTable::Deserialize(Deserializer &deserializer) {
+	ParsedSemanticTable result;
+	result.alias = deserializer.ReadProperty<string>(100, "alias");
+	result.source = deserializer.ReadPropertyWithDefault<unique_ptr<TableRef>>(101, "source");
+	result.primary_key = deserializer.ReadProperty<vector<string>>(102, "primary_key");
+	result.unique_keys = deserializer.ReadProperty<vector<vector<string>>>(103, "unique_keys");
+	result.range_constraints =
+	    deserializer.ReadProperty<vector<ParsedSemanticRangeConstraint>>(104, "range_constraints");
+	result.synonyms = deserializer.ReadProperty<vector<string>>(105, "synonyms");
+	result.comment = deserializer.ReadProperty<string>(106, "comment");
+	result.tags = deserializer.ReadProperty<vector<ParsedSemanticTag>>(107, "tags");
+	return result;
+}
+
+void ParsedSemanticRelationship::Serialize(Serializer &serializer) const {
+	serializer.WriteProperty(100, "name", name);
+	serializer.WriteProperty(101, "from_table", from_table);
+	serializer.WriteProperty(102, "from_columns", from_columns);
+	serializer.WriteProperty(103, "to_table", to_table);
+	serializer.WriteProperty(104, "to_columns", to_columns);
+	serializer.WriteProperty<uint64_t>(105, "asof_index", asof_index);
+	serializer.WriteProperty(106, "is_range", is_range);
+	serializer.WriteProperty(107, "range_start", range_start);
+	serializer.WriteProperty(108, "range_end", range_end);
+}
+
+ParsedSemanticRelationship ParsedSemanticRelationship::Deserialize(Deserializer &deserializer) {
+	ParsedSemanticRelationship result;
+	result.name = deserializer.ReadProperty<string>(100, "name");
+	result.from_table = deserializer.ReadProperty<string>(101, "from_table");
+	result.from_columns = deserializer.ReadProperty<vector<string>>(102, "from_columns");
+	result.to_table = deserializer.ReadProperty<string>(103, "to_table");
+	result.to_columns = deserializer.ReadProperty<vector<string>>(104, "to_columns");
+	result.asof_index = deserializer.ReadProperty<uint64_t>(105, "asof_index");
+	result.is_range = deserializer.ReadProperty<bool>(106, "is_range");
+	result.range_start = deserializer.ReadProperty<string>(107, "range_start");
+	result.range_end = deserializer.ReadProperty<string>(108, "range_end");
+	return result;
+}
+
+void ParsedSemanticMember::Serialize(Serializer &serializer) const {
+	serializer.WriteProperty<uint8_t>(100, "kind", static_cast<uint8_t>(kind));
+	serializer.WriteProperty(101, "table", table);
+	serializer.WriteProperty(102, "name", name);
+	serializer.WriteProperty(103, "is_private", is_private);
+	serializer.WriteProperty(104, "labels", labels);
+	serializer.WriteProperty(105, "using_relationships", using_relationships);
+	serializer.WriteProperty(106, "non_additive_by", non_additive_by);
+	serializer.WritePropertyWithDefault(107, "expression", expression);
+	serializer.WriteProperty(108, "synonyms", synonyms);
+	serializer.WriteProperty(109, "comment", comment);
+	serializer.WriteProperty(110, "tags", tags);
+	serializer.WriteProperty(111, "sample_values", sample_values);
+	serializer.WriteProperty(112, "is_enum", is_enum);
+	serializer.WriteProperty(113, "cortex_search_service", cortex_search_service);
+	serializer.WriteProperty(114, "cortex_search_column", cortex_search_column);
+}
+
+ParsedSemanticMember ParsedSemanticMember::Deserialize(Deserializer &deserializer) {
+	ParsedSemanticMember result;
+	result.kind = static_cast<SemanticMemberKind>(deserializer.ReadProperty<uint8_t>(100, "kind"));
+	result.table = deserializer.ReadProperty<string>(101, "table");
+	result.name = deserializer.ReadProperty<string>(102, "name");
+	result.is_private = deserializer.ReadProperty<bool>(103, "is_private");
+	result.labels = deserializer.ReadProperty<vector<string>>(104, "labels");
+	result.using_relationships = deserializer.ReadProperty<vector<string>>(105, "using_relationships");
+	result.non_additive_by = deserializer.ReadProperty<vector<OrderByNode>>(106, "non_additive_by");
+	result.expression = deserializer.ReadPropertyWithDefault<unique_ptr<ParsedExpression>>(107, "expression");
+	result.synonyms = deserializer.ReadProperty<vector<string>>(108, "synonyms");
+	result.comment = deserializer.ReadProperty<string>(109, "comment");
+	result.tags = deserializer.ReadProperty<vector<ParsedSemanticTag>>(110, "tags");
+	result.sample_values = deserializer.ReadProperty<vector<string>>(111, "sample_values");
+	result.is_enum = deserializer.ReadProperty<bool>(112, "is_enum");
+	result.cortex_search_service = deserializer.ReadProperty<string>(113, "cortex_search_service");
+	result.cortex_search_column = deserializer.ReadProperty<string>(114, "cortex_search_column");
+	return result;
+}
+
+void ParsedSemanticVerifiedQuery::Serialize(Serializer &serializer) const {
+	serializer.WriteProperty(100, "name", name);
+	serializer.WriteProperty(101, "question", question);
+	serializer.WriteProperty(102, "verified_at", verified_at);
+	serializer.WriteProperty(103, "onboarding_question", onboarding_question);
+	serializer.WriteProperty(104, "verified_by", verified_by);
+	serializer.WriteProperty(105, "sql", sql);
+}
+
+ParsedSemanticVerifiedQuery ParsedSemanticVerifiedQuery::Deserialize(Deserializer &deserializer) {
+	ParsedSemanticVerifiedQuery result;
+	result.name = deserializer.ReadProperty<string>(100, "name");
+	result.question = deserializer.ReadProperty<string>(101, "question");
+	result.verified_at = deserializer.ReadProperty<string>(102, "verified_at");
+	result.onboarding_question = deserializer.ReadProperty<bool>(103, "onboarding_question");
+	result.verified_by = deserializer.ReadProperty<string>(104, "verified_by");
+	result.sql = deserializer.ReadProperty<string>(105, "sql");
+	return result;
+}
+
+void ParsedSemanticView::Serialize(Serializer &serializer) const {
+	WriteName(serializer, 100, name);
+	serializer.WriteProperty(103, "tables", tables);
+	serializer.WriteProperty(104, "relationships", relationships);
+	serializer.WriteProperty(105, "facts", facts);
+	serializer.WriteProperty(106, "dimensions", dimensions);
+	serializer.WriteProperty(107, "metrics", metrics);
+	serializer.WriteProperty(108, "comment", comment);
+	serializer.WriteProperty(109, "has_max_staleness", has_max_staleness);
+	serializer.WriteProperty(110, "max_staleness", max_staleness);
+	serializer.WriteProperty(111, "ai_sql_generation", ai_sql_generation);
+	serializer.WriteProperty(112, "ai_question_categorization", ai_question_categorization);
+	serializer.WriteProperty(113, "verified_queries", verified_queries);
+	serializer.WriteProperty(114, "tags", tags);
+	serializer.WriteProperty(115, "copy_grants", copy_grants);
+}
+
+unique_ptr<ParsedSemanticView> ParsedSemanticView::Deserialize(Deserializer &deserializer) {
 	auto result = make_uniq<ParsedSemanticView>();
-	result->name = name;
-	for (auto &table : tables) {
-		result->tables.push_back(table.Copy());
-	}
-	result->relationships = relationships;
-	for (auto &member : facts) {
-		result->facts.push_back(member.Copy());
-	}
-	for (auto &member : dimensions) {
-		result->dimensions.push_back(member.Copy());
-	}
-	for (auto &member : metrics) {
-		result->metrics.push_back(member.Copy());
-	}
-	result->comment = comment;
-	result->has_max_staleness = has_max_staleness;
-	result->max_staleness = max_staleness;
-	result->ai_sql_generation = ai_sql_generation;
-	result->ai_question_categorization = ai_question_categorization;
-	result->verified_queries = verified_queries;
-	result->tags = tags;
-	result->copy_grants = copy_grants;
+	result->name = ReadName(deserializer, 100);
+	result->tables = deserializer.ReadProperty<vector<ParsedSemanticTable>>(103, "tables");
+	result->relationships = deserializer.ReadProperty<vector<ParsedSemanticRelationship>>(104, "relationships");
+	result->facts = deserializer.ReadProperty<vector<ParsedSemanticMember>>(105, "facts");
+	result->dimensions = deserializer.ReadProperty<vector<ParsedSemanticMember>>(106, "dimensions");
+	result->metrics = deserializer.ReadProperty<vector<ParsedSemanticMember>>(107, "metrics");
+	result->comment = deserializer.ReadProperty<string>(108, "comment");
+	result->has_max_staleness = deserializer.ReadProperty<bool>(109, "has_max_staleness");
+	result->max_staleness = deserializer.ReadProperty<int64_t>(110, "max_staleness");
+	result->ai_sql_generation = deserializer.ReadProperty<string>(111, "ai_sql_generation");
+	result->ai_question_categorization = deserializer.ReadProperty<string>(112, "ai_question_categorization");
+	result->verified_queries = deserializer.ReadProperty<vector<ParsedSemanticVerifiedQuery>>(113, "verified_queries");
+	result->tags = deserializer.ReadProperty<vector<ParsedSemanticTag>>(114, "tags");
+	result->copy_grants = deserializer.ReadProperty<bool>(115, "copy_grants");
 	return result;
 }
 
-ParsedSemanticQueryItem ParsedSemanticQueryItem::Copy() const {
+void ParsedSemanticQueryItem::Serialize(Serializer &serializer) const {
+	serializer.WriteProperty<uint8_t>(100, "kind", static_cast<uint8_t>(kind));
+	serializer.WritePropertyWithDefault(101, "expression", expression);
+	serializer.WriteProperty(102, "star_table", star_table);
+	serializer.WriteProperty(103, "alias", alias);
+}
+
+ParsedSemanticQueryItem ParsedSemanticQueryItem::Deserialize(Deserializer &deserializer) {
 	ParsedSemanticQueryItem result;
-	result.kind = kind;
-	result.expression = expression ? expression->Copy() : nullptr;
-	result.star_table = star_table;
-	result.alias = alias;
+	result.kind = static_cast<SemanticMemberKind>(deserializer.ReadProperty<uint8_t>(100, "kind"));
+	result.expression = deserializer.ReadPropertyWithDefault<unique_ptr<ParsedExpression>>(101, "expression");
+	result.star_table = deserializer.ReadProperty<string>(102, "star_table");
+	result.alias = deserializer.ReadProperty<string>(103, "alias");
 	return result;
 }
 
-//===--------------------------------------------------------------------===//
-// ToSQL
-//===--------------------------------------------------------------------===//
-static string QuotedList(const vector<string> &identifiers) {
-	string result = "(";
-	for (idx_t i = 0; i < identifiers.size(); i++) {
-		if (i > 0) {
-			result += ", ";
-		}
-		result += SemanticQuoteIdentifier(identifiers[i]);
-	}
-	return result + ")";
+void ParsedSemanticQuery::Serialize(Serializer &serializer) const {
+	WriteName(serializer, 100, view);
+	serializer.WriteProperty(103, "items", items);
+	serializer.WritePropertyWithDefault(104, "where", where);
 }
 
-static string StringList(const vector<string> &values) {
-	string result = "(";
-	for (idx_t i = 0; i < values.size(); i++) {
-		if (i > 0) {
-			result += ", ";
-		}
-		result += SemanticQuoteString(values[i]);
-	}
-	return result + ")";
-}
-
-static string TagList(const vector<pair<string, string>> &tags) {
-	string result = "TAG (";
-	for (idx_t i = 0; i < tags.size(); i++) {
-		if (i > 0) {
-			result += ", ";
-		}
-		result += tags[i].first + " = " + SemanticQuoteString(tags[i].second);
-	}
-	return result + ")";
-}
-
-static string QualifiedNameToSQL(const QualifiedName &name) {
-	string result;
-	if (!name.catalog.empty() && name.catalog != INVALID_CATALOG) {
-		result += SemanticQuoteIdentifier(name.catalog) + ".";
-	}
-	if (!name.schema.empty() && name.schema != INVALID_SCHEMA) {
-		result += SemanticQuoteIdentifier(name.schema) + ".";
-	}
-	return result + SemanticQuoteIdentifier(name.name);
-}
-
-static string TableSourceToSQL(const TableRef &source) {
-	if (source.type == TableReferenceType::BASE_TABLE) {
-		auto &base = source.Cast<BaseTableRef>();
-		QualifiedName name;
-		name.catalog = base.catalog_name;
-		name.schema = base.schema_name;
-		name.name = base.table_name;
-		return QualifiedNameToSQL(name);
-	}
-	if (source.type == TableReferenceType::SUBQUERY) {
-		auto &subquery = source.Cast<SubqueryRef>();
-		return "(" + subquery.subquery->ToString() + ")";
-	}
-	throw InternalException("unsupported semantic view table source");
-}
-
-static void AppendCommonAnnotations(string &sql, const vector<string> &synonyms,
-                                    const vector<pair<string, string>> &tags, const string &comment) {
-	if (!synonyms.empty()) {
-		sql += " WITH SYNONYMS " + StringList(synonyms);
-	}
-	if (!tags.empty()) {
-		sql += " WITH " + TagList(tags);
-	}
-	if (!comment.empty()) {
-		sql += " COMMENT = " + SemanticQuoteString(comment);
-	}
-}
-
-static string MemberToSQL(const ParsedSemanticMember &member) {
-	string sql;
-	if (member.is_private) {
-		sql += "PRIVATE ";
-	}
-	if (!member.table.empty()) {
-		sql += SemanticQuoteIdentifier(member.table) + ".";
-	}
-	sql += SemanticQuoteIdentifier(member.name);
-	if (!member.labels.empty()) {
-		sql += " LABELS = " + QuotedList(member.labels);
-	}
-	if (!member.using_relationships.empty()) {
-		sql += " USING " + QuotedList(member.using_relationships);
-	}
-	if (!member.non_additive_by.empty()) {
-		sql += " NON ADDITIVE BY (";
-		for (idx_t i = 0; i < member.non_additive_by.size(); i++) {
-			if (i > 0) {
-				sql += ", ";
-			}
-			sql += member.non_additive_by[i].ToString();
-		}
-		sql += ")";
-	}
-	sql += " AS " + member.expression->ToString();
-	AppendCommonAnnotations(sql, member.synonyms, member.tags, member.comment);
-	if (!member.sample_values.empty()) {
-		sql += " SAMPLE_VALUES " + StringList(member.sample_values);
-	}
-	if (member.is_enum) {
-		sql += " IS_ENUM";
-	}
-	if (!member.cortex_search_service.empty()) {
-		sql += " WITH CORTEX SEARCH SERVICE " + member.cortex_search_service;
-		if (!member.cortex_search_column.empty()) {
-			sql += " USING " + SemanticQuoteIdentifier(member.cortex_search_column);
-		}
-	}
-	return sql;
-}
-
-static void AppendMembers(string &sql, const char *clause, const vector<ParsedSemanticMember> &members) {
-	if (members.empty()) {
-		return;
-	}
-	sql += "\n  ";
-	sql += clause;
-	sql += " (";
-	for (idx_t i = 0; i < members.size(); i++) {
-		sql += i == 0 ? "\n    " : ",\n    ";
-		sql += MemberToSQL(members[i]);
-	}
-	sql += "\n  )";
-}
-
-string ParsedSemanticView::ToSQL() const {
-	string sql = "CREATE SEMANTIC VIEW " + QualifiedNameToSQL(name);
-	sql += "\n  TABLES (";
-	for (idx_t i = 0; i < tables.size(); i++) {
-		auto &table = tables[i];
-		sql += i == 0 ? "\n    " : ",\n    ";
-		if (!table.alias.empty()) {
-			sql += SemanticQuoteIdentifier(table.alias) + " AS ";
-		}
-		sql += TableSourceToSQL(*table.source);
-		if (!table.primary_key.empty()) {
-			sql += " PRIMARY KEY " + QuotedList(table.primary_key);
-		}
-		for (auto &unique : table.unique_keys) {
-			sql += " UNIQUE " + QuotedList(unique);
-		}
-		for (auto &range : table.range_constraints) {
-			sql += " CONSTRAINT ";
-			if (!range.name.empty()) {
-				sql += SemanticQuoteIdentifier(range.name) + " ";
-			}
-			sql += "DISTINCT RANGE BETWEEN " + SemanticQuoteIdentifier(range.start_column) + " AND " +
-			       SemanticQuoteIdentifier(range.end_column) + " EXCLUSIVE";
-		}
-		AppendCommonAnnotations(sql, table.synonyms, table.tags, table.comment);
-	}
-	sql += "\n  )";
-	if (!relationships.empty()) {
-		sql += "\n  RELATIONSHIPS (";
-		for (idx_t i = 0; i < relationships.size(); i++) {
-			auto &rel = relationships[i];
-			sql += i == 0 ? "\n    " : ",\n    ";
-			if (!rel.name.empty()) {
-				sql += SemanticQuoteIdentifier(rel.name) + " AS ";
-			}
-			sql += SemanticQuoteIdentifier(rel.from_table) + " " + QuotedList(rel.from_columns) + " REFERENCES " +
-			       SemanticQuoteIdentifier(rel.to_table);
-			if (rel.is_range) {
-				sql += " (BETWEEN " + SemanticQuoteIdentifier(rel.range_start) + " AND " +
-				       SemanticQuoteIdentifier(rel.range_end) + " EXCLUSIVE)";
-			} else if (!rel.to_columns.empty()) {
-				sql += " (";
-				for (idx_t c = 0; c < rel.to_columns.size(); c++) {
-					if (c > 0) {
-						sql += ", ";
-					}
-					if (c == rel.asof_index) {
-						sql += "ASOF ";
-					}
-					sql += SemanticQuoteIdentifier(rel.to_columns[c]);
-				}
-				sql += ")";
-			}
-		}
-		sql += "\n  )";
-	}
-	AppendMembers(sql, "FACTS", facts);
-	AppendMembers(sql, "DIMENSIONS", dimensions);
-	AppendMembers(sql, "METRICS", metrics);
-	if (!comment.empty()) {
-		sql += "\n  COMMENT = " + SemanticQuoteString(comment);
-	}
-	if (has_max_staleness) {
-		sql += "\n  MAX_STALENESS = " + to_string(max_staleness);
-	}
-	if (!ai_sql_generation.empty()) {
-		sql += "\n  AI_SQL_GENERATION " + SemanticQuoteString(ai_sql_generation);
-	}
-	if (!ai_question_categorization.empty()) {
-		sql += "\n  AI_QUESTION_CATEGORIZATION " + SemanticQuoteString(ai_question_categorization);
-	}
-	if (!verified_queries.empty()) {
-		sql += "\n  AI_VERIFIED_QUERIES (";
-		for (idx_t i = 0; i < verified_queries.size(); i++) {
-			sql += i == 0 ? "\n    " : ",\n    ";
-			sql += SemanticQuoteIdentifier(verified_queries[i].name) + " AS (";
-			for (idx_t p = 0; p < verified_queries[i].properties.size(); p++) {
-				auto &property = verified_queries[i].properties[p];
-				sql += (p == 0 ? "" : " ") + property.first + " " + property.second;
-			}
-			sql += ")";
-		}
-		sql += "\n  )";
-	}
-	if (!tags.empty()) {
-		sql += "\n  WITH " + TagList(tags);
-	}
-	if (copy_grants) {
-		sql += "\n  COPY GRANTS";
-	}
-	return sql;
-}
-
-//===--------------------------------------------------------------------===//
-// Query items <-> Value
-//===--------------------------------------------------------------------===//
-LogicalType ParsedSemanticQuery::ItemsType() {
-	child_list_t<LogicalType> children;
-	children.emplace_back("kind", LogicalType::VARCHAR);
-	children.emplace_back("expr", LogicalType::VARCHAR);
-	children.emplace_back("star_table", LogicalType::VARCHAR);
-	children.emplace_back("alias", LogicalType::VARCHAR);
-	return LogicalType::LIST(LogicalType::STRUCT(std::move(children)));
-}
-
-Value ParsedSemanticQuery::ItemsToValue() const {
-	auto item_type = ListType::GetChildType(ItemsType());
-	vector<Value> values;
-	for (auto &item : items) {
-		// missing fields are empty strings (not NULL): the lowered SQL must keep its types when it is
-		// re-parsed from its textual form (e.g. statement verification, views)
-		vector<Value> fields;
-		fields.emplace_back(SemanticMemberKindToString(item.kind));
-		fields.emplace_back(item.expression ? item.expression->ToString() : string());
-		fields.emplace_back(item.expression ? string() : item.star_table);
-		fields.emplace_back(item.alias);
-		values.push_back(Value::STRUCT(item_type, std::move(fields)));
-	}
-	return Value::LIST(item_type, std::move(values));
-}
-
-vector<ParsedSemanticQueryItem> ParsedSemanticQuery::ItemsFromValue(const Value &value) {
-	vector<ParsedSemanticQueryItem> result;
-	if (value.IsNull()) {
-		return result;
-	}
-	for (auto &entry : ListValue::GetChildren(value)) {
-		auto &fields = StructValue::GetChildren(entry);
-		ParsedSemanticQueryItem item;
-		item.kind = SemanticMemberKindFromString(fields[0].ToString());
-		if (!fields[1].IsNull() && !StringValue::Get(fields[1]).empty()) {
-			auto expressions = Parser::ParseExpressionList(fields[1].ToString());
-			if (expressions.size() != 1) {
-				throw InternalException("semantic view query item did not round-trip: %s", fields[1].ToString());
-			}
-			item.expression = std::move(expressions[0]);
-		} else {
-			item.star_table = fields[2].ToString();
-		}
-		if (!fields[3].IsNull()) {
-			item.alias = StringValue::Get(fields[3]);
-		}
-		result.push_back(std::move(item));
-	}
+unique_ptr<ParsedSemanticQuery> ParsedSemanticQuery::Deserialize(Deserializer &deserializer) {
+	auto result = make_uniq<ParsedSemanticQuery>();
+	result->view = ReadName(deserializer, 100);
+	result->items = deserializer.ReadProperty<vector<ParsedSemanticQueryItem>>(103, "items");
+	result->where = deserializer.ReadPropertyWithDefault<unique_ptr<ParsedExpression>>(104, "where");
 	return result;
-}
-
-string ParsedSemanticQuery::ToString() const {
-	string result = "SEMANTIC_VIEW(" + QualifiedNameToSQL(view);
-	SemanticMemberKind current = SemanticMemberKind::DIMENSION;
-	bool first_in_clause = true;
-	for (idx_t i = 0; i < items.size(); i++) {
-		auto &item = items[i];
-		if (i == 0 || item.kind != current) {
-			current = item.kind;
-			result += " " + SemanticMemberKindToString(item.kind) + "S ";
-			first_in_clause = true;
-		}
-		if (!first_in_clause) {
-			result += ", ";
-		}
-		first_in_clause = false;
-		result += item.expression ? item.expression->ToString() : SemanticQuoteIdentifier(item.star_table) + ".*";
-		if (!item.alias.empty()) {
-			result += " AS " + SemanticQuoteIdentifier(item.alias);
-		}
-	}
-	if (where) {
-		result += " WHERE " + where->ToString();
-	}
-	return result + ")";
 }
 
 } // namespace duckdb

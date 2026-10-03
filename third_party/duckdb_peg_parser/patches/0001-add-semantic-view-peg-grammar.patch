@@ -1,13 +1,13 @@
---- a/grammar/statements/common.gram	2026-10-03 08:14:20
-+++ b/grammar/statements/common.gram	2026-10-03 01:19:32
+--- a/grammar/statements/common.gram
++++ b/grammar/statements/common.gram
 @@ -1,4 +1,5 @@
  Statement <-
 +	SemanticViewStatement /
  	CreateStatement /
  	SelectStatement /
  	SetStatement /
---- a/grammar/statements/select.gram	2026-10-03 08:14:20
-+++ b/grammar/statements/select.gram	2026-10-03 01:19:32
+--- a/grammar/statements/select.gram
++++ b/grammar/statements/select.gram
 @@ -42,7 +42,7 @@
  DistinctOn <- 'DISTINCT' DistinctOnTargets?
  DistinctOnTargets <- 'ON' Parens(List(Expression))
@@ -17,8 +17,8 @@
  
  TableRef <- InnerTableRef JoinOrPivot*
  TableSubquery <- Lateral? SubqueryReference TableAlias?
---- a/grammar/statements/explain.gram	2026-10-03 08:14:20
-+++ b/grammar/statements/explain.gram	2026-10-03 01:19:32
+--- a/grammar/statements/explain.gram
++++ b/grammar/statements/explain.gram
 @@ -1,6 +1,7 @@
  ExplainStatement <- 'EXPLAIN' 'ANALYZE'? GenericCopyOptionList? ExplainableStatements
  
@@ -27,8 +27,8 @@
      AlterStatement /
      AnalyzeStatement /
      CallStatement /
---- a/grammar/statements/expression.gram	2026-10-03 08:14:20
-+++ b/grammar/statements/expression.gram	2026-10-03 01:41:24
+--- a/grammar/statements/expression.gram
++++ b/grammar/statements/expression.gram
 @@ -70,7 +70,9 @@
  WindowFrameContentsParens <- Parens(WindowFrameContents)
  WindowFrameContents <- WindowPartition? OrderByClause? FrameClause?
@@ -40,8 +40,8 @@
  ListExpression <- ArrayBoundedListExpression / ArrayParensSelect
  ArrayBoundedListExpression <- 'ARRAY'? BoundedListExpression
  ArrayParensSelect <- 'ARRAY' Parens(SelectStatementInternal)
---- a/include/transformer/peg_transformer.hpp	2026-10-03 08:14:20
-+++ b/include/transformer/peg_transformer.hpp	2026-10-03 01:19:32
+--- a/include/transformer/peg_transformer.hpp
++++ b/include/transformer/peg_transformer.hpp
 @@ -278,6 +278,8 @@
  	void RegisterVacuum();
  	void RegisterKeywordsAndIdentifiers();
@@ -51,8 +51,8 @@
  
  private:
  	template <typename T>
---- a/transformer/peg_transformer_factory.cpp	2026-10-03 08:14:20
-+++ b/transformer/peg_transformer_factory.cpp	2026-10-03 01:19:32
+--- a/transformer/peg_transformer_factory.cpp
++++ b/transformer/peg_transformer_factory.cpp
 @@ -1049,6 +1049,7 @@
  	RegisterVacuum();
  	RegisterKeywordsAndIdentifiers();
@@ -61,8 +61,8 @@
  }
  
  vector<optional_ptr<ParseResult>>
---- a/transformer/transform_expression.cpp	2026-10-03 08:14:20
-+++ b/transformer/transform_expression.cpp	2026-10-03 01:41:24
+--- a/transformer/transform_expression.cpp
++++ b/transformer/transform_expression.cpp
 @@ -2207,10 +2207,16 @@
  vector<unique_ptr<ParsedExpression>>
  PEGTransformerFactory::TransformWindowPartition(PEGTransformer &transformer, optional_ptr<ParseResult> parse_result) {

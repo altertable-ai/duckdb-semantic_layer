@@ -17,6 +17,10 @@ include_directories(third_party/duckdb_peg_parser)
 set(EXTENSION_SOURCES
     src/semantic_views_extension.cpp
     src/semantic_views_functions.cpp
+    src/semantic_ddl_functions.cpp
+    src/semantic_show_functions.cpp
+    src/semantic_query_functions.cpp
+    src/semantic_lowering.cpp
     src/parsed_semantic_view.cpp
     src/semantic_analysis.cpp
     src/semantic_join_scope.cpp

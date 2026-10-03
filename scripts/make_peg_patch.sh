@@ -35,8 +35,7 @@ mkdir -p "${CUR}/patches"
 : >"${PATCH}"
 
 for path in "${PATHS[@]}"; do
-	diff -u "${DEST}/${path}" "${CUR}/${path}" |
-		sed "s|${DEST}/|a/|g; s|${CUR}/|b/|g" >>"${PATCH}" || true
+	diff -u --label "a/${path}" --label "b/${path}" "${DEST}/${path}" "${CUR}/${path}" >>"${PATCH}" || true
 done
 
 wc -l "${PATCH}"

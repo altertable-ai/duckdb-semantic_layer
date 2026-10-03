@@ -1,708 +1,591 @@
 #include "transformer/peg_transformer.hpp"
 
 #include "duckdb/common/exception.hpp"
-#include "duckdb/common/exception/binder_exception.hpp"
-#include "duckdb/common/exception/catalog_exception.hpp"
-#include "duckdb/common/to_string.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
-#include "duckdb/parser/expression/function_expression.hpp"
-#include "duckdb/parser/expression/star_expression.hpp"
-#include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
-#include "duckdb/parser/tableref/table_function_ref.hpp"
 #include "parsed_semantic_view.hpp"
-#include "semantic_view_peg_context.hpp"
+#include "semantic_lowering.hpp"
 
 namespace duckdb {
-
-thread_local unique_ptr<ParsedSemanticView> *SemanticViewPegContext::definition_capture = nullptr;
-
 namespace semantic_views_peg {
+
+// One transform per rule of grammar/statements/semantic_view.gram, registered with the factory. Children are
+// addressed by their position in the rule's sequence (noted above each transform). Statements are lowered onto the
+// internal table functions of semantic_lowering.hpp.
 
 namespace {
 
-//===--------------------------------------------------------------------===//
-// Parse-tree helpers
-//===--------------------------------------------------------------------===//
-bool IsWordLike(const string &text) {
-	if (text.empty()) {
-		return false;
-	}
-	for (auto c : text) {
-		if (!StringUtil::CharacterIsAlphaNumeric(c) && c != '_' && c != '$' && static_cast<unsigned char>(c) < 128) {
-			return false;
-		}
-	}
-	return true;
+ListParseResult &List(optional_ptr<ParseResult> parse_result) {
+	return parse_result->Cast<ListParseResult>();
 }
 
-//! Nodes whose subtrees belong to DuckDB's own grammar - never searched for semantic-view rules
-bool IsOpaque(const ParseResult &pr) {
-	return pr.name == "Expression" || pr.name == "SelectStatementInternal" || pr.name == "OrderByExpression" ||
-	       pr.name == "QualifiedName" || pr.name == "BaseTableName" || pr.name == "TableAlias";
+//! The alternative matched by a rule whose body is an ordered choice
+optional_ptr<ParseResult> Choice(optional_ptr<ParseResult> parse_result) {
+	return List(parse_result).Child<ChoiceParseResult>(0).result;
 }
 
-void Children(optional_ptr<ParseResult> pr, vector<optional_ptr<ParseResult>> &out) {
-	if (!pr) {
-		return;
-	}
-	switch (pr->type) {
-	case ParseResultType::LIST:
-		for (auto &child : pr->Cast<ListParseResult>().GetChildren()) {
-			if (child) {
-				out.push_back(child);
-			}
-		}
-		break;
-	case ParseResultType::REPEAT:
-		for (auto &child : pr->Cast<RepeatParseResult>().children) {
-			if (child) {
-				out.push_back(child);
-			}
-		}
-		break;
-	case ParseResultType::OPTIONAL: {
-		auto &opt = pr->Cast<OptionalParseResult>();
-		if (opt.HasResult()) {
-			out.push_back(opt.optional_result);
-		}
-		break;
-	}
-	case ParseResultType::CHOICE: {
-		auto &choice = pr->Cast<ChoiceParseResult>();
-		if (choice.result) {
-			out.push_back(choice.result);
-		}
-		break;
-	}
-	default:
-		break;
-	}
+bool Present(ListParseResult &list, idx_t index) {
+	return list.Child<OptionalParseResult>(index).HasResult();
 }
 
-//! Collects the descendants (not `pr` itself) named `name`, without descending into matches or opaque nodes
-void CollectNamed(optional_ptr<ParseResult> pr, const string &name, vector<optional_ptr<ParseResult>> &out) {
-	vector<optional_ptr<ParseResult>> children;
-	Children(pr, children);
-	for (auto &child : children) {
-		if (StringUtil::CIEquals(child->name, name)) {
-			// Choice / optional wrappers copy the name of the rule they wrap: return the rule's own node
-			auto node = child;
-			while (node && (node->type == ParseResultType::CHOICE || node->type == ParseResultType::OPTIONAL)) {
-				vector<optional_ptr<ParseResult>> inner;
-				Children(node, inner);
-				if (inner.empty() || !StringUtil::CIEquals(inner[0]->name, name)) {
-					break;
-				}
-				node = inner[0];
-			}
-			out.push_back(node);
-			continue;
+optional_ptr<ParseResult> Optional(ListParseResult &list, idx_t index) {
+	return list.Child<OptionalParseResult>(index).optional_result;
+}
+
+//! The elements of an `X*` (optional repeat) or `X+` (repeat) child
+vector<optional_ptr<ParseResult>> Repeated(optional_ptr<ParseResult> parse_result) {
+	if (parse_result->type == ParseResultType::OPTIONAL) {
+		auto &optional = parse_result->Cast<OptionalParseResult>();
+		if (!optional.HasResult()) {
+			return {};
 		}
-		if (IsOpaque(*child)) {
-			continue;
-		}
-		CollectNamed(child, name, out);
+		parse_result = optional.optional_result;
 	}
+	return parse_result->Cast<RepeatParseResult>().children;
 }
 
-vector<optional_ptr<ParseResult>> AllNamed(optional_ptr<ParseResult> pr, const string &name) {
-	vector<optional_ptr<ParseResult>> result;
-	CollectNamed(pr, name, result);
-	return result;
+//! The elements of a `Parens(List(X))` child
+vector<optional_ptr<ParseResult>> ParenthesizedList(optional_ptr<ParseResult> parse_result) {
+	return PEGTransformerFactory::ExtractParseResultsFromList(
+	    PEGTransformerFactory::ExtractResultFromParens(parse_result));
 }
 
-optional_ptr<ParseResult> FirstNamed(optional_ptr<ParseResult> pr, const string &name) {
-	auto all = AllNamed(pr, name);
-	return all.empty() ? nullptr : all[0];
-}
-
-//! Word-like leaves (identifiers, keywords, string and number literals) in order
-void CollectLeaves(optional_ptr<ParseResult> pr, vector<string> &out) {
-	if (!pr) {
-		return;
-	}
-	switch (pr->type) {
-	case ParseResultType::IDENTIFIER:
-		out.push_back(pr->Cast<IdentifierParseResult>().identifier);
-		return;
-	case ParseResultType::KEYWORD: {
-		auto &keyword = pr->Cast<KeywordParseResult>().keyword;
-		if (IsWordLike(keyword)) {
-			out.push_back(keyword);
-		}
-		return;
-	}
-	case ParseResultType::STRING:
-		out.push_back(pr->Cast<StringLiteralParseResult>().result);
-		return;
-	case ParseResultType::NUMBER:
-		out.push_back(pr->Cast<NumberParseResult>().number);
-		return;
-	default:
-		break;
-	}
-	vector<optional_ptr<ParseResult>> children;
-	Children(pr, children);
-	for (auto &child : children) {
-		CollectLeaves(child, out);
-	}
-}
-
-string LeafText(optional_ptr<ParseResult> pr) {
-	vector<string> leaves;
-	CollectLeaves(pr, leaves);
-	if (leaves.empty()) {
-		throw InternalException("semantic view parser: expected an identifier or literal in rule '%s'",
-		                        pr ? pr->name : string("<null>"));
-	}
-	return leaves[0];
-}
-
-vector<string> NamedLeafTexts(optional_ptr<ParseResult> pr, const string &name) {
-	vector<string> result;
-	for (auto &node : AllNamed(pr, name)) {
-		result.push_back(LeafText(node));
+template <class T>
+vector<T> TransformAll(PEGTransformer &transformer, const vector<optional_ptr<ParseResult>> &parse_results) {
+	vector<T> result;
+	for (auto &parse_result : parse_results) {
+		result.push_back(transformer.Transform<T>(parse_result));
 	}
 	return result;
 }
 
-string StringLiteralValue(optional_ptr<ParseResult> pr) {
-	auto literal = FirstNamed(pr, "StringLiteral");
-	if (!literal) {
-		throw InternalException("semantic view parser: expected a string literal in rule '%s'", pr->name);
+//! The keyword matched by a rule of keyword alternatives ('PRIVATE' / 'PUBLIC', ...)
+string Keyword(optional_ptr<ParseResult> parse_result) {
+	return StringUtil::Upper(Choice(parse_result)->Cast<KeywordParseResult>().keyword);
+}
+
+SemanticMemberKind MemberKind(const string &keyword) {
+	auto upper = StringUtil::Upper(keyword);
+	if (upper == "DIMENSIONS") {
+		return SemanticMemberKind::DIMENSION;
 	}
-	return LeafText(literal);
-}
-
-vector<string> StringLiteralList(optional_ptr<ParseResult> pr) {
-	return NamedLeafTexts(pr, "StringLiteral");
-}
-
-vector<pair<string, string>> ParseTags(optional_ptr<ParseResult> tag) {
-	vector<pair<string, string>> result;
-	for (auto &entry : AllNamed(tag, "SemanticTagEntry")) {
-		auto dotted = FirstNamed(entry, "SemanticDottedName");
-		vector<string> parts;
-		CollectLeaves(dotted, parts);
-		result.emplace_back(StringUtil::Join(parts, "."), StringLiteralValue(entry));
+	if (upper == "METRICS") {
+		return SemanticMemberKind::METRIC;
 	}
-	return result;
+	D_ASSERT(upper == "FACTS");
+	return SemanticMemberKind::FACT;
 }
 
-string DottedName(optional_ptr<ParseResult> pr) {
-	vector<string> parts;
-	CollectLeaves(pr, parts);
-	return StringUtil::Join(parts, ".");
-}
-
-//===--------------------------------------------------------------------===//
-// Lowering helpers
-//===--------------------------------------------------------------------===//
-unique_ptr<SQLStatement> MakeFunctionSelect(const string &function_name, vector<Value> args) {
-	vector<unique_ptr<ParsedExpression>> children;
-	for (auto &arg : args) {
-		children.push_back(make_uniq<ConstantExpression>(std::move(arg)));
+void ApplyAlias(PEGTransformer &transformer, ListParseResult &list, idx_t index, TableRef &ref) {
+	if (Present(list, index)) {
+		auto alias = transformer.Transform<TableAlias>(Optional(list, index));
+		ref.alias = alias.name;
+		ref.column_name_alias = alias.column_name_alias;
 	}
-	auto ref = make_uniq<TableFunctionRef>();
-	ref->function = make_uniq<FunctionExpression>(function_name, std::move(children));
-	auto node = make_uniq<SelectNode>();
-	node->select_list.push_back(make_uniq<StarExpression>());
-	node->from_table = std::move(ref);
-	auto statement = make_uniq<SelectStatement>();
-	statement->node = std::move(node);
-	return std::move(statement);
-}
-
-Value NameValue(const string &part) {
-	return Value(part);
 }
 
 //===--------------------------------------------------------------------===//
-// CREATE SEMANTIC VIEW
+// Shared clauses
 //===--------------------------------------------------------------------===//
-ParsedSemanticTable ParseLogicalTable(PEGTransformer &transformer, optional_ptr<ParseResult> pr) {
+// Parens(List(ColId))
+vector<string> TransformSemanticColumnList(PEGTransformer &transformer, optional_ptr<ParseResult> parse_result) {
+	return TransformAll<string>(transformer, ParenthesizedList(List(parse_result).GetChild(0)));
+}
+
+// 'WITH'? 'SYNONYMS' '='? Parens(List(StringLiteral))
+vector<string> TransformSemanticWithSynonyms(PEGTransformer &transformer, optional_ptr<ParseResult> parse_result) {
+	return TransformAll<string>(transformer, ParenthesizedList(List(parse_result).GetChild(3)));
+}
+
+// 'COMMENT' '=' StringLiteral
+string TransformSemanticComment(PEGTransformer &transformer, optional_ptr<ParseResult> parse_result) {
+	return transformer.Transform<string>(List(parse_result), 2);
+}
+
+// 'WITH'? 'TAG' Parens(List(SemanticTagEntry))
+vector<ParsedSemanticTag> TransformSemanticTag(PEGTransformer &transformer, optional_ptr<ParseResult> parse_result) {
+	return TransformAll<ParsedSemanticTag>(transformer, ParenthesizedList(List(parse_result).GetChild(2)));
+}
+
+// SemanticDottedName '=' StringLiteral
+ParsedSemanticTag TransformSemanticTagEntry(PEGTransformer &transformer, optional_ptr<ParseResult> parse_result) {
+	auto &list = List(parse_result);
+	ParsedSemanticTag tag;
+	tag.name = StringUtil::Join(transformer.Transform<vector<string>>(list, 0), ".");
+	tag.value = transformer.Transform<string>(list, 2);
+	return tag;
+}
+
+// ColId ('.' ColLabel)*
+vector<string> TransformSemanticDottedName(PEGTransformer &transformer, optional_ptr<ParseResult> parse_result) {
+	auto &list = List(parse_result);
+	vector<string> parts {transformer.Transform<string>(list, 0)};
+	for (auto &part : Repeated(list.GetChild(1))) {
+		parts.push_back(transformer.Transform<string>(List(part), 1));
+	}
+	return parts;
+}
+
+// ColId 'AS' (SemanticTableAliasAs, SemanticRelationshipName) / ColId (SemanticConstraintName)
+string TransformSemanticName(PEGTransformer &transformer, optional_ptr<ParseResult> parse_result) {
+	return transformer.Transform<string>(List(parse_result), 0);
+}
+
+//===--------------------------------------------------------------------===//
+// TABLES
+//===--------------------------------------------------------------------===//
+// 'TABLES' Parens(List(SemanticLogicalTable))
+vector<ParsedSemanticTable> TransformSemanticTablesClause(PEGTransformer &transformer,
+                                                          optional_ptr<ParseResult> parse_result) {
+	return TransformAll<ParsedSemanticTable>(transformer, ParenthesizedList(List(parse_result).GetChild(1)));
+}
+
+// SemanticTableAliasAs? SemanticTableSource SemanticTableOption*
+ParsedSemanticTable TransformSemanticLogicalTable(PEGTransformer &transformer, optional_ptr<ParseResult> parse_result) {
+	auto &list = List(parse_result);
 	ParsedSemanticTable table;
-	auto alias = FirstNamed(pr, "SemanticTableAliasAs");
-	if (alias) {
-		table.alias = LeafText(alias);
-	}
-	auto source = FirstNamed(pr, "SemanticTableSource");
-	auto select = FirstNamed(source, "SelectStatementInternal");
-	if (select) {
-		auto subquery = transformer.Transform<unique_ptr<SelectStatement>>(select);
-		table.source = make_uniq<SubqueryRef>(std::move(subquery));
-	} else {
-		auto base = FirstNamed(source, "BaseTableName");
-		if (!base) {
-			throw ParserException("semantic view: expected a table name or a parenthesized query in TABLES");
-		}
-		auto base_ref = transformer.Transform<unique_ptr<BaseTableRef>>(base);
-		table.source = std::move(base_ref);
-	}
-	for (auto &option : AllNamed(pr, "SemanticTableOption")) {
-		auto key = FirstNamed(option, "SemanticPrimaryKey");
-		if (key) {
+	transformer.TransformOptional<string>(list, 0, table.alias);
+	table.source = transformer.Transform<unique_ptr<TableRef>>(list, 1);
+	for (auto &option_node : Repeated(list.GetChild(2))) {
+		auto option = Choice(option_node);
+		if (option->name == "SemanticPrimaryKey") {
+			// 'PRIMARY' 'KEY' SemanticColumnList
 			if (!table.primary_key.empty()) {
 				throw ParserException("semantic view: logical table has more than one PRIMARY KEY");
 			}
-			table.primary_key = NamedLeafTexts(key, "ColId");
-			continue;
-		}
-		auto unique = FirstNamed(option, "SemanticUnique");
-		if (unique) {
-			table.unique_keys.push_back(NamedLeafTexts(unique, "ColId"));
-			continue;
-		}
-		auto range = FirstNamed(option, "SemanticRangeConstraint");
-		if (range) {
-			ParsedSemanticRangeConstraint constraint;
-			auto name = FirstNamed(range, "SemanticConstraintName");
-			if (name) {
-				constraint.name = LeafText(name);
-			}
-			// the last two ColIds are the range bounds (an optional constraint name precedes them)
-			auto columns = NamedLeafTexts(range, "ColId");
-			if (columns.size() < 2) {
-				throw ParserException("semantic view: invalid DISTINCT RANGE constraint");
-			}
-			constraint.start_column = columns[columns.size() - 2];
-			constraint.end_column = columns[columns.size() - 1];
-			table.range_constraints.push_back(std::move(constraint));
-			continue;
-		}
-		auto synonyms = FirstNamed(option, "SemanticWithSynonyms");
-		if (synonyms) {
-			table.synonyms = StringLiteralList(synonyms);
-			continue;
-		}
-		auto comment = FirstNamed(option, "SemanticComment");
-		if (comment) {
-			table.comment = StringLiteralValue(comment);
-			continue;
-		}
-		auto tag = FirstNamed(option, "SemanticTag");
-		if (tag) {
-			table.tags = ParseTags(tag);
-			continue;
+			table.primary_key = transformer.Transform<vector<string>>(List(option), 2);
+		} else if (option->name == "SemanticUnique") {
+			// 'UNIQUE' SemanticColumnList
+			table.unique_keys.push_back(transformer.Transform<vector<string>>(List(option), 1));
+		} else if (option->name == "SemanticRangeConstraint") {
+			table.range_constraints.push_back(transformer.Transform<ParsedSemanticRangeConstraint>(option));
+		} else if (option->name == "SemanticWithSynonyms") {
+			table.synonyms = transformer.Transform<vector<string>>(option);
+		} else if (option->name == "SemanticComment") {
+			table.comment = transformer.Transform<string>(option);
+		} else {
+			table.tags = transformer.Transform<vector<ParsedSemanticTag>>(option);
 		}
 	}
 	return table;
 }
 
-ParsedSemanticRelationship ParseRelationship(optional_ptr<ParseResult> pr) {
-	// SemanticRelationship <- SemanticRelationshipName? ColId SemanticColumnList 'REFERENCES' ColId
-	//                         SemanticReferencedColumns?
-	auto &list_pr = pr->Cast<ListParseResult>();
-	ParsedSemanticRelationship rel;
-	auto &name = list_pr.Child<OptionalParseResult>(0);
-	if (name.HasResult()) {
-		rel.name = LeafText(name.optional_result);
+// SemanticParensSelect / BaseTableName
+unique_ptr<TableRef> TransformSemanticTableSource(PEGTransformer &transformer, optional_ptr<ParseResult> parse_result) {
+	auto source = Choice(parse_result);
+	if (source->name == "BaseTableName") {
+		return transformer.Transform<unique_ptr<BaseTableRef>>(source);
 	}
-	rel.from_table = LeafText(list_pr.GetChild(1));
-	rel.from_columns = NamedLeafTexts(list_pr.GetChild(2), "ColId");
-	rel.to_table = LeafText(list_pr.GetChild(4));
-	auto &referenced = list_pr.Child<OptionalParseResult>(5);
-	if (referenced.HasResult()) {
-		auto range = FirstNamed(referenced.optional_result, "SemanticRangeReference");
-		if (range) {
-			auto bounds = NamedLeafTexts(range, "ColId");
-			rel.is_range = true;
-			rel.range_start = bounds[0];
-			rel.range_end = bounds[1];
-		} else {
-			auto columns = AllNamed(referenced.optional_result, "SemanticReferencedColumn");
-			for (idx_t i = 0; i < columns.size(); i++) {
-				if (FirstNamed(columns[i], "SemanticAsof")) {
-					if (rel.asof_index != DConstants::INVALID_INDEX) {
-						throw ParserException("semantic view: at most one ASOF column per relationship");
-					}
-					rel.asof_index = i;
-				}
-				rel.to_columns.push_back(LeafText(FirstNamed(columns[i], "ColId")));
+	// Parens(SelectStatementInternal)
+	auto select = PEGTransformerFactory::ExtractResultFromParens(List(source).GetChild(0));
+	return make_uniq<SubqueryRef>(transformer.Transform<unique_ptr<SelectStatement>>(select));
+}
+
+// 'CONSTRAINT' SemanticConstraintName? 'DISTINCT' 'RANGE' 'BETWEEN' ColId 'AND' ColId 'EXCLUSIVE'
+ParsedSemanticRangeConstraint TransformSemanticRangeConstraint(PEGTransformer &transformer,
+                                                               optional_ptr<ParseResult> parse_result) {
+	auto &list = List(parse_result);
+	ParsedSemanticRangeConstraint constraint;
+	transformer.TransformOptional<string>(list, 1, constraint.name);
+	constraint.start_column = transformer.Transform<string>(list, 5);
+	constraint.end_column = transformer.Transform<string>(list, 7);
+	return constraint;
+}
+
+//===--------------------------------------------------------------------===//
+// RELATIONSHIPS
+//===--------------------------------------------------------------------===//
+// 'RELATIONSHIPS' Parens(List(SemanticRelationship))
+vector<ParsedSemanticRelationship> TransformSemanticRelationshipsClause(PEGTransformer &transformer,
+                                                                       optional_ptr<ParseResult> parse_result) {
+	return TransformAll<ParsedSemanticRelationship>(transformer, ParenthesizedList(List(parse_result).GetChild(1)));
+}
+
+// SemanticRelationshipName? ColId SemanticColumnList 'REFERENCES' ColId SemanticReferencedColumns?
+ParsedSemanticRelationship TransformSemanticRelationship(PEGTransformer &transformer,
+                                                         optional_ptr<ParseResult> parse_result) {
+	auto &list = List(parse_result);
+	ParsedSemanticRelationship rel;
+	transformer.TransformOptional<string>(list, 0, rel.name);
+	rel.from_table = transformer.Transform<string>(list, 1);
+	rel.from_columns = transformer.Transform<vector<string>>(list, 2);
+	rel.to_table = transformer.Transform<string>(list, 4);
+	if (!Present(list, 5)) {
+		return rel;
+	}
+	// Parens(SemanticRangeReference / List(SemanticReferencedColumn))
+	auto referenced = PEGTransformerFactory::ExtractResultFromParens(List(Optional(list, 5)).GetChild(0));
+	auto spec = Choice(referenced);
+	if (spec->name == "SemanticRangeReference") {
+		// 'BETWEEN' ColId 'AND' ColId 'EXCLUSIVE'
+		rel.is_range = true;
+		rel.range_start = transformer.Transform<string>(List(spec), 1);
+		rel.range_end = transformer.Transform<string>(List(spec), 3);
+		return rel;
+	}
+	auto columns = PEGTransformerFactory::ExtractParseResultsFromList(List(spec).GetChild(0));
+	for (idx_t i = 0; i < columns.size(); i++) {
+		// SemanticAsof? ColId
+		auto &column = List(columns[i]);
+		if (Present(column, 0)) {
+			if (rel.asof_index != DConstants::INVALID_INDEX) {
+				throw ParserException("semantic view: at most one ASOF column per relationship");
 			}
+			rel.asof_index = i;
 		}
+		rel.to_columns.push_back(transformer.Transform<string>(column, 1));
 	}
 	return rel;
 }
 
-ParsedSemanticMember ParseMember(PEGTransformer &transformer, optional_ptr<ParseResult> pr, SemanticMemberKind kind) {
-	ParsedSemanticMember member;
-	member.kind = kind;
-	auto visibility = FirstNamed(pr, "SemanticVisibility");
-	if (visibility) {
-		member.is_private = StringUtil::CIEquals(LeafText(visibility), "PRIVATE");
+//===--------------------------------------------------------------------===//
+// FACTS / DIMENSIONS / METRICS
+//===--------------------------------------------------------------------===//
+// 'FACTS' / 'DIMENSIONS' / 'METRICS' Parens(List(SemanticMember))
+vector<ParsedSemanticMember> TransformSemanticMemberClause(PEGTransformer &transformer,
+                                                           optional_ptr<ParseResult> parse_result) {
+	auto &list = List(parse_result);
+	auto kind = MemberKind(list.Child<KeywordParseResult>(0).keyword);
+	auto members = TransformAll<ParsedSemanticMember>(transformer, ParenthesizedList(list.GetChild(1)));
+	for (auto &member : members) {
+		member.kind = kind;
 		if (member.is_private && kind == SemanticMemberKind::DIMENSION) {
 			throw ParserException("semantic view: dimensions cannot be PRIVATE");
 		}
-	}
-	auto name = FirstNamed(pr, "SemanticMemberName");
-	vector<string> name_parts;
-	CollectLeaves(name, name_parts);
-	if (name_parts.size() == 2) {
-		member.table = name_parts[0];
-		member.name = name_parts[1];
-	} else if (name_parts.size() == 1) {
-		if (kind != SemanticMemberKind::METRIC) {
+		if (member.table.empty() && kind != SemanticMemberKind::METRIC) {
 			throw ParserException("semantic view: %s '%s' must be qualified with its logical table (table.name)",
-			                      StringUtil::Lower(SemanticMemberKindToString(kind)), name_parts[0]);
-		}
-		member.name = name_parts[0];
-	} else {
-		throw ParserException("semantic view: invalid member name");
-	}
-	auto labels = FirstNamed(pr, "SemanticLabels");
-	if (labels) {
-		member.labels = NamedLeafTexts(labels, "ColId");
-	}
-	auto using_clause = FirstNamed(pr, "SemanticUsing");
-	if (using_clause) {
-		member.using_relationships = NamedLeafTexts(using_clause, "ColId");
-	}
-	auto non_additive = FirstNamed(pr, "SemanticNonAdditive");
-	if (non_additive) {
-		for (auto &order : AllNamed(non_additive, "OrderByExpression")) {
-			member.non_additive_by.push_back(transformer.Transform<OrderByNode>(order));
+			                      StringUtil::Lower(SemanticMemberKindToString(kind)), member.name);
 		}
 	}
-	auto expression = FirstNamed(pr, "Expression");
-	if (!expression) {
-		throw ParserException("semantic view: missing AS <expression> for '%s'", member.FullName());
+	return members;
+}
+
+// SemanticVisibility? SemanticMemberName SemanticLabels? SemanticUsing? SemanticNonAdditive? 'AS' Expression
+// SemanticMemberOption*
+ParsedSemanticMember TransformSemanticMember(PEGTransformer &transformer, optional_ptr<ParseResult> parse_result) {
+	auto &list = List(parse_result);
+	ParsedSemanticMember member;
+	member.is_private = Present(list, 0) && Keyword(Optional(list, 0)) == "PRIVATE";
+	auto name = transformer.Transform<vector<string>>(list, 1);
+	member.name = name.back();
+	if (name.size() == 2) {
+		member.table = name[0];
 	}
-	member.expression = transformer.Transform<unique_ptr<ParsedExpression>>(expression);
-	for (auto &option : AllNamed(pr, "SemanticMemberOption")) {
-		if (auto synonyms = FirstNamed(option, "SemanticWithSynonyms")) {
-			member.synonyms = StringLiteralList(synonyms);
-		} else if (auto comment = FirstNamed(option, "SemanticComment")) {
-			member.comment = StringLiteralValue(comment);
-		} else if (auto tag = FirstNamed(option, "SemanticTag")) {
-			member.tags = ParseTags(tag);
-		} else if (auto samples = FirstNamed(option, "SemanticSampleValues")) {
-			member.sample_values = StringLiteralList(samples);
-		} else if (FirstNamed(option, "SemanticIsEnum")) {
+	if (Present(list, 2)) {
+		// 'LABELS' '=' Parens(List(ColId))
+		member.labels = TransformAll<string>(transformer, ParenthesizedList(List(Optional(list, 2)).GetChild(2)));
+	}
+	if (Present(list, 3)) {
+		// 'USING' Parens(List(ColId))
+		member.using_relationships =
+		    TransformAll<string>(transformer, ParenthesizedList(List(Optional(list, 3)).GetChild(1)));
+	}
+	if (Present(list, 4)) {
+		// 'NON' 'ADDITIVE' 'BY' Parens(List(OrderByExpression))
+		member.non_additive_by =
+		    TransformAll<OrderByNode>(transformer, ParenthesizedList(List(Optional(list, 4)).GetChild(3)));
+	}
+	member.expression = transformer.Transform<unique_ptr<ParsedExpression>>(list, 6);
+	for (auto &option_node : Repeated(list.GetChild(7))) {
+		auto option = Choice(option_node);
+		auto &option_list = List(option);
+		if (option->name == "SemanticWithSynonyms") {
+			member.synonyms = transformer.Transform<vector<string>>(option);
+		} else if (option->name == "SemanticComment") {
+			member.comment = transformer.Transform<string>(option);
+		} else if (option->name == "SemanticTag") {
+			member.tags = transformer.Transform<vector<ParsedSemanticTag>>(option);
+		} else if (option->name == "SemanticSampleValues") {
+			// 'SAMPLE_VALUES' Parens(List(StringLiteral))
+			member.sample_values = TransformAll<string>(transformer, ParenthesizedList(option_list.GetChild(1)));
+		} else if (option->name == "SemanticIsEnum") {
 			member.is_enum = true;
-		} else if (auto cortex = FirstNamed(option, "SemanticCortexSearch")) {
-			member.cortex_search_service = DottedName(FirstNamed(cortex, "SemanticDottedName"));
-			auto column = FirstNamed(cortex, "SemanticCortexSearchColumn");
-			if (column) {
-				member.cortex_search_column = LeafText(FirstNamed(column, "ColId"));
+		} else {
+			// 'WITH' 'CORTEX' 'SEARCH' 'SERVICE' SemanticDottedName ('USING' ColId)?
+			member.cortex_search_service = StringUtil::Join(transformer.Transform<vector<string>>(option_list, 4), ".");
+			if (Present(option_list, 5)) {
+				member.cortex_search_column = transformer.Transform<string>(List(Optional(option_list, 5)), 1);
 			}
 		}
 	}
 	return member;
 }
 
-void ParseMembers(PEGTransformer &transformer, optional_ptr<ParseResult> clause, SemanticMemberKind kind,
-                  vector<ParsedSemanticMember> &out) {
-	if (!clause) {
-		return;
+// (ColId '.' ColLabel) / ColId
+vector<string> TransformSemanticMemberName(PEGTransformer &transformer, optional_ptr<ParseResult> parse_result) {
+	auto name = Choice(parse_result);
+	if (name->name == "SemanticQualifiedMemberName") {
+		return {transformer.Transform<string>(List(name), 0), transformer.Transform<string>(List(name), 2)};
 	}
-	for (auto &member : AllNamed(clause, "SemanticMember")) {
-		out.push_back(ParseMember(transformer, member, kind));
-	}
+	return {transformer.Transform<string>(name)};
 }
 
-void ParseViewProperties(optional_ptr<ParseResult> body, ParsedSemanticView &view) {
-	for (auto &property : AllNamed(body, "SemanticViewProperty")) {
-		if (auto comment = FirstNamed(property, "SemanticComment")) {
-			view.comment = StringLiteralValue(comment);
-		} else if (auto staleness = FirstNamed(property, "SemanticMaxStaleness")) {
-			vector<string> leaves;
-			CollectLeaves(staleness, leaves);
-			view.has_max_staleness = true;
-			view.max_staleness = std::stoll(leaves.back());
-		} else if (auto ai_sql = FirstNamed(property, "SemanticAiSqlGeneration")) {
-			view.ai_sql_generation = StringLiteralValue(ai_sql);
-		} else if (auto ai_cat = FirstNamed(property, "SemanticAiQuestionCategorization")) {
-			view.ai_question_categorization = StringLiteralValue(ai_cat);
-		} else if (auto verified = FirstNamed(property, "SemanticAiVerifiedQueries")) {
-			for (auto &query : AllNamed(verified, "SemanticVerifiedQuery")) {
-				ParsedSemanticVerifiedQuery vq;
-				vq.name = LeafText(FirstNamed(query, "ColId"));
-				for (auto &vq_property : AllNamed(query, "SemanticVerifiedQueryProperty")) {
-					vector<string> leaves;
-					CollectLeaves(vq_property, leaves);
-					if (leaves.size() < 2) {
-						continue;
-					}
-					auto keyword = StringUtil::Upper(leaves[0]);
-					auto value = leaves[1];
-					if (FirstNamed(vq_property, "StringLiteral")) {
-						value = SemanticQuoteString(value);
-					}
-					vq.properties.emplace_back(keyword, value);
-				}
-				view.verified_queries.push_back(std::move(vq));
-			}
-		} else if (auto tag = FirstNamed(property, "SemanticTag")) {
-			view.tags = ParseTags(tag);
-		} else if (FirstNamed(property, "SemanticCopyGrants")) {
-			view.copy_grants = true;
+//===--------------------------------------------------------------------===//
+// CREATE SEMANTIC VIEW
+//===--------------------------------------------------------------------===//
+// ColId 'AS' Parens(SemanticVerifiedQueryProperty+)
+ParsedSemanticVerifiedQuery TransformSemanticVerifiedQuery(PEGTransformer &transformer,
+                                                           optional_ptr<ParseResult> parse_result) {
+	auto &list = List(parse_result);
+	ParsedSemanticVerifiedQuery query;
+	query.name = transformer.Transform<string>(list, 0);
+	for (auto &property_node : Repeated(PEGTransformerFactory::ExtractResultFromParens(list.GetChild(2)))) {
+		// each property is <keyword> <value>
+		auto property = Choice(property_node);
+		auto &property_list = List(property);
+		if (property->name == "SemanticVqQuestion") {
+			query.question = transformer.Transform<string>(property_list, 1);
+		} else if (property->name == "SemanticVqVerifiedAt") {
+			query.verified_at = transformer.Transform<unique_ptr<ParsedExpression>>(property_list, 1)->ToString();
+		} else if (property->name == "SemanticVqOnboarding") {
+			query.onboarding_question = Keyword(property_list.GetChild(1)) == "TRUE";
+		} else if (property->name == "SemanticVqVerifiedBy") {
+			query.verified_by = transformer.Transform<string>(property_list, 1);
+		} else {
+			query.sql = transformer.Transform<string>(property_list, 1);
 		}
 	}
+	return query;
 }
 
-} // namespace
+void ApplyViewProperty(PEGTransformer &transformer, optional_ptr<ParseResult> property, ParsedSemanticView &view) {
+	auto &list = List(property);
+	if (property->name == "SemanticComment") {
+		view.comment = transformer.Transform<string>(property);
+	} else if (property->name == "SemanticMaxStaleness") {
+		// 'MAX_STALENESS' '=' NumberLiteral
+		auto value = transformer.Transform<unique_ptr<ParsedExpression>>(list, 2);
+		view.has_max_staleness = true;
+		view.max_staleness = value->Cast<ConstantExpression>().value.GetValue<int64_t>();
+	} else if (property->name == "SemanticAiSqlGeneration") {
+		view.ai_sql_generation = transformer.Transform<string>(list, 1);
+	} else if (property->name == "SemanticAiQuestionCategorization") {
+		view.ai_question_categorization = transformer.Transform<string>(list, 1);
+	} else if (property->name == "SemanticAiVerifiedQueries") {
+		// 'AI_VERIFIED_QUERIES' Parens(List(SemanticVerifiedQuery))
+		view.verified_queries =
+		    TransformAll<ParsedSemanticVerifiedQuery>(transformer, ParenthesizedList(list.GetChild(1)));
+	} else if (property->name == "SemanticTag") {
+		view.tags = transformer.Transform<vector<ParsedSemanticTag>>(property);
+	} else {
+		view.copy_grants = true;
+	}
+}
 
-//===--------------------------------------------------------------------===//
-// Statement transforms
-//===--------------------------------------------------------------------===//
-static unique_ptr<SQLStatement> TransformCreateSemanticViewStmt(PEGTransformer &transformer,
-                                                                optional_ptr<ParseResult> parse_result) {
+// SemanticTablesClause SemanticRelationshipsClause? SemanticFactsClause? SemanticDimensionsClause?
+// SemanticMetricsClause? SemanticViewProperty*
+unique_ptr<ParsedSemanticView> TransformSemanticViewDefinitionBody(PEGTransformer &transformer,
+                                                                   optional_ptr<ParseResult> parse_result) {
+	auto &list = List(parse_result);
 	auto view = make_uniq<ParsedSemanticView>();
-	string conflict = "error";
-	auto modifier = FirstNamed(parse_result, "SemanticReplaceOrAlter");
-	if (modifier) {
-		conflict = "replace";
+	view->tables = transformer.Transform<vector<ParsedSemanticTable>>(list, 0);
+	transformer.TransformOptional(list, 1, view->relationships);
+	transformer.TransformOptional(list, 2, view->facts);
+	transformer.TransformOptional(list, 3, view->dimensions);
+	transformer.TransformOptional(list, 4, view->metrics);
+	for (auto &property : Repeated(list.GetChild(5))) {
+		ApplyViewProperty(transformer, Choice(property), *view);
 	}
-	if (FirstNamed(parse_result, "IfNotExists")) {
-		if (modifier) {
-			throw ParserException("CREATE OR REPLACE SEMANTIC VIEW cannot be combined with IF NOT EXISTS");
-		}
-		conflict = "ignore";
-	}
-	view->name = transformer.Transform<QualifiedName>(FirstNamed(parse_result, "QualifiedName"));
-	auto body = FirstNamed(parse_result, "SemanticViewDefinitionBody");
-	for (auto &table : AllNamed(FirstNamed(body, "SemanticTablesClause"), "SemanticLogicalTable")) {
-		view->tables.push_back(ParseLogicalTable(transformer, table));
-	}
-	auto relationships = FirstNamed(body, "SemanticRelationshipsClause");
-	if (relationships) {
-		for (auto &rel : AllNamed(relationships, "SemanticRelationship")) {
-			view->relationships.push_back(ParseRelationship(rel));
-		}
-	}
-	ParseMembers(transformer, FirstNamed(body, "SemanticFactsClause"), SemanticMemberKind::FACT, view->facts);
-	ParseMembers(transformer, FirstNamed(body, "SemanticDimensionsClause"), SemanticMemberKind::DIMENSION,
-	             view->dimensions);
-	ParseMembers(transformer, FirstNamed(body, "SemanticMetricsClause"), SemanticMemberKind::METRIC, view->metrics);
-	ParseViewProperties(body, *view);
-
-	auto canonical_sql = view->ToSQL();
-	auto name = view->name;
-	if (SemanticViewPegContext::definition_capture) {
-		*SemanticViewPegContext::definition_capture = std::move(view);
-	}
-	return MakeFunctionSelect(SEMANTIC_VIEW_DDL_FUNCTION,
-	                          {Value("create"), NameValue(name.catalog), NameValue(name.schema), NameValue(name.name),
-	                           Value(canonical_sql), Value(conflict)});
+	return view;
 }
 
-static unique_ptr<SQLStatement> TransformDropSemanticViewStmt(PEGTransformer &transformer,
-                                                              optional_ptr<ParseResult> parse_result) {
-	auto name = transformer.Transform<QualifiedName>(FirstNamed(parse_result, "QualifiedName"));
-	auto flag = FirstNamed(parse_result, "IfExists") ? "if_exists" : "error";
-	return MakeFunctionSelect(SEMANTIC_VIEW_DDL_FUNCTION, {Value("drop"), NameValue(name.catalog),
-	                                                       NameValue(name.schema), NameValue(name.name), Value(),
-	                                                       Value(flag)});
+// 'CREATE' ('OR' ('REPLACE' / 'ALTER'))? 'SEMANTIC' 'VIEW' IfNotExists? QualifiedName SemanticViewDefinitionBody
+unique_ptr<SQLStatement> TransformCreateSemanticViewStmt(PEGTransformer &transformer,
+                                                         optional_ptr<ParseResult> parse_result) {
+	auto &list = List(parse_result);
+	auto or_replace = Present(list, 1);
+	auto if_not_exists = Present(list, 4);
+	if (or_replace && if_not_exists) {
+		throw ParserException("CREATE OR REPLACE SEMANTIC VIEW cannot be combined with IF NOT EXISTS");
+	}
+	auto view = transformer.Transform<unique_ptr<ParsedSemanticView>>(list, 6);
+	view->name = transformer.Transform<QualifiedName>(list, 5);
+	auto on_conflict = or_replace      ? OnCreateConflict::REPLACE_ON_CONFLICT
+	                   : if_not_exists ? OnCreateConflict::IGNORE_ON_CONFLICT
+	                                   : OnCreateConflict::ERROR_ON_CONFLICT;
+	return SemanticLowering::SelectAll(SemanticLowering::Create(*view, on_conflict));
 }
 
-static unique_ptr<SQLStatement> TransformAlterSemanticViewStmt(PEGTransformer &transformer,
-                                                               optional_ptr<ParseResult> parse_result) {
-	auto names = AllNamed(parse_result, "QualifiedName");
-	auto name = transformer.Transform<QualifiedName>(names[0]);
-	auto flag = FirstNamed(parse_result, "IfExists") ? "if_exists" : "error";
-	string action;
-	Value arg;
-	if (FirstNamed(parse_result, "SemanticAlterRename")) {
-		action = "rename";
-		auto new_name = transformer.Transform<QualifiedName>(names[1]);
-		if ((!new_name.catalog.empty() && new_name.catalog != INVALID_CATALOG) ||
-		    (!new_name.schema.empty() && new_name.schema != INVALID_SCHEMA)) {
+//===--------------------------------------------------------------------===//
+// DROP / ALTER / DESCRIBE / SHOW
+//===--------------------------------------------------------------------===//
+// 'DROP' 'SEMANTIC' 'VIEW' IfExists? QualifiedName
+unique_ptr<SQLStatement> TransformDropSemanticViewStmt(PEGTransformer &transformer,
+                                                       optional_ptr<ParseResult> parse_result) {
+	auto &list = List(parse_result);
+	auto name = transformer.Transform<QualifiedName>(list, 4);
+	return SemanticLowering::SelectAll(SemanticLowering::Drop(name, Present(list, 3)));
+}
+
+// 'ALTER' 'SEMANTIC' 'VIEW' IfExists? QualifiedName SemanticAlterAction
+unique_ptr<SQLStatement> TransformAlterSemanticViewStmt(PEGTransformer &transformer,
+                                                        optional_ptr<ParseResult> parse_result) {
+	auto &list = List(parse_result);
+	auto name = transformer.Transform<QualifiedName>(list, 4);
+	auto if_exists = Present(list, 3);
+	auto action = Choice(list.GetChild(5));
+	if (action->name == "SemanticAlterRename") {
+		// 'RENAME' 'TO' QualifiedName
+		auto new_name = transformer.Transform<QualifiedName>(List(action), 2);
+		if (!new_name.catalog.empty() || !new_name.schema.empty()) {
 			throw ParserException("ALTER SEMANTIC VIEW ... RENAME TO only accepts an unqualified name");
 		}
-		arg = Value(new_name.name);
-	} else if (auto set_comment = FirstNamed(parse_result, "SemanticAlterSetComment")) {
-		action = "set_comment";
-		arg = Value(StringLiteralValue(set_comment));
-	} else {
-		action = "unset_comment";
+		return SemanticLowering::SelectAll(SemanticLowering::Rename(name, if_exists, new_name.name));
 	}
-	return MakeFunctionSelect(SEMANTIC_VIEW_DDL_FUNCTION,
-	                          {Value(action), NameValue(name.catalog), NameValue(name.schema), NameValue(name.name),
-	                           std::move(arg), Value(flag)});
+	// 'SET' 'COMMENT' '=' StringLiteral / 'UNSET' 'COMMENT' (a NULL comment)
+	Value comment(LogicalType::VARCHAR);
+	if (action->name == "SemanticAlterSetComment") {
+		comment = Value(transformer.Transform<string>(List(action), 3));
+	}
+	return SemanticLowering::SelectAll(SemanticLowering::SetComment(name, if_exists, comment));
 }
 
-static unique_ptr<SQLStatement> TransformDescribeSemanticViewStmt(PEGTransformer &transformer,
-                                                                  optional_ptr<ParseResult> parse_result) {
-	auto name = transformer.Transform<QualifiedName>(FirstNamed(parse_result, "QualifiedName"));
-	return MakeFunctionSelect(SEMANTIC_VIEW_SHOW_FUNCTION, {Value("describe"), NameValue(name.catalog),
-	                                                        NameValue(name.schema), NameValue(name.name), Value(),
-	                                                        Value()});
+// ('DESCRIBE' / 'DESC') 'SEMANTIC' 'VIEW' QualifiedName
+unique_ptr<TableRef> DescribeRef(PEGTransformer &transformer, optional_ptr<ParseResult> parse_result) {
+	return SemanticLowering::Describe(transformer.Transform<QualifiedName>(List(parse_result), 3));
 }
 
-static unique_ptr<SQLStatement> TransformShowSemanticStmt(PEGTransformer &transformer,
-                                                          optional_ptr<ParseResult> parse_result) {
-	Value like;
-	auto like_node = FirstNamed(parse_result, "SemanticShowLike");
-	if (like_node) {
-		like = Value(StringLiteralValue(like_node));
+//! Applies the optional `'LIKE' StringLiteral` child at `index`
+unique_ptr<TableRef> WithLike(PEGTransformer &transformer, unique_ptr<TableRef> ref, ListParseResult &list,
+                              idx_t index) {
+	if (!Present(list, index)) {
+		return ref;
 	}
-	if (auto views = FirstNamed(parse_result, "SemanticShowViews")) {
-		string catalog, schema, scope;
-		auto scope_node = FirstNamed(views, "SemanticShowViewsScope");
-		if (scope_node) {
-			auto scope_name = transformer.Transform<QualifiedName>(FirstNamed(scope_node, "QualifiedName"));
-			if (StringUtil::CIEquals(LeafText(FirstNamed(scope_node, "SemanticShowScopeKind")), "DATABASE")) {
-				scope = "database";
-				catalog = scope_name.name;
+	auto pattern = transformer.Transform<string>(List(Optional(list, index)), 1);
+	return SemanticLowering::WhereNameLike(std::move(ref), pattern);
+}
+
+// 'SHOW' 'SEMANTIC' (SemanticShowViews / SemanticShowMembers)
+unique_ptr<TableRef> ShowRef(PEGTransformer &transformer, optional_ptr<ParseResult> parse_result) {
+	auto target = Choice(List(parse_result).GetChild(2));
+	auto &list = List(target);
+	if (target->name == "SemanticShowViews") {
+		// 'VIEWS' SemanticShowLike? ('IN' ('SCHEMA' / 'DATABASE') QualifiedName)?
+		QualifiedName scope;
+		if (Present(list, 2)) {
+			auto &scope_list = List(Optional(list, 2));
+			auto scope_name = transformer.Transform<QualifiedName>(scope_list, 2);
+			if (Keyword(scope_list.GetChild(1)) == "DATABASE") {
+				scope.catalog = scope_name.name;
 			} else {
-				scope = "schema";
-				catalog = scope_name.schema == INVALID_SCHEMA ? string() : scope_name.schema;
-				schema = scope_name.name;
+				scope.catalog = scope_name.schema;
+				scope.schema = scope_name.name;
 			}
 		}
-		return MakeFunctionSelect(SEMANTIC_VIEW_SHOW_FUNCTION,
-		                          {Value("views"), Value(catalog), Value(schema), Value(), like, Value(scope)});
+		return WithLike(transformer, SemanticLowering::ShowViews(scope), list, 1);
 	}
-	auto members = FirstNamed(parse_result, "SemanticShowMembers");
-	auto kind = StringUtil::Lower(LeafText(FirstNamed(members, "SemanticShowMemberKind")));
-	QualifiedName name;
-	name.catalog = INVALID_CATALOG;
-	name.schema = INVALID_SCHEMA;
-	auto in_node = FirstNamed(members, "SemanticShowIn");
-	if (in_node) {
-		name = transformer.Transform<QualifiedName>(FirstNamed(in_node, "QualifiedName"));
+	// ('DIMENSIONS' / 'METRICS' / 'FACTS') SemanticShowLike? ('IN' ('SEMANTIC' 'VIEW')? QualifiedName)?
+	// ('FOR' 'METRIC' SemanticDottedName)?
+	auto kind = MemberKind(Keyword(list.GetChild(0)));
+	QualifiedName view;
+	if (Present(list, 2)) {
+		view = transformer.Transform<QualifiedName>(List(Optional(list, 2)), 2);
 	}
-	Value for_metric;
-	auto for_node = FirstNamed(members, "SemanticShowForMetric");
-	if (for_node) {
-		if (kind != "dimensions") {
-			throw ParserException("FOR METRIC is only supported with SHOW SEMANTIC DIMENSIONS");
-		}
-		if (!in_node) {
-			throw ParserException("SHOW SEMANTIC DIMENSIONS ... FOR METRIC requires IN <semantic view>");
-		}
-		for_metric = Value(DottedName(FirstNamed(for_node, "SemanticDottedName")));
+	if (!Present(list, 3)) {
+		return WithLike(transformer, SemanticLowering::ShowMembers(kind, view), list, 1);
 	}
-	return MakeFunctionSelect(SEMANTIC_VIEW_SHOW_FUNCTION, {Value(kind), NameValue(name.catalog),
-	                                                        NameValue(name.schema), NameValue(name.name), like,
-	                                                        for_metric});
+	if (kind != SemanticMemberKind::DIMENSION) {
+		throw ParserException("FOR METRIC is only supported with SHOW SEMANTIC DIMENSIONS");
+	}
+	if (!Present(list, 2)) {
+		throw ParserException("SHOW SEMANTIC DIMENSIONS ... FOR METRIC requires IN <semantic view>");
+	}
+	auto metric = transformer.Transform<vector<string>>(List(Optional(list, 3)), 2);
+	return WithLike(transformer, SemanticLowering::ShowDimensionsForMetric(view, metric), list, 1);
 }
 
-static unique_ptr<SQLStatement> TransformSemanticViewStatement(PEGTransformer &transformer,
-                                                               optional_ptr<ParseResult> parse_result) {
-	vector<optional_ptr<ParseResult>> children;
-	Children(parse_result, children);
-	while (children.size() == 1 && children[0]->name == "SemanticViewStatement") {
-		auto node = children[0];
-		children.clear();
-		Children(node, children);
-	}
-	for (auto &child : children) {
-		if (child->name == "CreateSemanticViewStmt") {
-			return TransformCreateSemanticViewStmt(transformer, child);
-		}
-		if (child->name == "DropSemanticViewStmt") {
-			return TransformDropSemanticViewStmt(transformer, child);
-		}
-		if (child->name == "AlterSemanticViewStmt") {
-			return TransformAlterSemanticViewStmt(transformer, child);
-		}
-		if (child->name == "DescribeSemanticViewStmt") {
-			return TransformDescribeSemanticViewStmt(transformer, child);
-		}
-		if (child->name == "ShowSemanticStmt") {
-			return TransformShowSemanticStmt(transformer, child);
-		}
-	}
-	throw InternalException("semantic view parser: unrecognized statement");
+unique_ptr<SQLStatement> TransformDescribeSemanticViewStmt(PEGTransformer &transformer,
+                                                           optional_ptr<ParseResult> parse_result) {
+	return SemanticLowering::SelectAll(DescribeRef(transformer, parse_result));
+}
+
+unique_ptr<SQLStatement> TransformShowSemanticStmt(PEGTransformer &transformer,
+                                                   optional_ptr<ParseResult> parse_result) {
+	return SemanticLowering::SelectAll(ShowRef(transformer, parse_result));
+}
+
+unique_ptr<SQLStatement> TransformSemanticViewStatement(PEGTransformer &transformer,
+                                                        optional_ptr<ParseResult> parse_result) {
+	return transformer.Transform<unique_ptr<SQLStatement>>(Choice(parse_result));
+}
+
+// Parens(ShowSemanticStmt / DescribeSemanticViewStmt) TableAlias?
+unique_ptr<TableRef> TransformSemanticShowTableRef(PEGTransformer &transformer,
+                                                   optional_ptr<ParseResult> parse_result) {
+	auto &list = List(parse_result);
+	auto statement = Choice(PEGTransformerFactory::ExtractResultFromParens(list.GetChild(0)));
+	auto result = statement->name == "ShowSemanticStmt" ? ShowRef(transformer, statement)
+	                                                    : DescribeRef(transformer, statement);
+	ApplyAlias(transformer, list, 1, *result);
+	return result;
 }
 
 //===--------------------------------------------------------------------===//
-// SEMANTIC_VIEW(...) table reference
+// SEMANTIC_VIEW(...)
 //===--------------------------------------------------------------------===//
-static unique_ptr<TableRef> TransformSemanticViewRef(PEGTransformer &transformer,
-                                                     optional_ptr<ParseResult> parse_result) {
-	ParsedSemanticQuery query;
-	auto body = FirstNamed(parse_result, "SemanticViewQueryBody");
-	query.view = transformer.Transform<QualifiedName>(FirstNamed(body, "QualifiedName"));
-	bool has_kind = false;
-	bool expecting_item = true;
-	idx_t clause_items = 0;
-	SemanticMemberKind kind = SemanticMemberKind::DIMENSION;
-	// a clause keyword must be followed by at least one item, and a ',' by another item
-	auto close_clause = [&]() {
-		if (has_kind && expecting_item) {
-			throw ParserException("SEMANTIC_VIEW: %sS requires at least one item%s", SemanticMemberKindToString(kind),
-			                      clause_items > 0 ? " after ','" : "");
+//! Assembles the flat SEMANTIC_VIEW(...) body. The PEG matcher has no negative lookahead, so the clause keywords
+//! (DIMENSIONS / METRICS / FACTS parse as bare column references), the items and their bare aliases are told apart
+//! here: a clause keyword opens a clause, which takes one or more ','-separated items.
+class SemanticQueryBodyBuilder {
+public:
+	explicit SemanticQueryBodyBuilder(ParsedSemanticQuery &query) : query(query) {
+	}
+
+	void Separator() {
+		if (expecting_item) {
+			throw ParserException("SEMANTIC_VIEW: unexpected ','");
 		}
-	};
-	for (auto &piece : AllNamed(body, "SemanticQueryPiece")) {
-		if (FirstNamed(piece, "SemanticQueryComma")) {
-			if (expecting_item) {
-				throw ParserException("SEMANTIC_VIEW: unexpected ','");
-			}
-			expecting_item = true;
-			continue;
+		expecting_item = true;
+	}
+
+	void AliasAs(const string &alias) {
+		if (expecting_item || !CanAlias()) {
+			throw ParserException("SEMANTIC_VIEW: unexpected AS");
 		}
-		if (auto alias = FirstNamed(piece, "SemanticQueryAliasAs")) {
-			if (expecting_item || query.items.empty() || !query.items.back().alias.empty() ||
-			    !query.items.back().expression) {
-				throw ParserException("SEMANTIC_VIEW: unexpected AS");
-			}
-			query.items.back().alias = LeafText(FirstNamed(alias, "ColLabel"));
-			continue;
+		query.items.back().alias = alias;
+	}
+
+	void Where(unique_ptr<ParsedExpression> where) {
+		if (query.where) {
+			throw ParserException("SEMANTIC_VIEW accepts at most one WHERE clause");
 		}
-		if (auto where = FirstNamed(piece, "SemanticQueryWhere")) {
-			if (query.where) {
-				throw ParserException("SEMANTIC_VIEW accepts at most one WHERE clause");
-			}
-			close_clause();
-			query.where = transformer.Transform<unique_ptr<ParsedExpression>>(FirstNamed(where, "Expression"));
-			has_kind = false;
-			expecting_item = true;
-			continue;
+		CloseClause();
+		query.where = std::move(where);
+		in_clause = false;
+		expecting_item = true;
+	}
+
+	void Wildcard(const string &table) {
+		if (!in_clause || !expecting_item) {
+			throw ParserException("SEMANTIC_VIEW: expected DIMENSIONS, METRICS or FACTS before '%s.*'", table);
 		}
-		if (auto star = FirstNamed(piece, "SemanticQueryStar")) {
-			if (!has_kind || !expecting_item) {
-				throw ParserException("SEMANTIC_VIEW: expected DIMENSIONS, METRICS or FACTS before '%s.*'",
-				                      LeafText(FirstNamed(star, "ColId")));
-			}
-			ParsedSemanticQueryItem item;
-			item.kind = kind;
-			item.star_table = LeafText(FirstNamed(star, "ColId"));
-			query.items.push_back(std::move(item));
-			expecting_item = false;
-			clause_items++;
-			continue;
-		}
-		auto expression = transformer.Transform<unique_ptr<ParsedExpression>>(FirstNamed(piece, "Expression"));
-		string bare_name;
-		if (expression->GetExpressionClass() == ExpressionClass::COLUMN_REF) {
-			auto &colref = expression->Cast<ColumnRefExpression>();
-			if (!colref.IsQualified()) {
-				bare_name = colref.GetColumnName();
-			}
-		}
+		ParsedSemanticQueryItem item;
+		item.star_table = table;
+		AddItem(std::move(item));
+	}
+
+	void Expression(unique_ptr<ParsedExpression> expression) {
+		auto bare_name = BareName(*expression);
 		if (!bare_name.empty()) {
-			// DIMENSIONS / METRICS / FACTS parse as bare column references: they open a clause
 			auto upper = StringUtil::Upper(bare_name);
 			if (upper == "DIMENSIONS" || upper == "METRICS" || upper == "FACTS") {
-				close_clause();
-				clause_items = 0;
-				kind = upper == "DIMENSIONS" ? SemanticMemberKind::DIMENSION
-				       : upper == "METRICS"  ? SemanticMemberKind::METRIC
-				                             : SemanticMemberKind::FACT;
-				has_kind = true;
-				expecting_item = true;
-				continue;
+				OpenClause(MemberKind(upper));
+				return;
 			}
 			if (!expecting_item) {
 				// a bare name right after an item is that item's alias
-				auto &last = query.items.back();
-				if (!last.alias.empty() || !last.expression) {
+				if (!CanAlias()) {
 					throw ParserException("SEMANTIC_VIEW: unexpected '%s'", bare_name);
 				}
-				last.alias = bare_name;
-				continue;
+				query.items.back().alias = bare_name;
+				return;
 			}
 		}
-		if (!has_kind) {
+		if (!in_clause) {
 			throw ParserException("SEMANTIC_VIEW: expected DIMENSIONS, METRICS or FACTS before '%s'",
 			                      expression->ToString());
 		}
@@ -710,59 +593,135 @@ static unique_ptr<TableRef> TransformSemanticViewRef(PEGTransformer &transformer
 			throw ParserException("SEMANTIC_VIEW: expected ',' before '%s'", expression->ToString());
 		}
 		ParsedSemanticQueryItem item;
-		item.kind = kind;
 		item.expression = std::move(expression);
+		AddItem(std::move(item));
+	}
+
+	void Finish() {
+		CloseClause();
+		if (query.items.empty()) {
+			throw ParserException("SEMANTIC_VIEW requires at least one of DIMENSIONS, METRICS or FACTS");
+		}
+	}
+
+private:
+	static string BareName(const ParsedExpression &expression) {
+		if (expression.GetExpressionClass() != ExpressionClass::COLUMN_REF) {
+			return string();
+		}
+		auto &column = expression.Cast<ColumnRefExpression>();
+		return column.IsQualified() ? string() : column.GetColumnName();
+	}
+
+	bool CanAlias() const {
+		return !query.items.empty() && query.items.back().alias.empty() && query.items.back().expression;
+	}
+
+	void OpenClause(SemanticMemberKind new_kind) {
+		CloseClause();
+		kind = new_kind;
+		in_clause = true;
+		expecting_item = true;
+		clause_items = 0;
+	}
+
+	//! A clause keyword must be followed by at least one item, and a ',' by another item
+	void CloseClause() {
+		if (in_clause && expecting_item) {
+			throw ParserException("SEMANTIC_VIEW: %sS requires at least one item%s", SemanticMemberKindToString(kind),
+			                      clause_items > 0 ? " after ','" : "");
+		}
+	}
+
+	void AddItem(ParsedSemanticQueryItem item) {
+		item.kind = kind;
 		query.items.push_back(std::move(item));
 		expecting_item = false;
 		clause_items++;
 	}
-	close_clause();
-	if (query.items.empty()) {
-		throw ParserException("SEMANTIC_VIEW requires at least one of DIMENSIONS, METRICS or FACTS");
-	}
 
-	vector<unique_ptr<ParsedExpression>> children;
-	children.push_back(make_uniq<ConstantExpression>(NameValue(query.view.catalog)));
-	children.push_back(make_uniq<ConstantExpression>(NameValue(query.view.schema)));
-	children.push_back(make_uniq<ConstantExpression>(NameValue(query.view.name)));
-	children.push_back(make_uniq<ConstantExpression>(query.ItemsToValue()));
-	children.push_back(
-	    make_uniq<ConstantExpression>(Value(query.where ? query.where->ToString() : string())));
-	auto result = make_uniq<TableFunctionRef>();
-	result->function = make_uniq<FunctionExpression>(SEMANTIC_VIEW_QUERY_FUNCTION, std::move(children));
+	ParsedSemanticQuery &query;
+	SemanticMemberKind kind = SemanticMemberKind::DIMENSION;
+	bool in_clause = false;
+	bool expecting_item = true;
+	idx_t clause_items = 0;
+};
 
-	auto alias_node = FirstNamed(parse_result, "TableAlias");
-	if (alias_node) {
-		auto table_alias = transformer.Transform<TableAlias>(alias_node);
-		result->alias = table_alias.name;
-		result->column_name_alias = table_alias.column_name_alias;
+// QualifiedName SemanticQueryPiece*
+unique_ptr<ParsedSemanticQuery> TransformSemanticViewQueryBody(PEGTransformer &transformer,
+                                                               optional_ptr<ParseResult> parse_result) {
+	auto &list = List(parse_result);
+	auto query = make_uniq<ParsedSemanticQuery>();
+	query->view = transformer.Transform<QualifiedName>(list, 0);
+	SemanticQueryBodyBuilder builder(*query);
+	for (auto &piece_node : Repeated(list.GetChild(1))) {
+		auto piece = Choice(piece_node);
+		auto &piece_list = List(piece);
+		if (piece->name == "SemanticQueryComma") {
+			builder.Separator();
+		} else if (piece->name == "SemanticQueryAliasAs") {
+			// 'AS' ColLabel
+			builder.AliasAs(transformer.Transform<string>(piece_list, 1));
+		} else if (piece->name == "SemanticQueryStar") {
+			// ColId '.' '*'
+			builder.Wildcard(transformer.Transform<string>(piece_list, 0));
+		} else if (piece->name == "SemanticQueryWhere") {
+			// 'WHERE' Expression
+			builder.Where(transformer.Transform<unique_ptr<ParsedExpression>>(piece_list, 1));
+		} else {
+			builder.Expression(transformer.Transform<unique_ptr<ParsedExpression>>(piece_list, 0));
+		}
 	}
-	return std::move(result);
+	builder.Finish();
+	return query;
 }
 
-static unique_ptr<TableRef> TransformSemanticShowTableRef(PEGTransformer &transformer,
-                                                          optional_ptr<ParseResult> parse_result) {
-	unique_ptr<SQLStatement> statement;
-	if (auto show = FirstNamed(parse_result, "ShowSemanticStmt")) {
-		statement = TransformShowSemanticStmt(transformer, show);
-	} else {
-		statement = TransformDescribeSemanticViewStmt(transformer, FirstNamed(parse_result, "DescribeSemanticViewStmt"));
-	}
-	auto &select = statement->Cast<SelectStatement>();
-	auto result = std::move(select.node->Cast<SelectNode>().from_table);
-	auto alias_node = FirstNamed(parse_result, "TableAlias");
-	if (alias_node) {
-		auto table_alias = transformer.Transform<TableAlias>(alias_node);
-		result->alias = table_alias.name;
-		result->column_name_alias = table_alias.column_name_alias;
-	}
+// ('SEMANTIC_VIEW' / 'SEMANTIC' 'VIEW') Parens(SemanticViewQueryBody) TableAlias?
+unique_ptr<TableRef> TransformSemanticViewRef(PEGTransformer &transformer, optional_ptr<ParseResult> parse_result) {
+	auto &list = List(parse_result);
+	auto body = PEGTransformerFactory::ExtractResultFromParens(list.GetChild(1));
+	auto result = SemanticLowering::Query(*transformer.Transform<unique_ptr<ParsedSemanticQuery>>(body));
+	ApplyAlias(transformer, list, 2, *result);
 	return result;
 }
 
+} // namespace
+
 void PEGTransformerFactory::RegisterSemanticView() {
+	// statements and table references
 	Register("SemanticViewStatement", &TransformSemanticViewStatement);
+	Register("CreateSemanticViewStmt", &TransformCreateSemanticViewStmt);
+	Register("DropSemanticViewStmt", &TransformDropSemanticViewStmt);
+	Register("AlterSemanticViewStmt", &TransformAlterSemanticViewStmt);
+	Register("DescribeSemanticViewStmt", &TransformDescribeSemanticViewStmt);
+	Register("ShowSemanticStmt", &TransformShowSemanticStmt);
 	Register("SemanticShowTableRef", &TransformSemanticShowTableRef);
 	Register("SemanticViewRef", &TransformSemanticViewRef);
+	Register("SemanticViewQueryBody", &TransformSemanticViewQueryBody);
+	// definition
+	Register("SemanticViewDefinitionBody", &TransformSemanticViewDefinitionBody);
+	Register("SemanticTablesClause", &TransformSemanticTablesClause);
+	Register("SemanticLogicalTable", &TransformSemanticLogicalTable);
+	Register("SemanticTableAliasAs", &TransformSemanticName);
+	Register("SemanticTableSource", &TransformSemanticTableSource);
+	Register("SemanticRangeConstraint", &TransformSemanticRangeConstraint);
+	Register("SemanticConstraintName", &TransformSemanticName);
+	Register("SemanticRelationshipsClause", &TransformSemanticRelationshipsClause);
+	Register("SemanticRelationship", &TransformSemanticRelationship);
+	Register("SemanticRelationshipName", &TransformSemanticName);
+	Register("SemanticFactsClause", &TransformSemanticMemberClause);
+	Register("SemanticDimensionsClause", &TransformSemanticMemberClause);
+	Register("SemanticMetricsClause", &TransformSemanticMemberClause);
+	Register("SemanticMember", &TransformSemanticMember);
+	Register("SemanticMemberName", &TransformSemanticMemberName);
+	Register("SemanticVerifiedQuery", &TransformSemanticVerifiedQuery);
+	// shared clauses
+	Register("SemanticColumnList", &TransformSemanticColumnList);
+	Register("SemanticWithSynonyms", &TransformSemanticWithSynonyms);
+	Register("SemanticComment", &TransformSemanticComment);
+	Register("SemanticTag", &TransformSemanticTag);
+	Register("SemanticTagEntry", &TransformSemanticTagEntry);
+	Register("SemanticDottedName", &TransformSemanticDottedName);
 }
 
 } // namespace semantic_views_peg

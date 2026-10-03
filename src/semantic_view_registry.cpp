@@ -18,9 +18,10 @@ static bool IsSet(const string &part, const string &invalid) {
 	return !part.empty() && part != invalid;
 }
 
-QualifiedName SemanticViewRegistry::ResolveDDLName(ClientContext &context, const QualifiedName &name) {
-	string catalog = IsSet(name.catalog, INVALID_CATALOG) ? name.catalog : string();
-	string schema = IsSet(name.schema, INVALID_SCHEMA) ? name.schema : string();
+QualifiedName SemanticViewRegistry::ResolveSchema(ClientContext &context, const string &catalog_p,
+                                                  const string &schema_p) {
+	string catalog = IsSet(catalog_p, INVALID_CATALOG) ? catalog_p : string();
+	string schema = IsSet(schema_p, INVALID_SCHEMA) ? schema_p : string();
 	if (catalog.empty() && !schema.empty()) {
 		// `x.view`: x may be a schema of the default database or a database name
 		Binder::BindSchemaOrCatalog(context, catalog, schema);
@@ -42,6 +43,11 @@ QualifiedName SemanticViewRegistry::ResolveDDLName(ClientContext &context, const
 	QualifiedName result;
 	result.catalog = schema_entry.ParentCatalog().GetName();
 	result.schema = schema_entry.name;
+	return result;
+}
+
+QualifiedName SemanticViewRegistry::ResolveDDLName(ClientContext &context, const QualifiedName &name) {
+	auto result = ResolveSchema(context, name.catalog, name.schema);
 	result.name = name.name;
 	return result;
 }

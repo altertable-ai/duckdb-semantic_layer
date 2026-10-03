@@ -28,6 +28,7 @@
 #include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckdb/parser/tableref/table_function_ref.hpp"
 #include "semantic_analysis.hpp"
+#include "semantic_lowering.hpp"
 #include "semantic_statement_visitor.hpp"
 #include "semantic_view_registry.hpp"
 
@@ -44,6 +45,9 @@ class StandardFormRewriter {
 public:
 	StandardFormRewriter(ClientContext &context, const SemanticModel &model, const BaseTableRef &ref)
 	    : context(context), model(model), analyzer(model, context), ref(ref) {
+		query.view.catalog = ref.catalog_name;
+		query.view.schema = ref.schema_name;
+		query.view.name = ref.table_name;
 	}
 
 	void Rewrite(SelectNode &node) {
@@ -349,16 +353,9 @@ private:
 	}
 
 	unique_ptr<TableRef> MakeTableFunction() {
-		vector<unique_ptr<ParsedExpression>> children;
-		children.push_back(make_uniq<ConstantExpression>(Value(ref.catalog_name)));
-		children.push_back(make_uniq<ConstantExpression>(Value(ref.schema_name)));
-		children.push_back(make_uniq<ConstantExpression>(Value(ref.table_name)));
-		children.push_back(make_uniq<ConstantExpression>(query.ItemsToValue()));
-		children.push_back(make_uniq<ConstantExpression>(Value(query.where ? query.where->ToString() : string())));
-		auto result = make_uniq<TableFunctionRef>();
-		result->function = make_uniq<FunctionExpression>(SEMANTIC_VIEW_QUERY_FUNCTION, std::move(children));
+		auto result = SemanticLowering::Query(query);
 		result->alias = "__sv_std";
-		return std::move(result);
+		return result;
 	}
 
 	ClientContext &context;

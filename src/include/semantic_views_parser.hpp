@@ -16,7 +16,6 @@
 #include "duckdb/parser/sql_statement.hpp"
 #include "duckdb/planner/extension_callback.hpp"
 #include "duckdb/planner/operator_extension.hpp"
-#include "parsed_semantic_view.hpp"
 
 namespace duckdb {
 
@@ -26,8 +25,6 @@ public:
 	static bool ContainsSemanticSyntax(const string &sql);
 	//! Parses `sql` with the vendored PEG parser (all statements).
 	static vector<unique_ptr<SQLStatement>> Parse(const string &sql, ParserOptions options);
-	//! Parses a canonical `CREATE SEMANTIC VIEW` statement into its definition
-	static unique_ptr<ParsedSemanticView> ParseDefinition(const string &sql);
 };
 
 //! Parse data for the parse_function path (postgres failed on semantic-view syntax).
