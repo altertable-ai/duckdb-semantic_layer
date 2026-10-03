@@ -1,7 +1,7 @@
 # Many-to-many relationships and BI catalog visibility — Design
 
 Date: 2026-10-03
-Status: draft, awaiting review
+Status: approved and implemented
 
 Two independent features, built in this order:
 
@@ -127,8 +127,8 @@ GROUP BY ALL
 - Everything else is unchanged: blocks are merged on dimension values, derived metrics are computed on top, window
   metrics run last.
 - `NON ADDITIVE BY`: the last-snapshot window partitions by the block's dimension columns, which may now come from a
-  mapping subquery. A `NON ADDITIVE BY` dimension must itself be local; otherwise the query fails with
-  `NON ADDITIVE BY dimension "X" cannot be reached through a many-to-many relationship`.
+  mapping subquery. A `NON ADDITIVE BY` dimension is always local: `CREATE` already requires it to be reachable from
+  the metric's table.
 
 ### 1.4 Dimensions-only queries
 
@@ -172,9 +172,9 @@ inside the statement's transaction; the statement registers the database as modi
 The placeholder table function always fails at bind time, which hands the statement to the existing standard-SQL
 rewrite (`OnPlanningError`):
 
-- if the semantic view is registered:
-  `Semantic view "v" can only be queried with SEMANTIC_VIEW(...) or by name, with dimensions in GROUP BY and metrics in AGG(...)`.
-  This is normally superseded by the rewrite's own result or error.
+- if the semantic view is registered: `Semantic view "v" cannot be read as a table here: query it with
+  SEMANTIC_VIEW(...), or by name with dimensions in GROUP BY and metrics in AGG(...)`. This is normally superseded by
+  the rewrite's own result or error; it shows where the rewrite does not run (e.g. `CREATE VIEW ... FROM v`).
 - otherwise (a leftover, section 2.4): `Semantic view "v" is not defined in this session: semantic views are kept in
   memory only; run CREATE SEMANTIC VIEW again`.
 
@@ -201,6 +201,8 @@ placeholder's columns. `SELECT *` itself stays rejected (Snowflake rule).
 | `DROP VIEW v` (plain) | drops only the placeholder: the semantic view stays queryable but is no longer listed. Documented. |
 
 - **Read-only catalogs:** no placeholder is created. The semantic view works but is not listed.
+- **Ordering:** every DDL statement changes the placeholder before the registry, so a statement that fails (e.g. a
+  catalog write-write conflict with another connection) leaves the registry untouched.
 - **Transactions:** placeholders are transactional, the registry is not (unchanged limitation). After a rolled-back
   `CREATE`, the semantic view stays registered without a placeholder.
 - `CREATE TABLE v` while semantic view `v` exists fails with DuckDB's normal "already exists" error.

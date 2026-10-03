@@ -57,10 +57,20 @@ struct SemanticCreateData : public SemanticDDLData {
 	shared_ptr<SemanticModel> model;
 	OnCreateConflict on_conflict;
 
+	//! The catalog placeholder changes before the registry: when a later step fails, the statement's rollback undoes
+	//! the catalog change and the registry is left untouched
 	string Execute(ClientContext &context) const override {
-		if (model && state->registry.Create(model, on_conflict == OnCreateConflict::REPLACE_ON_CONFLICT)) {
+		auto replace = on_conflict == OnCreateConflict::REPLACE_ON_CONFLICT;
+		if (model && (replace || !state->registry.Get(name))) {
 			CreateSemanticPlaceholder(context, *model);
-			return "Semantic view " + DisplayName() + " successfully created.";
+			if (state->registry.Create(model, replace)) {
+				return "Semantic view " + DisplayName() + " successfully created.";
+			}
+			// created concurrently since bind: restore the placeholder of the registered view
+			auto registered = state->registry.Get(name);
+			if (registered) {
+				CreateSemanticPlaceholder(context, *registered);
+			}
 		}
 		if (on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT) {
 			return DisplayName() + " already exists, statement succeeded.";
@@ -92,10 +102,9 @@ struct SemanticDropData : public SemanticDDLData {
 	bool if_exists;
 
 	string Execute(ClientContext &context) const override {
-		auto dropped = state->registry.Drop(name);
 		// also drops a placeholder left in a database file by a previous session
-		dropped = DropSemanticPlaceholder(context, name) || dropped;
-		if (dropped) {
+		auto dropped_placeholder = DropSemanticPlaceholder(context, name);
+		if (state->registry.Drop(name) || dropped_placeholder) {
 			return DisplayName() + " successfully dropped.";
 		}
 		if (if_exists) {
@@ -132,13 +141,14 @@ struct SemanticAlterData : public SemanticDDLData {
 			}
 			throw CatalogException("Semantic view with name \"%s\" does not exist!", name.name);
 		}
-		if (!state->registry.Replace(*existing, model)) {
-			throw CatalogException("Semantic view \"%s\" was dropped or altered by a concurrent statement", name.name);
-		}
+		// catalog first, as in CREATE
 		if (!StringUtil::CIEquals(existing->Name().name, model->Name().name)) {
 			DropSemanticPlaceholder(context, existing->Name());
 		}
 		CreateSemanticPlaceholder(context, *model);
+		if (!state->registry.Replace(*existing, model)) {
+			throw CatalogException("Semantic view \"%s\" was dropped or altered by a concurrent statement", name.name);
+		}
 		return "Statement executed successfully.";
 	}
 };

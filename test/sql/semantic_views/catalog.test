@@ -195,3 +195,23 @@ statement error
 CREATE VIEW v AS SELECT status FROM shop2 GROUP BY status;
 ----
 Semantic view "shop2" cannot be read as a table here
+
+# a statement whose placeholder change fails leaves the semantic view unchanged
+statement ok con1
+BEGIN;
+
+statement ok con1
+CREATE SEMANTIC VIEW racy TABLES (o AS orders PRIMARY KEY (id)) METRICS (o.first_metric AS COUNT(*));
+
+statement error con2
+CREATE OR REPLACE SEMANTIC VIEW racy TABLES (o AS orders PRIMARY KEY (id)) METRICS (o.second_metric AS COUNT(*));
+----
+Catalog write-write conflict
+
+statement ok con1
+COMMIT;
+
+query I
+SELECT name FROM (SHOW SEMANTIC METRICS IN racy);
+----
+first_metric
