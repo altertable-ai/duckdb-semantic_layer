@@ -9,11 +9,14 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/parser/expression/cast_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/expression/star_expression.hpp"
 #include "duckdb/parser/parsed_data/create_view_info.hpp"
 #include "duckdb/parser/parsed_data/drop_info.hpp"
+#include "duckdb/parser/result_modifier.hpp"
+#include "duckdb/parser/tableref/emptytableref.hpp"
 #include "duckdb/parser/tableref/table_function_ref.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "semantic_ast_helpers.hpp"
@@ -152,6 +155,20 @@ bool IsSemanticPlaceholder(const CatalogEntry &entry) {
 	       StringUtil::CIEquals(function->Cast<FunctionExpression>().function_name, SEMANTIC_VIEW_PLACEHOLDER_FUNCTION);
 }
 
+unique_ptr<SelectNode> SemanticDescribeNode(const SemanticModel &model) {
+	auto node = make_uniq<SelectNode>();
+	for (auto &column : SemanticCatalogColumns(model)) {
+		auto value = make_uniq<CastExpression>(column.type, make_uniq<ConstantExpression>(Value()));
+		value->alias = column.name;
+		node->select_list.push_back(std::move(value));
+	}
+	auto limit = make_uniq<LimitModifier>();
+	limit->limit = make_uniq<ConstantExpression>(Value::BIGINT(0));
+	node->modifiers.push_back(std::move(limit));
+	node->from_table = make_uniq<EmptyTableRef>();
+	return node;
+}
+
 //===--------------------------------------------------------------------===//
 // __semantic_view_placeholder: reached only when the standard-SQL rewrite does not apply
 //===--------------------------------------------------------------------===//
@@ -159,8 +176,8 @@ static unique_ptr<FunctionData> PlaceholderBind(ClientContext &, TableFunctionBi
                                                 vector<string> &) {
 	auto name = NameArguments(input, 0);
 	if (GetSemanticViewsState(input).registry.Get(name)) {
-		throw BinderException("Semantic view \"%s\" can only be queried with SEMANTIC_VIEW(...) or by name, with "
-		                      "dimensions in GROUP BY and metrics in AGG(...)",
+		throw BinderException("Semantic view \"%s\" cannot be read as a table here: query it with SEMANTIC_VIEW(...), "
+		                      "or by name with dimensions in GROUP BY and metrics in AGG(...)",
 		                      name.name);
 	}
 	throw BinderException(

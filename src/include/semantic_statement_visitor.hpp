@@ -14,6 +14,7 @@
 #include "duckdb/common/case_insensitive_map.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/sql_statement.hpp"
+#include "duckdb/parser/tableref/showref.hpp"
 
 namespace duckdb {
 
@@ -29,6 +30,11 @@ protected:
 	}
 	//! Every SELECT node, after its children
 	virtual void VisitSelect(SelectNode &node) {
+	}
+	//! Every DESCRIBE / SHOW / SUMMARIZE of a query, before its query; returns true when it handled (replaced) the
+	//! query
+	virtual bool VisitShowQuery(ShowRef &show) {
+		return false;
 	}
 	//! Whether `name` is a CTE visible from the node being visited
 	bool IsCTEName(const string &name) const;

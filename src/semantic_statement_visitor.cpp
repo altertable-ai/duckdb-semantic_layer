@@ -110,7 +110,7 @@ void SemanticStatementVisitor::VisitRef(unique_ptr<TableRef> &ref, bool in_join)
 		break;
 	case TableReferenceType::SHOW_REF: {
 		auto &show = ref->Cast<ShowRef>();
-		if (show.query) {
+		if (show.query && !VisitShowQuery(show)) {
 			VisitNode(*show.query);
 		}
 		break;

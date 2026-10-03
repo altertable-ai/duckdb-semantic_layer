@@ -392,6 +392,25 @@ protected:
 		}
 	}
 
+	//! DESCRIBE <semantic view>: the columns of its catalog placeholder
+	bool VisitShowQuery(ShowRef &show) override {
+		if (show.show_type != ShowType::DESCRIBE || show.query->type != QueryNodeType::SELECT_NODE) {
+			return false;
+		}
+		auto &select = show.query->Cast<SelectNode>();
+		if (select.select_list.size() != 1 || select.select_list[0]->GetExpressionClass() != ExpressionClass::STAR ||
+		    !select.from_table || select.from_table->type != TableReferenceType::BASE_TABLE) {
+			return false;
+		}
+		auto model = SemanticViewFor(select.from_table->Cast<BaseTableRef>());
+		if (!model) {
+			return false;
+		}
+		show.query = SemanticDescribeNode(*model);
+		rewritten = true;
+		return true;
+	}
+
 	void VisitSelect(SelectNode &select) override {
 		if (!select.from_table || select.from_table->type != TableReferenceType::BASE_TABLE) {
 			return;

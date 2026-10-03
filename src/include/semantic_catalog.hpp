@@ -48,6 +48,8 @@ void CreateSemanticPlaceholder(ClientContext &context, const SemanticModel &mode
 bool DropSemanticPlaceholder(ClientContext &context, const QualifiedName &name);
 //! Whether a catalog entry is the placeholder of a semantic view
 bool IsSemanticPlaceholder(const CatalogEntry &entry);
+//! SELECT CAST(NULL AS <type>) AS "<column>", ... LIMIT 0: the placeholder's columns, for DESCRIBE
+unique_ptr<SelectNode> SemanticDescribeNode(const SemanticModel &model);
 
 void RegisterSemanticPlaceholderFunction(ExtensionLoader &loader, shared_ptr<SemanticViewsState> state);
 
