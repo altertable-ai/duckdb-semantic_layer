@@ -152,141 +152,114 @@ vector<SemanticEdge> SemanticModel::Path(idx_t from, idx_t to, const vector<idx_
 }
 
 //===--------------------------------------------------------------------===//
-// Markers
-//===--------------------------------------------------------------------===//
-unique_ptr<ParsedExpression> SemanticModel::MakeColumnMarker(idx_t table, const string &column) {
-	vector<string> names {SEMANTIC_COLUMN_MARKER, to_string(table), column};
-	return make_uniq<ColumnRefExpression>(std::move(names));
-}
-
-unique_ptr<ParsedExpression> SemanticModel::MakeMemberMarker(idx_t member) {
-	vector<string> names {SEMANTIC_MEMBER_MARKER, to_string(member)};
-	return make_uniq<ColumnRefExpression>(std::move(names));
-}
-
-bool SemanticModel::IsColumnMarker(const ParsedExpression &expr, idx_t &table, string &column) {
-	if (expr.GetExpressionClass() != ExpressionClass::COLUMN_REF) {
-		return false;
-	}
-	auto &colref = expr.Cast<ColumnRefExpression>();
-	if (colref.column_names.size() != 3 || colref.column_names[0] != SEMANTIC_COLUMN_MARKER) {
-		return false;
-	}
-	table = std::stoull(colref.column_names[1]);
-	column = colref.column_names[2];
-	return true;
-}
-
-bool SemanticModel::IsMemberMarker(const ParsedExpression &expr, idx_t &member) {
-	if (expr.GetExpressionClass() != ExpressionClass::COLUMN_REF) {
-		return false;
-	}
-	auto &colref = expr.Cast<ColumnRefExpression>();
-	if (colref.column_names.size() != 2 || colref.column_names[0] != SEMANTIC_MEMBER_MARKER) {
-		return false;
-	}
-	member = std::stoull(colref.column_names[1]);
-	return true;
-}
-
-//===--------------------------------------------------------------------===//
 // Name resolution
 //===--------------------------------------------------------------------===//
 static string ErrorPrefix(const SemanticResolveContext &context) {
 	return context.what.empty() ? string() : context.what + ": ";
 }
 
-static unique_ptr<ParsedExpression> ResolveColumnRef(const SemanticModel &model, const ColumnRefExpression &colref,
-                                                     const SemanticResolveContext &context) {
-	auto check_private = [&](idx_t member) {
-		if (!context.allow_private && model.members[member].IsPrivate()) {
-			throw BinderException("%sSemantic expression \"%s\" is PRIVATE and cannot be queried", ErrorPrefix(context),
-			                      model.MemberDisplayName(member));
-		}
-		return member;
+SemanticRef SemanticModel::Lookup(const vector<string> &names, const SemanticResolveContext &context,
+                                  string &error) const {
+	SemanticRef result;
+	auto member_ref = [&](idx_t member) {
+		result.kind = SemanticRefKind::MEMBER;
+		result.index = member;
+		return result;
 	};
-	auto &names = colref.column_names;
+	auto column_ref = [&](idx_t table, idx_t column) {
+		result.kind = SemanticRefKind::COLUMN;
+		result.index = table;
+		result.column = tables[table].column_names[column];
+		return result;
+	};
+	auto fail = [&](const string &message) {
+		error = message;
+		return result;
+	};
 	if (names.size() == 1) {
 		auto &name = names[0];
 		// 1. member of the owning table
 		if (context.owner_table != DConstants::INVALID_INDEX) {
-			auto member = model.FindMember(context.owner_table, name);
+			auto member = FindMember(context.owner_table, name);
 			if (member.IsValid() && member.GetIndex() != context.self_member) {
-				return SemanticModel::MakeMemberMarker(check_private(member.GetIndex()));
+				return member_ref(member.GetIndex());
 			}
 		}
 		// 2. a unique member name in the view
 		vector<idx_t> candidates;
-		for (auto member : model.FindMembersByName(name)) {
+		for (auto member : FindMembersByName(name)) {
 			if (member != context.self_member) {
 				candidates.push_back(member);
 			}
 		}
 		if (candidates.size() > 1) {
-			throw BinderException("%sAmbiguous name \"%s\"; qualify it with its logical table", ErrorPrefix(context),
-			                      name);
+			return fail(StringUtil::Format("Ambiguous name \"%s\"; qualify it with its logical table", name));
 		}
 		if (candidates.size() == 1) {
-			return SemanticModel::MakeMemberMarker(check_private(candidates[0]));
+			return member_ref(candidates[0]);
 		}
-		// 3. a column of the owning table
-		if (context.owner_table != DConstants::INVALID_INDEX) {
-			auto &table = model.tables[context.owner_table];
-			auto entry = table.columns.find(name);
-			if (entry != table.columns.end()) {
-				return SemanticModel::MakeColumnMarker(context.owner_table, table.column_names[entry->second]);
+		// 3. a column of the owning table, or (view-level expressions) of exactly one logical table
+		for (idx_t t = 0; t < tables.size(); t++) {
+			if (context.owner_table != DConstants::INVALID_INDEX && t != context.owner_table) {
+				continue;
 			}
-		} else {
-			// 4. a column of exactly one logical table (view-level expressions)
-			idx_t found_table = DConstants::INVALID_INDEX;
-			string found_column;
-			for (idx_t t = 0; t < model.tables.size(); t++) {
-				auto entry = model.tables[t].columns.find(name);
-				if (entry != model.tables[t].columns.end()) {
-					if (found_table != DConstants::INVALID_INDEX) {
-						throw BinderException("%sAmbiguous name \"%s\"; qualify it with its logical table",
-						                      ErrorPrefix(context), name);
-					}
-					found_table = t;
-					found_column = model.tables[t].column_names[entry->second];
-				}
+			auto entry = tables[t].columns.find(name);
+			if (entry == tables[t].columns.end()) {
+				continue;
 			}
-			if (found_table != DConstants::INVALID_INDEX) {
-				return SemanticModel::MakeColumnMarker(found_table, found_column);
+			if (result.Is(SemanticRefKind::COLUMN)) {
+				result = SemanticRef();
+				return fail(StringUtil::Format("Ambiguous name \"%s\"; qualify it with its logical table", name));
 			}
+			column_ref(t, entry->second);
 		}
-		throw BinderException("%sUnknown column or semantic expression \"%s\"", ErrorPrefix(context), name);
+		if (result.Is(SemanticRefKind::COLUMN)) {
+			return result;
+		}
+		return fail(StringUtil::Format("Unknown column or semantic expression \"%s\"", name));
 	}
 	if (names.size() == 2) {
-		auto table = model.FindTable(names[0]);
+		auto table = FindTable(names[0]);
 		if (!table.IsValid()) {
-			throw BinderException("%sUnknown logical table \"%s\" in \"%s.%s\"", ErrorPrefix(context), names[0],
-			                      names[0], names[1]);
+			return fail(StringUtil::Format("Unknown logical table \"%s\" in \"%s.%s\"", names[0], names[0], names[1]));
 		}
-		auto member = model.FindMember(table.GetIndex(), names[1]);
+		auto member = FindMember(table.GetIndex(), names[1]);
 		if (member.IsValid() && member.GetIndex() != context.self_member) {
-			return SemanticModel::MakeMemberMarker(check_private(member.GetIndex()));
+			return member_ref(member.GetIndex());
 		}
-		auto &table_entry = model.tables[table.GetIndex()];
-		auto entry = table_entry.columns.find(names[1]);
-		if (entry != table_entry.columns.end()) {
-			return SemanticModel::MakeColumnMarker(table.GetIndex(), table_entry.column_names[entry->second]);
+		auto entry = tables[table.GetIndex()].columns.find(names[1]);
+		if (entry != tables[table.GetIndex()].columns.end()) {
+			return column_ref(table.GetIndex(), entry->second);
 		}
-		throw BinderException("%sUnknown column or semantic expression \"%s.%s\"", ErrorPrefix(context), names[0],
-		                      names[1]);
+		return fail(StringUtil::Format("Unknown column or semantic expression \"%s.%s\"", names[0], names[1]));
 	}
-	throw BinderException("%sUnsupported reference \"%s\": use <logical table>.<name>", ErrorPrefix(context),
-	                      colref.ToString());
+	return fail(
+	    StringUtil::Format("Unsupported reference \"%s\": use <logical table>.<name>", StringUtil::Join(names, ".")));
+}
+
+static unique_ptr<ParsedExpression> ResolveColumnRef(const SemanticModel &model, const ColumnRefExpression &colref,
+                                                     const SemanticResolveContext &context) {
+	string error;
+	auto ref = model.Lookup(colref.column_names, context, error);
+	switch (ref.kind) {
+	case SemanticRefKind::MEMBER:
+		if (!context.allow_private && model.members[ref.index].IsPrivate()) {
+			throw BinderException("%sSemantic expression \"%s\" is PRIVATE and cannot be queried", ErrorPrefix(context),
+			                      model.MemberDisplayName(ref.index));
+		}
+		return SemanticMarkers::Member(ref.index);
+	case SemanticRefKind::COLUMN:
+		return SemanticMarkers::Column(ref.index, ref.column);
+	default:
+		throw BinderException("%s%s", ErrorPrefix(context), error);
+	}
 }
 
 static void ResolveRecursive(const SemanticModel &model, unique_ptr<ParsedExpression> &expr,
                              const SemanticResolveContext &context) {
 	if (expr->GetExpressionClass() == ExpressionClass::COLUMN_REF) {
 		auto &colref = expr->Cast<ColumnRefExpression>();
-		idx_t ignored_idx;
-		string ignored_name;
-		if (SemanticModel::IsColumnMarker(colref, ignored_idx, ignored_name) ||
-		    SemanticModel::IsMemberMarker(colref, ignored_idx)) {
+		if (!SemanticMarkers::Classify(colref).Is(SemanticRefKind::NONE)) {
 			return;
 		}
 		auto alias = expr->alias;

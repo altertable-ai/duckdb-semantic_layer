@@ -28,6 +28,7 @@
 #include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckdb/parser/tableref/table_function_ref.hpp"
 #include "semantic_analysis.hpp"
+#include "semantic_statement_visitor.hpp"
 #include "semantic_view_registry.hpp"
 
 namespace duckdb {
@@ -245,21 +246,13 @@ private:
 		return normalized;
 	}
 
-	//! Whether `expr` is a bare reference to a metric (which must be wrapped in AGG)
+	//! Rejects bare references to metrics (they must be wrapped in AGG)
 	void CheckNotMetric(const ParsedExpression &expr) {
 		if (expr.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
-			try {
-				SemanticResolveContext resolve_context;
-				auto resolved = model.Resolve(expr, resolve_context);
-				idx_t member;
-				if (SemanticModel::IsMemberMarker(*resolved, member) &&
-				    model.members[member].Kind() == SemanticMemberKind::METRIC) {
-					throw BinderException("Metric \"%s\" must be used with AGG()", expr.ToString());
-				}
-			} catch (BinderException &ex) {
-				if (StringUtil::Contains(ex.what(), "must be used with AGG()")) {
-					throw;
-				}
+			string ignored;
+			auto ref = model.Lookup(expr.Cast<ColumnRefExpression>().column_names, SemanticResolveContext(), ignored);
+			if (ref.Is(SemanticRefKind::MEMBER) && model.members[ref.index].Kind() == SemanticMemberKind::METRIC) {
+				throw BinderException("Metric \"%s\" must be used with AGG()", expr.ToString());
 			}
 		}
 		ParsedExpressionIterator::EnumerateChildren(expr,
@@ -294,7 +287,7 @@ private:
 			metric = WithoutAlias(aggregate);
 		}
 		for (idx_t m = 0; m < metrics.size(); m++) {
-			if (metrics[m]->Equals(*metric) && metrics[m]->ToString() == metric->ToString()) {
+			if (metrics[m]->Equals(*metric)) {
 				return MetricColumn(m);
 			}
 		}
@@ -306,7 +299,7 @@ private:
 
 	unique_ptr<ParsedExpression> Replace(const ParsedExpression &expr, bool allow_aliases) {
 		for (idx_t g = 0; g < groups.size(); g++) {
-			if (groups[g]->Equals(expr) && groups[g]->ToString() == WithoutAlias(expr)->ToString()) {
+			if (groups[g]->Equals(expr)) {
 				return make_uniq<ColumnRefExpression>(GroupColumn(g));
 			}
 		}
@@ -338,7 +331,7 @@ private:
 
 	unique_ptr<ParsedExpression> MapToFacts(const ParsedExpression &expr) {
 		for (idx_t i = 0; i < select.size(); i++) {
-			if (select[i]->Equals(expr) && WithoutAlias(*select[i])->ToString() == WithoutAlias(expr)->ToString()) {
+			if (select[i]->Equals(expr)) {
 				return make_uniq<ColumnRefExpression>(FactColumn(i));
 			}
 		}
@@ -380,143 +373,41 @@ private:
 	ParsedSemanticQuery query;
 };
 
-//! Walks a statement and rewrites the query nodes that read from a semantic view by name
-class SemanticReferenceWalker {
+//! Rewrites the query nodes that read from a semantic view by name
+class SemanticReferenceRewriter : public SemanticStatementVisitor {
 public:
-	SemanticReferenceWalker(ClientContext &context, SemanticViewsState &state) : context(context), state(state) {
-	}
-
-	void Statement(SQLStatement &statement) {
-		switch (statement.type) {
-		case StatementType::SELECT_STATEMENT:
-			Node(*statement.Cast<SelectStatement>().node);
-			break;
-		case StatementType::EXPLAIN_STATEMENT:
-			Statement(*statement.Cast<ExplainStatement>().stmt);
-			break;
-		case StatementType::PREPARE_STATEMENT:
-			Statement(*statement.Cast<PrepareStatement>().statement);
-			break;
-		case StatementType::CREATE_STATEMENT: {
-			auto &create = statement.Cast<CreateStatement>();
-			if (create.info && create.info->type == CatalogType::TABLE_ENTRY) {
-				auto &info = create.info->Cast<CreateTableInfo>();
-				if (info.query) {
-					Node(*info.query->node);
-				}
-			}
-			break;
-		}
-		case StatementType::INSERT_STATEMENT: {
-			auto &insert = statement.Cast<InsertStatement>();
-			if (insert.select_statement) {
-				Node(*insert.select_statement->node);
-			}
-			break;
-		}
-		default:
-			break;
-		}
+	SemanticReferenceRewriter(ClientContext &context, SemanticViewsState &state) : context(context), state(state) {
 	}
 
 	bool rewritten = false;
 
+protected:
+	void VisitTableRef(unique_ptr<TableRef> &ref, bool in_join) override {
+		if (in_join && ref->type == TableReferenceType::BASE_TABLE && SemanticViewFor(ref->Cast<BaseTableRef>())) {
+			throw BinderException("Semantic view \"%s\" cannot be joined in the FROM clause; use SEMANTIC_VIEW(...) "
+			                      "or a subquery instead",
+			                      ref->Cast<BaseTableRef>().table_name);
+		}
+	}
+
+	void VisitSelect(SelectNode &select) override {
+		if (!select.from_table || select.from_table->type != TableReferenceType::BASE_TABLE) {
+			return;
+		}
+		auto &base = select.from_table->Cast<BaseTableRef>();
+		auto model = SemanticViewFor(base);
+		if (model) {
+			StandardFormRewriter(context, *model, base).Rewrite(select);
+			rewritten = true;
+		}
+	}
+
 private:
-	void Node(QueryNode &node) {
-		case_insensitive_set_t ctes;
-		for (auto &cte : node.cte_map.map) {
-			ctes.insert(cte.first);
-		}
-		cte_scopes.push_back(std::move(ctes));
-		for (auto &cte : node.cte_map.map) {
-			Node(*cte.second->query->node);
-		}
-		switch (node.type) {
-		case QueryNodeType::SELECT_NODE: {
-			auto &select = node.Cast<SelectNode>();
-			if (select.from_table) {
-				Ref(select.from_table, false);
-			}
-			for (auto &expr : select.select_list) {
-				Expr(expr);
-			}
-			if (select.where_clause) {
-				Expr(select.where_clause);
-			}
-			if (select.having) {
-				Expr(select.having);
-			}
-			if (select.from_table && select.from_table->type == TableReferenceType::BASE_TABLE) {
-				auto &base = select.from_table->Cast<BaseTableRef>();
-				auto model = SemanticViewFor(base);
-				if (model) {
-					StandardFormRewriter rewriter(context, *model, base);
-					rewriter.Rewrite(select);
-					rewritten = true;
-				}
-			}
-			break;
-		}
-		case QueryNodeType::SET_OPERATION_NODE:
-			for (auto &child : node.Cast<SetOperationNode>().children) {
-				Node(*child);
-			}
-			break;
-		default:
-			break;
-		}
-		cte_scopes.pop_back();
-	}
-
-	void Ref(unique_ptr<TableRef> &ref, bool in_join) {
-		switch (ref->type) {
-		case TableReferenceType::BASE_TABLE:
-			if (in_join && SemanticViewFor(ref->Cast<BaseTableRef>())) {
-				throw BinderException("Semantic view \"%s\" cannot be joined in the FROM clause; use "
-				                      "SEMANTIC_VIEW(...) or a subquery instead",
-				                      ref->Cast<BaseTableRef>().table_name);
-			}
-			break;
-		case TableReferenceType::JOIN: {
-			auto &join = ref->Cast<JoinRef>();
-			Ref(join.left, true);
-			Ref(join.right, true);
-			if (join.condition) {
-				Expr(join.condition);
-			}
-			break;
-		}
-		case TableReferenceType::SUBQUERY:
-			Node(*ref->Cast<SubqueryRef>().subquery->node);
-			break;
-		case TableReferenceType::SHOW_REF: {
-			auto &show = ref->Cast<ShowRef>();
-			if (show.query) {
-				Node(*show.query);
-			}
-			break;
-		}
-		default:
-			break;
-		}
-	}
-
-	void Expr(unique_ptr<ParsedExpression> &expr) {
-		if (expr->GetExpressionClass() == ExpressionClass::SUBQUERY) {
-			Node(*expr->Cast<SubqueryExpression>().subquery->node);
-		}
-		ParsedExpressionIterator::EnumerateChildren(*expr, [&](unique_ptr<ParsedExpression> &child) { Expr(child); });
-	}
-
 	shared_ptr<SemanticModel> SemanticViewFor(const BaseTableRef &ref) {
 		bool unqualified = (ref.catalog_name.empty() || ref.catalog_name == INVALID_CATALOG) &&
 		                   (ref.schema_name.empty() || ref.schema_name == INVALID_SCHEMA);
-		if (unqualified) {
-			for (auto &scope : cte_scopes) {
-				if (scope.count(ref.table_name)) {
-					return nullptr;
-				}
-			}
+		if (unqualified && IsCTEName(ref.table_name)) {
+			return nullptr;
 		}
 		QualifiedName name;
 		name.catalog = ref.catalog_name;
@@ -527,27 +418,23 @@ private:
 			return nullptr;
 		}
 		// a real table or view of that name takes precedence
-		try {
-			EntryLookupInfo lookup(CatalogType::TABLE_ENTRY, ref.table_name);
-			if (Catalog::GetEntry(context, ref.catalog_name, ref.schema_name, lookup, OnEntryNotFound::RETURN_NULL)) {
-				return nullptr;
-			}
-		} catch (std::exception &) {
+		EntryLookupInfo lookup(CatalogType::TABLE_ENTRY, ref.table_name);
+		if (Catalog::GetEntry(context, ref.catalog_name, ref.schema_name, lookup, OnEntryNotFound::RETURN_NULL)) {
+			return nullptr;
 		}
 		return model;
 	}
 
 	ClientContext &context;
 	SemanticViewsState &state;
-	vector<case_insensitive_set_t> cte_scopes;
 };
 
 } // namespace
 
 bool RewriteSemanticViewReferences(ClientContext &context, SemanticViewsState &state, SQLStatement &statement) {
-	SemanticReferenceWalker walker(context, state);
-	walker.Statement(statement);
-	return walker.rewritten;
+	SemanticReferenceRewriter rewriter(context, state);
+	rewriter.VisitStatement(statement);
+	return rewriter.rewritten;
 }
 
 } // namespace duckdb

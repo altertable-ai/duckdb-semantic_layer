@@ -81,3 +81,9 @@ query I
 SELECT sql FROM semantic_view_sql('SELECT 42 AS x');
 ----
 SELECT 42 AS x
+
+# DESCRIBE wraps the query in a SHOW reference; it is expanded too
+query I
+SELECT sql NOT ILIKE '%__semantic_view_query%' FROM semantic_view_sql('DESCRIBE SELECT * FROM SEMANTIC_VIEW(shop METRICS o.revenue)');
+----
+true

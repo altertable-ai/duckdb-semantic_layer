@@ -19,6 +19,9 @@
 
 namespace duckdb {
 
+class SemanticExpressionCompiler;
+struct SemanticAliasGenerator;
+
 struct SemanticQueryItem {
 	SemanticMemberKind kind;
 	//! Resolved expression (marker references)
@@ -40,19 +43,16 @@ public:
 	SemanticQuerySpec Resolve(const vector<ParsedSemanticQueryItem> &items, optional_ptr<ParsedExpression> where);
 	//! Compiles a resolved query into a SELECT statement
 	unique_ptr<SelectStatement> Compile(const SemanticQuerySpec &spec);
-
 	//! Compiles a single member (including PRIVATE ones) for type probing; `column` is its output column
 	unique_ptr<SelectStatement> CompileMemberProbe(idx_t member, idx_t &column);
 
 private:
-	void MapWindowDimensions(unique_ptr<ParsedExpression> &expr, const vector<const SemanticQueryItem *> &dimensions);
+	unique_ptr<SelectStatement> CompileRowQuery(SemanticExpressionCompiler &compiler, SemanticAliasGenerator &aliases,
+	                                            const SemanticQuerySpec &spec, bool has_dimensions, bool has_facts,
+	                                            const set<idx_t> &row_tables);
 
 	const SemanticModel &model;
-	ClientContext &context;
 	SemanticAnalyzer analyzer;
-	idx_t scope_counter = 0;
-
-	friend class SemanticJoinScope;
 };
 
 //! Binds a probe query per member and records its output type (called while creating a semantic view)

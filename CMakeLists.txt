@@ -19,10 +19,13 @@ set(EXTENSION_SOURCES
     src/semantic_views_functions.cpp
     src/parsed_semantic_view.cpp
     src/semantic_analysis.cpp
+    src/semantic_join_scope.cpp
+    src/semantic_markers.cpp
     src/semantic_model.cpp
     src/semantic_model_builder.cpp
     src/semantic_query_compiler.cpp
     src/semantic_sql_rewrite.cpp
+    src/semantic_statement_visitor.cpp
     src/semantic_view_registry.cpp
     src/parser/semantic_views_parser.cpp)
 

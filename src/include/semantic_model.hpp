@@ -14,16 +14,11 @@
 #include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
 #include "parsed_semantic_view.hpp"
+#include "semantic_markers.hpp"
 
 namespace duckdb {
 
 class ClientContext;
-
-//! Name resolution replaces column references with marker references:
-//!   physical column : ColumnRef("__sv_col__", "<table index>", "<column name>")
-//!   semantic member : ColumnRef("__sv_mem__", "<member index>")
-static constexpr const char *SEMANTIC_COLUMN_MARKER = "__sv_col__";
-static constexpr const char *SEMANTIC_MEMBER_MARKER = "__sv_mem__";
 
 struct SemanticTable {
 	string name;
@@ -163,17 +158,13 @@ public:
 	//! `using_relationships` (USING on metrics) restricts how the tables they reference are reached.
 	vector<SemanticEdge> Path(idx_t from, idx_t to, const vector<idx_t> &using_relationships = {}) const;
 
-	//! Resolves every column reference of `expr` to a marker reference
+	//! Looks up a (possibly qualified) name: a member or a column; NONE with `error` set when unknown or ambiguous
+	SemanticRef Lookup(const vector<string> &names, const SemanticResolveContext &context, string &error) const;
+	//! Resolves every column reference of `expr` to a marker reference (semantic_markers.hpp)
 	unique_ptr<ParsedExpression> Resolve(const ParsedExpression &expr, const SemanticResolveContext &context) const;
 
 	string MemberDisplayName(idx_t member) const;
 	static string KindDisplayName(SemanticMemberKind kind);
-
-	//! Marker helpers
-	static unique_ptr<ParsedExpression> MakeColumnMarker(idx_t table, const string &column);
-	static unique_ptr<ParsedExpression> MakeMemberMarker(idx_t member);
-	static bool IsColumnMarker(const ParsedExpression &expr, idx_t &table, string &column);
-	static bool IsMemberMarker(const ParsedExpression &expr, idx_t &member);
 };
 
 //! Builds and validates a model from a parsed definition (catalog lookups through `context`)

@@ -377,9 +377,9 @@ private:
 	}
 
 	static void CollectMemberRefs(const ParsedExpression &expr, vector<idx_t> &out) {
-		idx_t member;
-		if (SemanticModel::IsMemberMarker(expr, member)) {
-			out.push_back(member);
+		auto ref = SemanticMarkers::Classify(expr);
+		if (ref.Is(SemanticRefKind::MEMBER)) {
+			out.push_back(ref.index);
 			return;
 		}
 		ParsedExpressionIterator::EnumerateChildren(
@@ -436,12 +436,12 @@ private:
 			}
 			return;
 		}
-		idx_t member;
-		if (SemanticModel::IsMemberMarker(expr, member)) {
-			auto &entry = model->members[member];
-			if (entry.Kind() == SemanticMemberKind::METRIC) {
+		auto ref = SemanticMarkers::Classify(expr);
+		if (ref.Is(SemanticRefKind::MEMBER)) {
+			auto member = ref.index;
+			if (model->members[member].Kind() == SemanticMemberKind::METRIC) {
 				vector<SemanticAtom> atoms;
-				analyzer.Decompose(*entry.resolved, entry.table, atoms, what);
+				analyzer.DecomposeMetric(member, atoms, what);
 				for (auto &atom : atoms) {
 					if (atom.home == table || !model->Reaches(atom.home, table) || model->Reaches(table, atom.home)) {
 						Fail("%s cannot reference metric \"%s\": its logical table must have a higher granularity "
@@ -509,7 +509,7 @@ private:
 				}
 			}
 			vector<SemanticAtom> atoms;
-			analyzer.Decompose(*member.resolved, member.table, atoms, what, member.using_relationships);
+			analyzer.DecomposeMetric(m, atoms, what);
 			if (member.IsDerived()) {
 				continue;
 			}

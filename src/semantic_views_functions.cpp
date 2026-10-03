@@ -25,6 +25,7 @@
 #include "semantic_analysis.hpp"
 #include "semantic_query_compiler.hpp"
 #include "semantic_sql_rewrite.hpp"
+#include "semantic_statement_visitor.hpp"
 #include "semantic_view_registry.hpp"
 #include "semantic_views_parser.hpp"
 
@@ -317,12 +318,10 @@ static void ShowDimensionsForMetric(ClientContext &context, shared_ptr<SemanticM
 	}
 	SemanticAnalyzer analyzer(*model, context);
 	vector<SemanticAtom> atoms;
-	auto &metric_member = model->members[metric];
-	analyzer.Decompose(*metric_member.resolved, metric_member.table, atoms, "Metric",
-	                   metric_member.using_relationships);
+	analyzer.DecomposeMetric(metric, atoms, "Metric");
 	// dimensions used by window clauses must be part of the query
 	set<idx_t> required;
-	analyzer.WindowDimensions(*SemanticModel::MakeMemberMarker(metric), required);
+	analyzer.WindowDimensions(*SemanticMarkers::Member(metric), required);
 	for (idx_t d = 0; d < model->members.size(); d++) {
 		auto &dimension = model->members[d];
 		if (dimension.Kind() != SemanticMemberKind::DIMENSION) {
@@ -527,89 +526,34 @@ static unique_ptr<TableRef> SemanticQueryBindReplace(ClientContext &context, Tab
 //===--------------------------------------------------------------------===//
 // semantic_view_sql(query) - the SQL a statement compiles to
 //===--------------------------------------------------------------------===//
-class SemanticQueryExpander {
+//! Replaces every SEMANTIC_VIEW(...) call by the query it compiles to
+class SemanticQueryExpander : public SemanticStatementVisitor {
 public:
 	SemanticQueryExpander(ClientContext &context, SemanticViewsState &state) : context(context), state(state) {
 	}
 
-	void Node(QueryNode &node) {
-		for (auto &cte : node.cte_map.map) {
-			Node(*cte.second->query->node);
+protected:
+	void VisitTableRef(unique_ptr<TableRef> &ref, bool) override {
+		if (ref->type != TableReferenceType::TABLE_FUNCTION) {
+			return;
 		}
-		switch (node.type) {
-		case QueryNodeType::SELECT_NODE: {
-			auto &select = node.Cast<SelectNode>();
-			if (select.from_table) {
-				Ref(select.from_table);
-			}
-			for (auto &expr : select.select_list) {
-				Expr(expr);
-			}
-			if (select.where_clause) {
-				Expr(select.where_clause);
-			}
-			if (select.having) {
-				Expr(select.having);
-			}
-			if (select.qualify) {
-				Expr(select.qualify);
-			}
-			break;
+		auto &function_ref = ref->Cast<TableFunctionRef>();
+		auto &function = function_ref.function->Cast<FunctionExpression>();
+		if (!StringUtil::CIEquals(function.function_name, SEMANTIC_VIEW_QUERY_FUNCTION)) {
+			return;
 		}
-		case QueryNodeType::SET_OPERATION_NODE:
-			for (auto &child : node.Cast<SetOperationNode>().children) {
-				Node(*child);
-			}
-			break;
-		default:
-			break;
+		vector<Value> args;
+		for (auto &child : function.children) {
+			args.push_back(child->Cast<ConstantExpression>().value);
 		}
+		string view_name;
+		auto select = CompileSemanticQuery(context, state, args, view_name);
+		auto replacement = make_uniq<SubqueryRef>(std::move(select), ref->alias.empty() ? view_name : ref->alias);
+		replacement->column_name_alias = function_ref.column_name_alias;
+		ref = std::move(replacement);
 	}
 
 private:
-	void Ref(unique_ptr<TableRef> &ref) {
-		switch (ref->type) {
-		case TableReferenceType::TABLE_FUNCTION: {
-			auto &function_ref = ref->Cast<TableFunctionRef>();
-			auto &function = function_ref.function->Cast<FunctionExpression>();
-			if (!StringUtil::CIEquals(function.function_name, SEMANTIC_VIEW_QUERY_FUNCTION)) {
-				break;
-			}
-			vector<Value> args;
-			for (auto &child : function.children) {
-				args.push_back(child->Cast<ConstantExpression>().value);
-			}
-			string view_name;
-			auto select = CompileSemanticQuery(context, state, args, view_name);
-			auto replacement = make_uniq<SubqueryRef>(std::move(select), ref->alias.empty() ? view_name : ref->alias);
-			replacement->column_name_alias = function_ref.column_name_alias;
-			ref = std::move(replacement);
-			break;
-		}
-		case TableReferenceType::JOIN: {
-			auto &join = ref->Cast<JoinRef>();
-			Ref(join.left);
-			Ref(join.right);
-			if (join.condition) {
-				Expr(join.condition);
-			}
-			break;
-		}
-		case TableReferenceType::SUBQUERY:
-			Node(*ref->Cast<SubqueryRef>().subquery->node);
-			break;
-		default:
-			break;
-		}
-	}
-
-	void Expr(unique_ptr<ParsedExpression> &expr) {
-		if (expr->GetExpressionClass() == ExpressionClass::SUBQUERY) {
-			Node(*expr->Cast<SubqueryExpression>().subquery->node);
-		}
-		ParsedExpressionIterator::EnumerateChildren(*expr, [&](unique_ptr<ParsedExpression> &child) { Expr(child); });
-	}
-
 	ClientContext &context;
 	SemanticViewsState &state;
 };
@@ -626,9 +570,7 @@ static unique_ptr<FunctionData> SemanticViewSqlBind(ClientContext &context, Tabl
 	auto result = make_uniq<RowsFunctionData>();
 	for (auto &statement : statements) {
 		RewriteSemanticViewReferences(context, GetState(input), *statement);
-		if (statement->type == StatementType::SELECT_STATEMENT) {
-			expander.Node(*statement->Cast<SelectStatement>().node);
-		}
+		expander.VisitStatement(*statement);
 		result->rows.push_back({Value(statement->ToString())});
 	}
 	return std::move(result);
