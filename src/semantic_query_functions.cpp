@@ -72,8 +72,7 @@ static unique_ptr<FunctionData> SemanticViewSqlBind(ClientContext &context, Tabl
 	auto &state = GetSemanticViewsState(input);
 	SemanticQueryExpander expander(context, state);
 	auto result = make_uniq<RowsFunctionData>();
-	for (auto &statement :
-	     SemanticViewsRewriter::Parse(StringValue::Get(input.inputs[0]), context.GetParserOptions())) {
+	for (auto &statement : SemanticViewsParser::Parse(StringValue::Get(input.inputs[0]), context.GetParserOptions())) {
 		RewriteSemanticViewReferences(context, state, *statement);
 		expander.VisitStatement(*statement);
 		result->rows.push_back({Value(statement->ToString())});
@@ -92,8 +91,7 @@ static unique_ptr<FunctionData> PegParseBind(ClientContext &context, TableFuncti
 		throw BinderException("semantic_views_peg_parse: the query cannot be NULL");
 	}
 	auto result = make_uniq<RowsFunctionData>();
-	for (auto &statement :
-	     SemanticViewsRewriter::Parse(StringValue::Get(input.inputs[0]), context.GetParserOptions())) {
+	for (auto &statement : SemanticViewsParser::Parse(StringValue::Get(input.inputs[0]), context.GetParserOptions())) {
 		result->rows.push_back({Value(statement->ToString())});
 	}
 	return std::move(result);
