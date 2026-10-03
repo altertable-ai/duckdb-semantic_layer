@@ -96,8 +96,20 @@ ORDER BY 2 DESC;
 `GROUP BY` expressions become dimensions, metrics must be wrapped in `AGG(...)`, other aggregate functions over
 dimensions or facts are ad-hoc metrics, `WHERE` filters before aggregation and `HAVING` after. Without aggregation the
 select list is evaluated as facts, row by row. Names can be bare, qualified (`customers.segment`) or quoted as BI tools
-do (`"customers.segment"`). A table or view with the same name takes precedence. Not supported in this form (as in
-Snowflake): joins with the semantic view, window functions, `QUALIFY`, `SELECT *`.
+do (`"customers.segment"`). Not supported in this form (as in Snowflake): joins with the semantic view, window
+functions, `QUALIFY`, `SELECT *`.
+
+### In the catalog (BI tools)
+
+Every semantic view is also listed as a view of the same name in `information_schema.tables` / `columns`,
+`duckdb_views()` and `duckdb_columns()`, so BI tools and SQL clients discover it like any view. It has one column per
+public fact, dimension and metric (in that order), with the member's type and comment; a name shared by several
+members is qualified (`"orders.revenue"`), which the query-by-name form resolves. `DESCRIBE sales` shows those columns.
+The view is a placeholder: reading it as a plain table fails with a message pointing to `SEMANTIC_VIEW(...)` and
+`AGG(...)`.
+
+Semantic views therefore share the namespace of tables and views: creating one with the name of an existing table or
+view fails, and so does creating a table with the name of a semantic view.
 
 ### Advanced metrics
 
@@ -158,6 +170,14 @@ On a 100M-row fact table the generated queries run within a few percent of equiv
 
 - Semantic views live in memory, per database instance: they are not persisted in the database file and are
   not transactional (a `CREATE` inside a rolled-back transaction stays). Re-create them after restarting.
+- Their catalog placeholder views, however, are saved in database files like any view. After a restart a placeholder
+  stays listed, and querying it fails with `Semantic view "x" is not defined in this session`; `CREATE SEMANTIC VIEW x`
+  replaces it and `DROP SEMANTIC VIEW x` removes it. Without the extension loaded, querying it fails with an unknown
+  `__semantic_view_placeholder` function.
+- No placeholder is created in read-only databases or in attached non-DuckDB catalogs (Postgres, SQLite, ...): such
+  semantic views work but are not listed. A plain `DROP VIEW x` removes only the placeholder.
+- A DuckDB view cannot be defined over the query-by-name form (`CREATE VIEW v AS SELECT ... FROM x GROUP BY ...`);
+  use `SEMANTIC_VIEW(...)` in view definitions.
 - A single statement cannot combine `SEMANTIC_VIEW(...)` with syntax of another parser extension such as
   `MATCH_RECOGNIZE`.
 - Physical columns of another logical table can be referenced directly in expressions (Snowflake requires a fact).
