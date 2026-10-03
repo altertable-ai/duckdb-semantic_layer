@@ -21,11 +21,15 @@ DuckDB v1.5.5, release build, Apple M4 Pro (14 cores, 48 GB), median of 11 runs,
 | q6_child_aggregate | metric over a fact that aggregates 100M child rows per customer | 0.292 | 0.292 | 1.00 | identical |
 | q7_standard_sql_form | `SELECT dim, AGG(m) FROM sv WHERE ... GROUP BY ... HAVING ...` over three joins | 0.362 | 0.361 | 1.00 | identical |
 | q8_semi_additive | `NON ADDITIVE BY` (last day per category) over 100M rows | 0.651 | 0.592 | 1.10 | identical |
+| q9_range_relationship | range relationship (fiscal quarters) vs. a hand-written inequality join | 0.184 | 1.692 | 0.11 | identical |
 
 q8's hand-written query assumes the snapshot column has no NULLs; the semantic query also honours the NULL ordering
 (`ASC` sorts NULLs last, so a NULL snapshot would be the last one), which costs two extra window counts.
 
-The plans DuckDB executes are the same as for the hand-written queries (same joins, aggregates and projections);
+q9 is faster than the obvious hand-written query because range lookups run on the distinct values of the
+referencing column (a decorrelated scalar subquery) rather than as a range join over all 100M rows.
+
+For q1-q7 the plans DuckDB executes are the same as for the hand-written queries (same joins, aggregates and projections);
 apart from q8, the only measurable difference is a fixed ~1 ms for parsing and compiling the semantic query,
 visible on q1.
 

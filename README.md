@@ -105,6 +105,12 @@ Snowflake): joins with the semantic view, window functions, `QUALIFY`, `SELECT *
   (role-playing dimensions, e.g. departure vs arrival airport). Without it such queries are rejected as ambiguous.
 - `NON ADDITIVE BY (dimension [ASC|DESC] [NULLS FIRST|LAST], ...)` makes a metric semi-additive: within every group,
   only the rows of the last snapshot in that order are aggregated (balances, inventory levels).
+- `ASOF` relationships, `orders (o_cust_id, o_ord_date) REFERENCES addresses (ca_cust_id, ASOF ca_start_date)`, join
+  each row to the latest referenced row at or before its value (`ASOF LEFT JOIN`).
+- Range relationships, `events (ts) REFERENCES periods (BETWEEN start_time AND end_time EXCLUSIVE)` with
+  `CONSTRAINT DISTINCT RANGE BETWEEN start_time AND end_time EXCLUSIVE` on `periods`, look up the range containing each
+  value (NULL bounds are open). They are evaluated on the distinct values of the referencing column, which makes them
+  much cheaper than a range join.
 - Window function metrics, e.g.
   `AVG(total_sales_quantity) OVER (PARTITION BY EXCLUDING date.date ORDER BY date.date RANGE BETWEEN INTERVAL '6 days'
   PRECEDING AND CURRENT ROW)`, are evaluated over the aggregated rows; the dimensions they use must be requested in
@@ -140,7 +146,6 @@ On a 100M-row fact table the generated queries run within a few percent of equiv
 
 - Semantic views live in memory, per database instance: they are not persisted in the database file and are
   not transactional (a `CREATE` inside a rolled-back transaction stays). Re-create them after restarting.
-- Not supported yet: `ASOF` and range relationships (parsed and rejected with a clear error).
 - A single statement cannot combine `SEMANTIC_VIEW(...)` with syntax of another parser extension such as
   `MATCH_RECOGNIZE`.
 - Physical columns of another logical table can be referenced directly in expressions (Snowflake requires a fact).

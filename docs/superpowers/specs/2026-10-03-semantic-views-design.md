@@ -371,10 +371,12 @@ facts must all live on the same logical table (Snowflake rule).
 - **ASOF relationship** `from(c1, ..., ck) REFERENCES to(c'1, ..., ASOF c'j, ...)`: the up-join from
   `from` to `to` becomes `ASOF LEFT JOIN to ON <equalities> AND from.cj >= to.c'j`.
 - **Range relationship** `from(c) REFERENCES to(BETWEEN s AND e EXCLUSIVE)` with a matching
-  `DISTINCT RANGE` constraint on `to`: compiled to an `ASOF LEFT JOIN` on `from.c >= coalesce(to.s, -inf)`
-  against `to` and a validity guard `to.e IS NULL OR from.c < to.e` applied to every column read
-  from `to` (ranges are distinct, so the ASOF match is the only candidate). Sort-merge ASOF keeps this
-  O(n log n) at 100M rows instead of an inequality join.
+  `DISTINCT RANGE` constraint on `to`: every column read from `to` (or from tables reached through it) compiles to
+  a correlated scalar subquery `(SELECT to.x FROM to WHERE (to.s IS NULL OR from.c >= to.s) AND (to.e IS NULL OR
+  from.c < to.e))`. DuckDB decorrelates it on the distinct values of `from.c`, so the cost is a hash aggregate of the
+  referencing column plus a small join of its distinct values with the range table, instead of a range join over
+  every row (measured 9x faster than a hand-written inequality join at 100M rows). Rows without a matching range
+  read NULL. Child aggregations through ASOF or range relationships are rejected.
 - **ALTER SEMANTIC VIEW**: rename (re-key in registry), set/unset comment.
 
 ## 9. Error handling

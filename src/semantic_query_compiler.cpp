@@ -26,7 +26,6 @@
 namespace duckdb {
 
 static constexpr const char *BLOCK_COLUMN = "__sv_block";
-static constexpr const char *RANGE_KEY_COLUMN = "__sv_key";
 static constexpr const char *AGGREGATED_ALIAS = "__sv_agg";
 
 static string DimensionColumn(idx_t index) {
@@ -83,6 +82,12 @@ public:
 		}
 		idx_t current = base;
 		for (auto &edge : model.Path(base, table, using_relationships)) {
+			if (model.relationships[edge.relationship].is_range) {
+				throw BinderException("Semantic view \"%s\": logical table \"%s\" is reached through the range "
+				                      "relationship \"%s\" and cannot be used here",
+				                      model.QualifiedViewName(), model.tables[table].name,
+				                      model.relationships[edge.relationship].name);
+			}
 			if (!present.count(edge.target)) {
 				joins.push_back(Joined {edge.target, edge, current});
 				present.insert(edge.target);
@@ -90,6 +95,58 @@ public:
 			current = edge.target;
 		}
 		return AliasOf(table);
+	}
+
+	//! Reference to `column` of `table`. Tables reached through a range relationship are read with a correlated
+	//! scalar subquery: DuckDB decorrelates it on the distinct values of the referencing column, so the range
+	//! lookup costs a join of those distinct values with the (small) range table instead of a range join over every
+	//! row.
+	unique_ptr<ParsedExpression> ColumnReference(idx_t table, const string &column) {
+		if (parent && outer_context != DConstants::INVALID_INDEX && model.Reaches(outer_context, table)) {
+			return parent->ColumnReference(table, column);
+		}
+		auto path = model.Path(base, table, using_relationships);
+		idx_t range_at = DConstants::INVALID_INDEX;
+		for (idx_t i = 0; i < path.size(); i++) {
+			if (model.relationships[path[i].relationship].is_range) {
+				range_at = i;
+				break;
+			}
+		}
+		if (range_at == DConstants::INVALID_INDEX) {
+			return make_uniq<ColumnRefExpression>(column, Ensure(table));
+		}
+		auto source = range_at == 0 ? base : path[range_at - 1].target;
+		auto &rel = model.relationships[path[range_at].relationship];
+		auto source_alias = Ensure(source);
+		auto range_table = path[range_at].target;
+		SemanticJoinScope inner(model, range_table, prefix + "__svr" + to_string(++range_counter) + "_",
+		                        using_relationships);
+		auto value = inner.ColumnReference(table, column);
+		auto range_alias = inner.AliasOf(range_table);
+		auto key = [&]() {
+			return make_uniq<ColumnRefExpression>(rel.from_columns[0], source_alias);
+		};
+		// (start IS NULL OR key >= start) AND (end IS NULL OR key < end)
+		auto bound = [&](const string &bound_column, ExpressionType comparison) {
+			auto open = make_uniq<OperatorExpression>(ExpressionType::OPERATOR_IS_NULL,
+			                                          make_uniq<ColumnRefExpression>(bound_column, range_alias));
+			auto compare = make_uniq<ComparisonExpression>(comparison, key(),
+			                                               make_uniq<ColumnRefExpression>(bound_column, range_alias));
+			return make_uniq<ConjunctionExpression>(ExpressionType::CONJUNCTION_OR, std::move(open),
+			                                        std::move(compare));
+		};
+		auto node = make_uniq<SelectNode>();
+		node->select_list.push_back(std::move(value));
+		node->from_table = inner.BuildFrom();
+		node->where_clause = make_uniq<ConjunctionExpression>(
+		    ExpressionType::CONJUNCTION_AND, bound(rel.range_start, ExpressionType::COMPARE_GREATERTHANOREQUALTO),
+		    bound(rel.range_end, ExpressionType::COMPARE_LESSTHAN));
+		auto subquery = make_uniq<SubqueryExpression>();
+		subquery->subquery_type = SubqueryType::SCALAR;
+		subquery->subquery = make_uniq<SelectStatement>();
+		subquery->subquery->node = std::move(node);
+		return std::move(subquery);
 	}
 
 	unique_ptr<TableRef> BuildFrom() const {
@@ -102,14 +159,7 @@ public:
 			auto &parent_columns = join.edge.reversed ? rel.to_columns : rel.from_columns;
 			auto &child_columns = join.edge.reversed ? rel.from_columns : rel.to_columns;
 			if (rel.is_range) {
-				auto join_ref = make_uniq<JoinRef>(JoinRefType::REGULAR);
-				join_ref->type = JoinType::LEFT;
-				join_ref->left = std::move(result);
-				join_ref->right = RangeLookup(rel, AliasOf(join.table));
-				join_ref->condition =
-				    Equals(AliasOf(join.parent_table), rel.from_columns[0], AliasOf(join.table), RANGE_KEY_COLUMN);
-				result = std::move(join_ref);
-				continue;
+				throw InternalException("range relationships are read through subqueries, never joined");
 			}
 			vector<unique_ptr<ParsedExpression>> conditions;
 			for (idx_t c = 0; c < parent_columns.size(); c++) {
@@ -140,82 +190,6 @@ public:
 	vector<idx_t> using_relationships;
 
 private:
-	//! Range relationship `from(c) REFERENCES to(BETWEEN s AND e EXCLUSIVE)`: maps every distinct value of `c` to its
-	//! range row, so that the fact table joins the result on equality. Ranges with a start are matched with a
-	//! sort-merge ASOF join; the (at most one, ranges being distinct) range without a start matches values below its
-	//! end:
-	//!   SELECT k.__sv_key, r.* FROM (SELECT DISTINCT c AS __sv_key FROM from) k
-	//!     ASOF JOIN (SELECT * FROM to WHERE s IS NOT NULL) r ON k.__sv_key >= r.s
-	//!   WHERE r.e IS NULL OR k.__sv_key < r.e
-	//!   UNION ALL
-	//!   SELECT k.__sv_key, r.* FROM (...) k JOIN (SELECT * FROM to WHERE s IS NULL) r
-	//!     ON r.e IS NULL OR k.__sv_key < r.e
-	unique_ptr<TableRef> RangeLookup(const SemanticRelationship &rel, const string &alias) const {
-		auto &from = model.tables[rel.from_table];
-		auto &to = model.tables[rel.to_table];
-		auto keys = [&]() {
-			auto node = make_uniq<SelectNode>();
-			auto key = make_uniq<ColumnRefExpression>(rel.from_columns[0]);
-			key->alias = RANGE_KEY_COLUMN;
-			node->select_list.push_back(std::move(key));
-			node->from_table = from.source->Copy();
-			node->modifiers.push_back(make_uniq<DistinctModifier>());
-			auto statement = make_uniq<SelectStatement>();
-			statement->node = std::move(node);
-			return make_uniq<SubqueryRef>(std::move(statement), "__sv_k");
-		};
-		auto ranges = [&](bool open_start) {
-			auto node = make_uniq<SelectNode>();
-			node->select_list.push_back(make_uniq<StarExpression>());
-			node->from_table = to.source->Copy();
-			node->where_clause = make_uniq<OperatorExpression>(open_start ? ExpressionType::OPERATOR_IS_NULL
-			                                                              : ExpressionType::OPERATOR_IS_NOT_NULL,
-			                                                   make_uniq<ColumnRefExpression>(rel.range_start));
-			auto statement = make_uniq<SelectStatement>();
-			statement->node = std::move(node);
-			return make_uniq<SubqueryRef>(std::move(statement), "__sv_r");
-		};
-		auto before_end = [&]() {
-			auto open_end = make_uniq<OperatorExpression>(ExpressionType::OPERATOR_IS_NULL,
-			                                              make_uniq<ColumnRefExpression>(rel.range_end, "__sv_r"));
-			auto less = make_uniq<ComparisonExpression>(ExpressionType::COMPARE_LESSTHAN,
-			                                            make_uniq<ColumnRefExpression>(RANGE_KEY_COLUMN, "__sv_k"),
-			                                            make_uniq<ColumnRefExpression>(rel.range_end, "__sv_r"));
-			return make_uniq<ConjunctionExpression>(ExpressionType::CONJUNCTION_OR, std::move(open_end),
-			                                        std::move(less));
-		};
-		auto mapping = [&](unique_ptr<TableRef> from_table, unique_ptr<ParsedExpression> where) {
-			auto node = make_uniq<SelectNode>();
-			node->select_list.push_back(make_uniq<ColumnRefExpression>(RANGE_KEY_COLUMN, "__sv_k"));
-			node->select_list.push_back(make_uniq<StarExpression>("__sv_r"));
-			node->from_table = std::move(from_table);
-			node->where_clause = std::move(where);
-			return node;
-		};
-
-		auto asof = make_uniq<JoinRef>(JoinRefType::ASOF);
-		asof->type = JoinType::INNER;
-		asof->left = keys();
-		asof->right = ranges(false);
-		asof->condition = make_uniq<ComparisonExpression>(ExpressionType::COMPARE_GREATERTHANOREQUALTO,
-		                                                  make_uniq<ColumnRefExpression>(RANGE_KEY_COLUMN, "__sv_k"),
-		                                                  make_uniq<ColumnRefExpression>(rel.range_start, "__sv_r"));
-		auto open = make_uniq<JoinRef>(JoinRefType::REGULAR);
-		open->type = JoinType::INNER;
-		open->left = keys();
-		open->right = ranges(true);
-		open->condition = before_end();
-
-		auto union_node = make_uniq<SetOperationNode>();
-		union_node->setop_type = SetOperationType::UNION;
-		union_node->setop_all = true;
-		union_node->children.push_back(mapping(std::move(asof), before_end()));
-		union_node->children.push_back(mapping(std::move(open), nullptr));
-		auto statement = make_uniq<SelectStatement>();
-		statement->node = std::move(union_node);
-		return make_uniq<SubqueryRef>(std::move(statement), alias);
-	}
-
 	struct Joined {
 		idx_t table;
 		SemanticEdge edge;
@@ -227,6 +201,7 @@ private:
 	idx_t outer_context;
 	vector<Joined> joins;
 	set<idx_t> present;
+	idx_t range_counter = 0;
 };
 
 //===--------------------------------------------------------------------===//
@@ -246,9 +221,9 @@ public:
 		idx_t table;
 		string column;
 		if (SemanticModel::IsColumnMarker(expr, table, column)) {
-			auto result = make_uniq<ColumnRefExpression>(column, scope.Ensure(table));
+			auto result = scope.ColumnReference(table, column);
 			result->alias = expr.alias;
-			return std::move(result);
+			return result;
 		}
 		idx_t member;
 		if (SemanticModel::IsMemberMarker(expr, member)) {

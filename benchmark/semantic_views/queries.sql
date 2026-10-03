@@ -47,3 +47,9 @@ SELECT p.category, c.segment, SUM(s.amount), SUM(s.qty) FROM sales s LEFT JOIN p
 SELECT * FROM SEMANTIC_VIEW(sales_sv DIMENSIONS p.category METRICS s.last_day_revenue)
 -- handwritten
 SELECT category, SUM(amount) AS last_day_revenue FROM (SELECT p.category, s.amount, s.sale_date, max(s.sale_date) OVER (PARTITION BY p.category) AS last_day FROM sales s LEFT JOIN products p ON s.product_id = p.id) WHERE sale_date = last_day GROUP BY 1
+
+-- name: q9_range_relationship
+-- semantic
+SELECT * FROM SEMANTIC_VIEW(sales_sv DIMENSIONS f.fiscal_quarter METRICS s.revenue)
+-- handwritten
+SELECT f.name AS fiscal_quarter, SUM(s.amount) AS revenue FROM sales s LEFT JOIN fiscal_periods f ON s.sale_date >= f.start_date AND s.sale_date < f.end_date GROUP BY 1
