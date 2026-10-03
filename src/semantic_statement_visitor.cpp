@@ -3,15 +3,18 @@
 #include "duckdb/parser/expression/subquery_expression.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
+#include "duckdb/parser/query_node/recursive_cte_node.hpp"
 #include "duckdb/parser/query_node/set_operation_node.hpp"
 #include "duckdb/parser/statement/create_statement.hpp"
 #include "duckdb/parser/statement/explain_statement.hpp"
 #include "duckdb/parser/statement/insert_statement.hpp"
 #include "duckdb/parser/statement/prepare_statement.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
+#include "duckdb/parser/tableref/expressionlistref.hpp"
 #include "duckdb/parser/tableref/joinref.hpp"
 #include "duckdb/parser/tableref/showref.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
+#include "duckdb/parser/tableref/table_function_ref.hpp"
 
 namespace duckdb {
 
@@ -66,6 +69,8 @@ void SemanticStatementVisitor::VisitNode(QueryNode &node) {
 	for (auto &cte : node.cte_map.map) {
 		VisitNode(*cte.second->query->node);
 	}
+	ParsedExpressionIterator::EnumerateQueryNodeModifiers(
+	    node, [&](unique_ptr<ParsedExpression> &expr) { VisitExpression(expr); });
 	switch (node.type) {
 	case QueryNodeType::SELECT_NODE: {
 		auto &select = node.Cast<SelectNode>();
@@ -73,6 +78,9 @@ void SemanticStatementVisitor::VisitNode(QueryNode &node) {
 			VisitRef(select.from_table, false);
 		}
 		for (auto &expr : select.select_list) {
+			VisitExpression(expr);
+		}
+		for (auto &expr : select.groups.group_expressions) {
 			VisitExpression(expr);
 		}
 		for (auto *clause : {&select.where_clause, &select.having, &select.qualify}) {
@@ -88,6 +96,15 @@ void SemanticStatementVisitor::VisitNode(QueryNode &node) {
 			VisitNode(*child);
 		}
 		break;
+	case QueryNodeType::RECURSIVE_CTE_NODE: {
+		auto &recursive = node.Cast<RecursiveCTENode>();
+		VisitNode(*recursive.left);
+		VisitNode(*recursive.right);
+		for (auto &expr : recursive.key_targets) {
+			VisitExpression(expr);
+		}
+		break;
+	}
 	default:
 		break;
 	}
@@ -107,6 +124,16 @@ void SemanticStatementVisitor::VisitRef(unique_ptr<TableRef> &ref, bool in_join)
 	}
 	case TableReferenceType::SUBQUERY:
 		VisitNode(*ref->Cast<SubqueryRef>().subquery->node);
+		break;
+	case TableReferenceType::TABLE_FUNCTION:
+		VisitExpression(ref->Cast<TableFunctionRef>().function);
+		break;
+	case TableReferenceType::EXPRESSION_LIST:
+		for (auto &row : ref->Cast<ExpressionListRef>().values) {
+			for (auto &expr : row) {
+				VisitExpression(expr);
+			}
+		}
 		break;
 	case TableReferenceType::SHOW_REF: {
 		auto &show = ref->Cast<ShowRef>();

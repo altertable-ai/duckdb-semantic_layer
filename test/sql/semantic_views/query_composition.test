@@ -1,0 +1,79 @@
+# name: test/sql/semantic_views/query_composition.test
+# description: semantic SQL and generated SQL in query modifiers, table arguments and recursive CTEs
+# group: [semantic_views]
+
+require semantic_views
+
+statement ok
+PRAGMA enable_verification
+
+statement ok
+CREATE TABLE values_table (x INTEGER);
+INSERT INTO values_table VALUES (1), (2);
+CREATE SEMANTIC VIEW composition TABLES (t AS values_table) DIMENSIONS (t.x AS x) METRICS (t.n AS COUNT(*));
+
+query I
+SELECT 42 ORDER BY (SELECT AGG(n) FROM composition);
+----
+42
+
+query I
+SELECT x FROM values_table GROUP BY x ORDER BY (SELECT AGG(n) FROM composition), x;
+----
+1
+2
+
+query I
+SELECT x FROM values_table ORDER BY x LIMIT (SELECT AGG(n) FROM composition) OFFSET (SELECT MIN(x) FROM composition);
+----
+2
+
+query I
+SELECT x FROM values_table GROUP BY (SELECT AGG(n) FROM composition), x ORDER BY x;
+----
+1
+2
+
+query I
+WITH RECURSIVE r(n) AS (SELECT AGG(n) FROM composition UNION ALL SELECT n - 1 FROM r WHERE n > 0) SELECT * FROM r ORDER BY n;
+----
+0
+1
+2
+
+query I
+SELECT * FROM range((SELECT AGG(n) FROM composition));
+----
+0
+1
+
+query I
+SELECT * FROM (VALUES ((SELECT AGG(n) FROM composition))) AS v(n);
+----
+2
+
+# Generated SQL must expand semantic clauses in all of the same locations.
+query I
+SELECT sql NOT ILIKE '%__semantic_view_query%' FROM semantic_view_sql('SELECT 42 ORDER BY (SELECT * FROM SEMANTIC_VIEW(composition METRICS t.n))');
+----
+true
+
+query I
+SELECT sql NOT ILIKE '%__semantic_view_query%' FROM semantic_view_sql('SELECT 42 LIMIT (SELECT * FROM SEMANTIC_VIEW(composition METRICS t.n))');
+----
+true
+
+query I
+SELECT sql NOT ILIKE '%__semantic_view_query%' FROM semantic_view_sql('WITH RECURSIVE r(n) AS (SELECT * FROM SEMANTIC_VIEW(composition METRICS t.n) UNION ALL SELECT n - 1 FROM r WHERE n > 0) SELECT * FROM r');
+----
+true
+
+query I
+SELECT sql NOT ILIKE '%__semantic_view_query%' FROM semantic_view_sql('SELECT * FROM range((SELECT * FROM SEMANTIC_VIEW(composition METRICS t.n)))');
+----
+true
+
+query I
+SELECT sql NOT ILIKE '%__semantic_view_query%' FROM semantic_view_sql('SELECT * FROM (VALUES ((SELECT * FROM SEMANTIC_VIEW(composition METRICS t.n)))) AS v(n)');
+----
+true
