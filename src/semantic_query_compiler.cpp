@@ -349,6 +349,67 @@ static unique_ptr<SelectNode> BuildNonAdditiveBlock(ExpressionCompiler &compiler
 	return outer;
 }
 
+//! Window-function metrics run over the merged rows: their dimension references become the query's dimension
+//! columns (which must be requested), and PARTITION BY EXCLUDING expands to every other query dimension.
+void SemanticQueryCompiler::MapWindowDimensions(unique_ptr<ParsedExpression> &expr,
+                                                const vector<const SemanticQueryItem *> &dimensions) {
+	auto dimension_column = [&](const ParsedExpression &reference) -> unique_ptr<ParsedExpression> {
+		for (idx_t d = 0; d < dimensions.size(); d++) {
+			if (dimensions[d]->resolved->Equals(reference)) {
+				return ColumnRef(DimensionColumn(d));
+			}
+		}
+		idx_t member;
+		auto name =
+		    SemanticModel::IsMemberMarker(reference, member) ? model.MemberDisplayName(member) : reference.ToString();
+		throw BinderException("Invalid semantic view query: Dimension '%s' used in a window function metric must be "
+		                      "requested in the query.",
+		                      name);
+	};
+	std::function<void(unique_ptr<ParsedExpression> &)> map_key = [&](unique_ptr<ParsedExpression> &key) {
+		idx_t member;
+		if (SemanticModel::IsMemberMarker(*key, member)) {
+			key = dimension_column(*key);
+			return;
+		}
+		ParsedExpressionIterator::EnumerateChildren(*key, map_key);
+	};
+	if (expr->GetExpressionClass() == ExpressionClass::WINDOW) {
+		auto &window = expr->Cast<WindowExpression>();
+		vector<unique_ptr<ParsedExpression>> partitions;
+		for (auto &partition : window.partitions) {
+			if (!SemanticAnalyzer::IsExcludingMarker(*partition)) {
+				map_key(partition);
+				partitions.push_back(std::move(partition));
+				continue;
+			}
+			auto &excluded = partition->Cast<FunctionExpression>().children;
+			for (auto &dimension : excluded) {
+				dimension_column(*dimension);
+			}
+			for (idx_t d = 0; d < dimensions.size(); d++) {
+				bool is_excluded = false;
+				for (auto &dimension : excluded) {
+					is_excluded = is_excluded || dimensions[d]->resolved->Equals(*dimension);
+				}
+				if (!is_excluded) {
+					partitions.push_back(ColumnRef(DimensionColumn(d)));
+				}
+			}
+		}
+		window.partitions = std::move(partitions);
+		for (auto &order : window.orders) {
+			map_key(order.expression);
+		}
+		for (auto &child : window.children) {
+			MapWindowDimensions(child, dimensions);
+		}
+		return;
+	}
+	ParsedExpressionIterator::EnumerateChildren(
+	    *expr, [&](unique_ptr<ParsedExpression> &child) { MapWindowDimensions(child, dimensions); });
+}
+
 SemanticQueryCompiler::SemanticQueryCompiler(const SemanticModel &model, ClientContext &context)
     : model(model), context(context), analyzer(model, context) {
 }
@@ -654,6 +715,7 @@ unique_ptr<SelectStatement> SemanticQueryCompiler::Compile(const SemanticQuerySp
 		if (item.kind == SemanticMemberKind::METRIC) {
 			expr = compiler.ReplaceAtoms(*posts[metric_index++],
 			                             [](idx_t atom) { return make_uniq<ColumnRefExpression>(AtomColumn(atom)); });
+			MapWindowDimensions(expr, dimensions);
 		} else {
 			expr = make_uniq<ColumnRefExpression>(DimensionColumn(dimension_index++));
 		}
@@ -667,14 +729,27 @@ unique_ptr<SelectStatement> SemanticQueryCompiler::Compile(const SemanticQuerySp
 	return result;
 }
 
-unique_ptr<SelectStatement> SemanticQueryCompiler::CompileMemberProbe(idx_t member) {
+unique_ptr<SelectStatement> SemanticQueryCompiler::CompileMemberProbe(idx_t member, idx_t &column) {
 	auto &entry = model.members[member];
 	SemanticQuerySpec spec;
+	if (entry.kind == SemanticMemberKind::METRIC) {
+		// window-function metrics can only be evaluated together with their window dimensions
+		set<idx_t> window_dimensions;
+		analyzer.WindowDimensions(*SemanticModel::MakeMemberMarker(member), window_dimensions);
+		for (auto dimension : window_dimensions) {
+			SemanticQueryItem item;
+			item.kind = SemanticMemberKind::DIMENSION;
+			item.resolved = SemanticModel::MakeMemberMarker(dimension);
+			item.output_name = "__sv_probe_d" + to_string(dimension);
+			spec.items.push_back(std::move(item));
+		}
+	}
 	SemanticQueryItem item;
 	item.kind = entry.kind == SemanticMemberKind::METRIC ? SemanticMemberKind::METRIC : SemanticMemberKind::FACT;
 	item.resolved = SemanticModel::MakeMemberMarker(member);
 	item.output_name = entry.name;
 	spec.items.push_back(std::move(item));
+	column = spec.items.size() - 1;
 	return Compile(spec);
 }
 
@@ -683,10 +758,11 @@ void ProbeSemanticModelTypes(ClientContext &context, SemanticModel &model) {
 	for (idx_t m = 0; m < model.members.size(); m++) {
 		auto &member = model.members[m];
 		try {
-			auto statement = compiler.CompileMemberProbe(m);
+			idx_t column;
+			auto statement = compiler.CompileMemberProbe(m, column);
 			auto binder = Binder::CreateBinder(context);
 			auto bound = binder->Bind(statement->Cast<SQLStatement>());
-			member.type = bound.types[0];
+			member.type = bound.types[column];
 		} catch (std::exception &ex) {
 			ErrorData error(ex);
 			throw BinderException("Invalid semantic view \"%s\": %s \"%s\": %s", model.name.name,

@@ -463,6 +463,27 @@ private:
 		for (idx_t m = 0; m < model->members.size(); m++) {
 			auto &member = model->members[m];
 			auto what = What(m);
+			// window-function metrics cannot be used by other semantic expressions
+			vector<idx_t> references;
+			CollectMemberRefs(*member.resolved, references);
+			for (auto reference : references) {
+				auto &target = model->members[reference];
+				if (target.kind == SemanticMemberKind::METRIC && SemanticAnalyzer::ContainsWindow(*target.resolved)) {
+					Fail("%s cannot reference window function metric \"%s\"", what,
+					     model->MemberDisplayName(reference));
+				}
+			}
+			if (member.kind == SemanticMemberKind::METRIC && SemanticAnalyzer::ContainsWindow(*member.resolved)) {
+				set<idx_t> dimensions;
+				analyzer.WindowDimensions(*member.resolved, dimensions);
+				for (auto dimension : dimensions) {
+					auto table = model->members[dimension].table;
+					if (!member.IsDerived() && !model->Reaches(member.table, table)) {
+						Fail("%s: window dimension \"%s\" is not accessible from logical table \"%s\"", what,
+						     model->MemberDisplayName(dimension), model->tables[member.table].name);
+					}
+				}
+			}
 			if (member.IsRowLevel()) {
 				CheckChildAggregations(analyzer, *member.resolved, member.table, what);
 				set<idx_t> tables;

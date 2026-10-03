@@ -2207,10 +2207,16 @@ WindowExcludeMode PEGTransformerFactory::TransformWindowExcludeElement(PEGTransf
 vector<unique_ptr<ParsedExpression>>
 PEGTransformerFactory::TransformWindowPartition(PEGTransformer &transformer, optional_ptr<ParseResult> parse_result) {
 	auto &list_pr = parse_result->Cast<ListParseResult>();
-	auto expression_list = ExtractParseResultsFromList(list_pr.Child<ListParseResult>(2));
+	auto expression_list = ExtractParseResultsFromList(list_pr.Child<ListParseResult>(3));
 	vector<unique_ptr<ParsedExpression>> result;
 	for (auto expression : expression_list) {
 		result.push_back(transformer.Transform<unique_ptr<ParsedExpression>>(expression));
+	}
+	if (list_pr.Child<OptionalParseResult>(2).HasResult()) {
+		// semantic_views: PARTITION BY EXCLUDING a, b -> PARTITION BY __sv_excluding(a, b)
+		auto excluding = make_uniq<FunctionExpression>("__sv_excluding", std::move(result));
+		result.clear();
+		result.push_back(std::move(excluding));
 	}
 	return result;
 }

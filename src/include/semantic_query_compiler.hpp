@@ -41,10 +41,12 @@ public:
 	//! Compiles a resolved query into a SELECT statement
 	unique_ptr<SelectStatement> Compile(const SemanticQuerySpec &spec);
 
-	//! Compiles a single member (including PRIVATE ones) for type probing
-	unique_ptr<SelectStatement> CompileMemberProbe(idx_t member);
+	//! Compiles a single member (including PRIVATE ones) for type probing; `column` is its output column
+	unique_ptr<SelectStatement> CompileMemberProbe(idx_t member, idx_t &column);
 
 private:
+	void MapWindowDimensions(unique_ptr<ParsedExpression> &expr, const vector<const SemanticQueryItem *> &dimensions);
+
 	const SemanticModel &model;
 	ClientContext &context;
 	SemanticAnalyzer analyzer;

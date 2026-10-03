@@ -278,11 +278,6 @@ static void ShowViews(ClientContext &context, TableFunctionBindInput &input, Row
 	}
 }
 
-//! Dimensions a window-function metric needs in the query (filled in by window metric support)
-static set<idx_t> RequiredWindowDimensions(const SemanticModel &model, idx_t metric) {
-	return set<idx_t>();
-}
-
 //! SHOW SEMANTIC DIMENSIONS IN <view> FOR METRIC <metric>: dimensions every aggregate of the metric can be grouped by
 static void ShowDimensionsForMetric(ClientContext &context, shared_ptr<SemanticModel> model, const string &metric_name,
                                     const string &like, RowsFunctionData &result, vector<LogicalType> &return_types,
@@ -320,7 +315,9 @@ static void ShowDimensionsForMetric(ClientContext &context, shared_ptr<SemanticM
 	auto &metric_member = model->members[metric];
 	analyzer.Decompose(*metric_member.resolved, metric_member.table, atoms, "Metric",
 	                   metric_member.using_relationships);
-	auto required = RequiredWindowDimensions(*model, metric);
+	// dimensions used by window clauses must be part of the query
+	set<idx_t> required;
+	analyzer.WindowDimensions(*SemanticModel::MakeMemberMarker(metric), required);
 	for (idx_t d = 0; d < model->members.size(); d++) {
 		auto &dimension = model->members[d];
 		if (dimension.kind != SemanticMemberKind::DIMENSION) {

@@ -1,0 +1,88 @@
+# name: test/sql/semantic_views/window_metrics.test
+# description: window-function metrics (Snowflake store_sales / date_dim example)
+# group: [semantic_views]
+
+require semantic_views
+
+statement ok
+PRAGMA enable_verification
+
+statement ok
+CREATE TABLE date_dim AS SELECT range::INTEGER + 1 AS d_date_sk, DATE '2024-01-01' + range::INTEGER AS d_date, 2024 AS d_year FROM range(10);
+
+statement ok
+CREATE TABLE store_sales AS SELECT range::INTEGER + 1 AS ss_sold_date_sk, range::INTEGER + 1 AS ss_quantity FROM range(10) UNION ALL SELECT 3, 5;
+
+statement ok
+CREATE SEMANTIC VIEW sv_window_function_example
+  TABLES (
+    store_sales,
+    date AS date_dim PRIMARY KEY (d_date_sk)
+  )
+  RELATIONSHIPS (
+    sales_to_date AS store_sales(ss_sold_date_sk) REFERENCES date(d_date_sk)
+  )
+  DIMENSIONS (
+    date.date AS d_date,
+    date.d_date_sk AS d_date_sk,
+    date.year AS d_year
+  )
+  METRICS (
+    store_sales.total_sales_quantity AS SUM(ss_quantity)
+      WITH SYNONYMS = ('Total sales quantity'),
+    store_sales.avg_3_days_sales_quantity AS AVG(total_sales_quantity)
+      OVER (PARTITION BY EXCLUDING date.date, date.year ORDER BY date.date
+        RANGE BETWEEN INTERVAL '2 days' PRECEDING AND CURRENT ROW),
+    store_sales.total_sales_quantity_2_days_ago AS LAG(total_sales_quantity, 2)
+      OVER (PARTITION BY EXCLUDING date.date, date.year ORDER BY date.date),
+    store_sales.running_total AS SUM(total_sales_quantity)
+      OVER (PARTITION BY date.year ORDER BY date.date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),
+    store_sales.share_of_year AS total_sales_quantity / SUM(total_sales_quantity) OVER (PARTITION BY date.year)
+  );
+
+query IIIIII
+SELECT date, year, total_sales_quantity, round(avg_3_days_sales_quantity, 3), total_sales_quantity_2_days_ago, running_total
+FROM SEMANTIC_VIEW(
+  sv_window_function_example
+  DIMENSIONS date.date, date.year
+  METRICS store_sales.total_sales_quantity, store_sales.avg_3_days_sales_quantity,
+          store_sales.total_sales_quantity_2_days_ago, store_sales.running_total
+) ORDER BY date;
+----
+2024-01-01	2024	1	1.0	NULL	1
+2024-01-02	2024	2	1.5	NULL	3
+2024-01-03	2024	8	3.667	1	11
+2024-01-04	2024	4	4.667	2	15
+2024-01-05	2024	5	5.667	8	20
+2024-01-06	2024	6	5.0	4	26
+2024-01-07	2024	7	6.0	5	33
+2024-01-08	2024	8	7.0	6	41
+2024-01-09	2024	9	8.0	7	50
+2024-01-10	2024	10	9.0	8	60
+
+query II
+SELECT year, round(sum(share_of_year), 6) FROM SEMANTIC_VIEW(sv_window_function_example DIMENSIONS date.date, date.year METRICS store_sales.share_of_year) GROUP BY 1;
+----
+2024	1.0
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(sv_window_function_example DIMENSIONS date.year METRICS store_sales.avg_3_days_sales_quantity);
+----
+Dimension 'date.date' used in a window function metric must be requested in the query.
+
+query III
+SELECT table_name, name, required FROM (SHOW SEMANTIC DIMENSIONS IN sv_window_function_example FOR METRIC avg_3_days_sales_quantity) ORDER BY name;
+----
+date	d_date_sk	false
+date	date	true
+date	year	true
+
+query II
+SELECT name, data_type FROM (SHOW SEMANTIC METRICS IN sv_window_function_example) WHERE name = 'running_total';
+----
+running_total	HUGEINT
+
+statement error
+CREATE SEMANTIC VIEW bad TABLES (store_sales, date AS date_dim PRIMARY KEY (d_date_sk)) RELATIONSHIPS (store_sales(ss_sold_date_sk) REFERENCES date) DIMENSIONS (date.date AS d_date) METRICS (store_sales.q AS SUM(ss_quantity), store_sales.w AS SUM(q) OVER (ORDER BY date.date), store_sales.bad AS w * 2);
+----
+cannot reference window function metric

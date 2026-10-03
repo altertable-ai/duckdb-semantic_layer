@@ -18,6 +18,8 @@
 
 namespace duckdb {
 
+static constexpr const char *SEMANTIC_EXCLUDING_MARKER = "__sv_excluding";
+
 //! An aggregate evaluated over the rows of `home`
 struct SemanticAtom {
 	idx_t home;
@@ -56,6 +58,12 @@ public:
 	                                       vector<SemanticAtom> &atoms, const string &what,
 	                                       const vector<idx_t> &using_relationships = {},
 	                                       idx_t non_additive_member = DConstants::INVALID_INDEX);
+
+	//! PARTITION BY EXCLUDING a, b is parsed as PARTITION BY __sv_excluding(a, b)
+	static bool IsExcludingMarker(const ParsedExpression &expr);
+	static bool ContainsWindow(const ParsedExpression &expr);
+	//! Dimensions referenced by the window clauses of a (metric-level) expression, following metric references
+	void WindowDimensions(const ParsedExpression &expr, set<idx_t> &dimensions) const;
 
 	static unique_ptr<ParsedExpression> MakeAtomRef(idx_t atom);
 	static bool IsAtomRef(const ParsedExpression &expr, idx_t &atom);

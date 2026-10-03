@@ -70,7 +70,9 @@ WindowFrameNameContentsParens <- Parens(BaseWindowName? WindowFrameContents)
 WindowFrameContentsParens <- Parens(WindowFrameContents)
 WindowFrameContents <- WindowPartition? OrderByClause? FrameClause?
 BaseWindowName <- Identifier
-WindowPartition <- 'PARTITION' 'BY' List(Expression)
+# semantic_views: PARTITION BY EXCLUDING (window-function metrics) lowers to __sv_excluding(...)
+WindowPartition <- 'PARTITION' 'BY' WindowPartitionExcluding? List(Expression)
+WindowPartitionExcluding <- 'EXCLUDING'
 ListExpression <- ArrayBoundedListExpression / ArrayParensSelect
 ArrayBoundedListExpression <- 'ARRAY'? BoundedListExpression
 ArrayParensSelect <- 'ARRAY' Parens(SelectStatementInternal)

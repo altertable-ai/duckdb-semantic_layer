@@ -8,6 +8,7 @@
 #include "duckdb/common/to_string.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/parser/expression/window_expression.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
 
 namespace duckdb {
@@ -137,6 +138,50 @@ idx_t SemanticAnalyzer::AggregateHome(const FunctionExpression &aggregate, idx_t
 	return FinestTable(tables, what);
 }
 
+bool SemanticAnalyzer::IsExcludingMarker(const ParsedExpression &expr) {
+	return expr.GetExpressionClass() == ExpressionClass::FUNCTION &&
+	       StringUtil::CIEquals(expr.Cast<FunctionExpression>().function_name, SEMANTIC_EXCLUDING_MARKER);
+}
+
+bool SemanticAnalyzer::ContainsWindow(const ParsedExpression &expr) {
+	if (expr.GetExpressionClass() == ExpressionClass::WINDOW) {
+		return true;
+	}
+	bool found = false;
+	ParsedExpressionIterator::EnumerateChildren(
+	    expr, [&](const ParsedExpression &child) { found = found || ContainsWindow(child); });
+	return found;
+}
+
+void SemanticAnalyzer::WindowDimensions(const ParsedExpression &expr, set<idx_t> &dimensions) const {
+	if (expr.GetExpressionClass() == ExpressionClass::WINDOW) {
+		auto &window = expr.Cast<WindowExpression>();
+		std::function<void(const ParsedExpression &)> collect = [&](const ParsedExpression &key) {
+			idx_t member;
+			if (SemanticModel::IsMemberMarker(key, member)) {
+				if (model.members[member].IsRowLevel()) {
+					dimensions.insert(member);
+				}
+				return;
+			}
+			ParsedExpressionIterator::EnumerateChildren(key, collect);
+		};
+		for (auto &partition : window.partitions) {
+			collect(*partition);
+		}
+		for (auto &order : window.orders) {
+			collect(*order.expression);
+		}
+	}
+	idx_t member;
+	if (SemanticModel::IsMemberMarker(expr, member) && model.members[member].kind == SemanticMemberKind::METRIC) {
+		WindowDimensions(*model.members[member].resolved, dimensions);
+		return;
+	}
+	ParsedExpressionIterator::EnumerateChildren(
+	    expr, [&](const ParsedExpression &child) { WindowDimensions(child, dimensions); });
+}
+
 unique_ptr<ParsedExpression> SemanticAnalyzer::MakeAtomRef(idx_t atom) {
 	vector<string> names {SEMANTIC_ATOM_MARKER, to_string(atom)};
 	return make_uniq<ColumnRefExpression>(std::move(names));
@@ -159,6 +204,7 @@ unique_ptr<ParsedExpression> SemanticAnalyzer::Decompose(const ParsedExpression 
                                                          const vector<idx_t> &using_relationships,
                                                          idx_t non_additive_member) {
 	auto result = expr.Copy();
+	std::function<void(unique_ptr<ParsedExpression> &)> rewrite_window_key;
 	std::function<void(unique_ptr<ParsedExpression> &)> rewrite = [&](unique_ptr<ParsedExpression> &node) {
 		if (IsAggregate(*node)) {
 			SemanticAtom atom;
@@ -195,9 +241,50 @@ unique_ptr<ParsedExpression> SemanticAnalyzer::Decompose(const ParsedExpression 
 			                      model.tables[table].name, column);
 		}
 		if (node->GetExpressionClass() == ExpressionClass::WINDOW) {
-			throw NotImplementedException("%s: window function metrics are not supported yet", what);
+			// window-function metric: the window is evaluated over the aggregated rows. Its arguments are
+			// metric-level; PARTITION BY / ORDER BY keep their dimension references, which the compiler maps onto
+			// the query's dimension columns.
+			auto &window = node->Cast<WindowExpression>();
+			for (auto &child : window.children) {
+				rewrite(child);
+			}
+			if (window.filter_expr) {
+				rewrite(window.filter_expr);
+			}
+			for (auto &partition : window.partitions) {
+				rewrite_window_key(partition);
+			}
+			for (auto &order : window.orders) {
+				rewrite_window_key(order.expression);
+			}
+			return;
 		}
 		ParsedExpressionIterator::EnumerateChildren(*node, rewrite);
+	};
+	rewrite_window_key = [&](unique_ptr<ParsedExpression> &node) {
+		idx_t member;
+		if (SemanticModel::IsMemberMarker(*node, member) && model.members[member].IsRowLevel()) {
+			return;
+		}
+		if (IsExcludingMarker(*node)) {
+			for (auto &child : node->Cast<FunctionExpression>().children) {
+				if (!SemanticModel::IsMemberMarker(*child, member) || !model.members[member].IsRowLevel()) {
+					throw BinderException("%s: PARTITION BY EXCLUDING only accepts dimensions", what);
+				}
+			}
+			return;
+		}
+		idx_t table;
+		string column;
+		if (SemanticModel::IsColumnMarker(*node, table, column)) {
+			throw BinderException("%s: the window clause must reference dimensions or metrics, not column \"%s.%s\"",
+			                      what, model.tables[table].name, column);
+		}
+		if (IsAggregate(*node) || SemanticModel::IsMemberMarker(*node, member)) {
+			rewrite(node);
+			return;
+		}
+		ParsedExpressionIterator::EnumerateChildren(*node, rewrite_window_key);
 	};
 	rewrite(result);
 	return result;
