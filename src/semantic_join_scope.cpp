@@ -84,6 +84,9 @@ unique_ptr<ParsedExpression> SemanticJoinScope::RangeLookup(const vector<Semanti
 	node->select_list.push_back(std::move(value));
 	node->from_table = inner.BuildFrom();
 	vector<unique_ptr<ParsedExpression>> conditions;
+	// Open bounds remove limits on known values; they do not turn a NULL referencing value into a match.
+	conditions.push_back(make_uniq<OperatorExpression>(ExpressionType::OPERATOR_IS_NOT_NULL,
+	                                                   ColumnRef(rel.from_columns[0], source_alias)));
 	conditions.push_back(bound(rel.range_start, ExpressionType::COMPARE_GREATERTHANOREQUALTO));
 	conditions.push_back(bound(rel.range_end, ExpressionType::COMPARE_LESSTHAN));
 	node->where_clause = AndAll(std::move(conditions));

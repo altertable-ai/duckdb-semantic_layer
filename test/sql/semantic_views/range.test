@@ -126,3 +126,32 @@ CREATE SEMANTIC VIEW no_constraint
   METRICS (e.events AS COUNT(*));
 ----
 DISTINCT RANGE
+
+# NULL referencing values never match, even when both range bounds are open.
+statement ok
+CREATE TABLE all_time_periods (name VARCHAR, start_at TIMESTAMP, end_at TIMESTAMP);
+INSERT INTO all_time_periods VALUES ('all_time', NULL, NULL);
+CREATE TABLE nullable_events (id INTEGER, ts TIMESTAMP);
+INSERT INTO nullable_events VALUES (1, NULL), (2, '2024-01-01');
+CREATE SEMANTIC VIEW all_time_view
+  TABLES (e AS nullable_events, p AS all_time_periods CONSTRAINT DISTINCT RANGE BETWEEN start_at AND end_at EXCLUSIVE)
+  RELATIONSHIPS (e (ts) REFERENCES p (BETWEEN start_at AND end_at EXCLUSIVE))
+  DIMENSIONS (e.id AS id, p.period AS name)
+  METRICS (e.events AS COUNT(*));
+
+query III
+SELECT * FROM SEMANTIC_VIEW(all_time_view DIMENSIONS e.id, p.period METRICS e.events) ORDER BY id;
+----
+1	NULL	1
+2	all_time	1
+
+query II
+SELECT * FROM SEMANTIC_VIEW(all_time_view FACTS e.id, p.period) ORDER BY id;
+----
+1	NULL
+2	all_time
+
+query I
+SELECT * FROM SEMANTIC_VIEW(all_time_view METRICS e.events WHERE p.period = 'all_time');
+----
+1
