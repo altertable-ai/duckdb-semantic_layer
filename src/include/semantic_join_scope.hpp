@@ -11,6 +11,7 @@
 #pragma once
 
 #include "duckdb/common/set.hpp"
+#include "duckdb/common/string.hpp"
 #include "duckdb/common/to_string.hpp"
 #include "semantic_model.hpp"
 
