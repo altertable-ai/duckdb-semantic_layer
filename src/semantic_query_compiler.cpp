@@ -694,7 +694,24 @@ unique_ptr<SelectStatement> SemanticQueryCompiler::CompileRowQuery(SemanticExpre
                                                                    SemanticAliasGenerator &aliases,
                                                                    const SemanticQuerySpec &spec, bool has_dimensions,
                                                                    bool has_facts, const set<idx_t> &row_tables) {
-	auto base = analyzer.FinestTable(row_tables, "Invalid SEMANTIC_VIEW query");
+	auto base = DConstants::INVALID_INDEX;
+	if (!has_facts && !row_tables.empty()) {
+		// no referenced table reaches the others: dimensions related through a many-to-many bridge
+		bool related = false;
+		for (auto candidate : row_tables) {
+			bool reaches_all = true;
+			for (auto other : row_tables) {
+				reaches_all = reaches_all && model.Reaches(candidate, other);
+			}
+			related = related || reaches_all;
+		}
+		if (!related) {
+			base = SemanticBridgeResolver(model).CommonBase(row_tables);
+		}
+	}
+	if (base == DConstants::INVALID_INDEX) {
+		base = analyzer.FinestTable(row_tables, "Invalid SEMANTIC_VIEW query");
+	}
 	if (base == DConstants::INVALID_INDEX) {
 		throw BinderException("SEMANTIC_VIEW must reference at least one dimension or fact");
 	}

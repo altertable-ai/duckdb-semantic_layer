@@ -3,6 +3,7 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "semantic_analysis.hpp"
+#include "semantic_bridge.hpp"
 #include "semantic_lowering.hpp"
 #include "semantic_view_registry.hpp"
 #include "semantic_views_functions.hpp"
@@ -112,6 +113,17 @@ static unique_ptr<FunctionData> ShowMembersBind(ClientContext &context, TableFun
 //===--------------------------------------------------------------------===//
 // SHOW SEMANTIC DIMENSIONS IN view FOR METRIC m: dimensions every aggregate of the metric can be grouped by
 //===--------------------------------------------------------------------===//
+//! Whether `table` is reachable from `home` through a single, unambiguous many-to-many bridge
+static bool ReachesThroughBridge(const SemanticModel &model, idx_t home, idx_t table,
+                                 const vector<idx_t> &using_relationships) {
+	SemanticBridge bridge;
+	try {
+		return SemanticBridgeResolver(model).Resolve(home, {table}, using_relationships, bridge);
+	} catch (BinderException &) {
+		return false;
+	}
+}
+
 static unique_ptr<FunctionData> ShowForMetricBind(ClientContext &context, TableFunctionBindInput &input,
                                                   vector<LogicalType> &return_types, vector<string> &names) {
 	names = {"table_name", "name", "data_type", "required", "synonyms", "comment"};
@@ -146,7 +158,9 @@ static unique_ptr<FunctionData> ShowForMetricBind(ClientContext &context, TableF
 		}
 		bool valid = true;
 		for (auto &atom : atoms) {
-			valid = valid && model->Reaches(atom.home, dimension.table);
+			valid =
+			    valid && (model->Reaches(atom.home, dimension.table) ||
+			              ReachesThroughBridge(*model, atom.home, dimension.table, atom.context.using_relationships));
 		}
 		if (valid) {
 			result->rows.push_back({TableName(*model, dimension), Value(dimension.Name()), TypeName(dimension),

@@ -244,3 +244,42 @@ Ann	300	300
 Bob	100	400
 Cid	500	NULL
 NULL	400	300
+
+# dimensions only: the combinations that occur through the bridge
+query II
+SELECT * FROM SEMANTIC_VIEW(library DIMENSIONS books.category, authors.country) ORDER BY 1, 2;
+----
+essay	US
+novel	FR
+novel	US
+
+query I
+SELECT * FROM SEMANTIC_VIEW(library DIMENSIONS authors.author_name WHERE books.category = 'essay') ORDER BY 1;
+----
+Cid
+
+# dimensions available for a metric include those reached through a bridge, not the bridge's own
+query II
+SELECT table_name, name FROM (SHOW SEMANTIC DIMENSIONS IN library FOR METRIC books.total_pages) ORDER BY 1, 2;
+----
+authors	active
+authors	author_name
+authors	country
+books	category
+genres	genre_name
+
+# ambiguous bridges are not listed
+query II
+SELECT table_name, name FROM (SHOW SEMANTIC DIMENSIONS IN library_reviews FOR METRIC books.total_pages) ORDER BY 1, 2;
+----
+
+query II
+SELECT table_name, name FROM (SHOW SEMANTIC DIMENSIONS IN library_reviews FOR METRIC books.written_pages) ORDER BY 1, 2;
+----
+authors	author_name
+
+# the bridge becomes a de-duplicated mapping subquery
+query I
+SELECT sql ILIKE '%SELECT DISTINCT%book_authors%' FROM semantic_view_sql('SELECT * FROM SEMANTIC_VIEW(library DIMENSIONS authors.country METRICS books.total_pages)');
+----
+true
