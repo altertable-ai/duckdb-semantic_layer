@@ -2,6 +2,7 @@
 #include "duckdb/common/exception/catalog_exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "semantic_catalog.hpp"
 #include "semantic_lowering.hpp"
 #include "semantic_view_registry.hpp"
 #include "semantic_views_functions.hpp"
@@ -13,7 +14,7 @@ struct SemanticDDLData : public TableFunctionData {
 	explicit SemanticDDLData(shared_ptr<SemanticViewsState> state_p, QualifiedName name_p)
 	    : state(std::move(state_p)), name(std::move(name_p)) {
 	}
-	virtual string Execute() const = 0;
+	virtual string Execute(ClientContext &context) const = 0;
 
 	string DisplayName() const {
 		return StringUtil::Upper(name.name);
@@ -31,14 +32,14 @@ static unique_ptr<GlobalTableFunctionState> SemanticDDLInit(ClientContext &, Tab
 	return make_uniq<SemanticDDLState>();
 }
 
-static void SemanticDDLScan(ClientContext &, TableFunctionInput &data_p, DataChunk &output) {
+static void SemanticDDLScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
 	auto &state = data_p.global_state->Cast<SemanticDDLState>();
 	if (state.done) {
 		output.SetCardinality(0);
 		return;
 	}
 	state.done = true;
-	output.SetValue(0, 0, Value(data_p.bind_data->Cast<SemanticDDLData>().Execute()));
+	output.SetValue(0, 0, Value(data_p.bind_data->Cast<SemanticDDLData>().Execute(context)));
 	output.SetCardinality(1);
 }
 
@@ -56,8 +57,9 @@ struct SemanticCreateData : public SemanticDDLData {
 	shared_ptr<SemanticModel> model;
 	OnCreateConflict on_conflict;
 
-	string Execute() const override {
+	string Execute(ClientContext &context) const override {
 		if (model && state->registry.Create(model, on_conflict == OnCreateConflict::REPLACE_ON_CONFLICT)) {
+			CreateSemanticPlaceholder(context, *model);
 			return "Semantic view " + DisplayName() + " successfully created.";
 		}
 		if (on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT) {
@@ -76,6 +78,7 @@ static unique_ptr<FunctionData> SemanticCreateBind(ClientContext &context, Table
 	result->on_conflict = EnumUtil::FromString<OnCreateConflict>(StringArgument(input, 1));
 	bool skip = result->on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT && state->registry.Get(result->name);
 	if (!skip) {
+		PrepareSemanticPlaceholder(context, input.binder, result->name, true);
 		result->model = BuildSemanticModel(context, *definition, result->name);
 	}
 	return std::move(result);
@@ -88,8 +91,11 @@ struct SemanticDropData : public SemanticDDLData {
 	using SemanticDDLData::SemanticDDLData;
 	bool if_exists;
 
-	string Execute() const override {
-		if (state->registry.Drop(name)) {
+	string Execute(ClientContext &context) const override {
+		auto dropped = state->registry.Drop(name);
+		// also drops a placeholder left in a database file by a previous session
+		dropped = DropSemanticPlaceholder(context, name) || dropped;
+		if (dropped) {
 			return DisplayName() + " successfully dropped.";
 		}
 		if (if_exists) {
@@ -105,6 +111,7 @@ static unique_ptr<FunctionData> SemanticDropBind(ClientContext &context, TableFu
 	auto result = make_uniq<SemanticDropData>(input.info->Cast<SemanticViewsFunctionInfo>().state,
 	                                          SemanticViewRegistry::ResolveDDLName(context, NameArguments(input, 0)));
 	result->if_exists = BooleanValue::Get(input.inputs[3]);
+	PrepareSemanticPlaceholder(context, input.binder, result->name, false);
 	return std::move(result);
 }
 
@@ -118,7 +125,7 @@ struct SemanticAlterData : public SemanticDDLData {
 	shared_ptr<SemanticModel> existing;
 	shared_ptr<SemanticModel> model;
 
-	string Execute() const override {
+	string Execute(ClientContext &context) const override {
 		if (!existing) {
 			if (if_exists) {
 				return "Statement executed successfully.";
@@ -128,6 +135,10 @@ struct SemanticAlterData : public SemanticDDLData {
 		if (!state->registry.Replace(*existing, model)) {
 			throw CatalogException("Semantic view \"%s\" was dropped or altered by a concurrent statement", name.name);
 		}
+		if (!StringUtil::CIEquals(existing->Name().name, model->Name().name)) {
+			DropSemanticPlaceholder(context, existing->Name());
+		}
+		CreateSemanticPlaceholder(context, *model);
 		return "Statement executed successfully.";
 	}
 };
@@ -146,6 +157,9 @@ static unique_ptr<FunctionData> SemanticAlterBind(ClientContext &context, TableF
 		edit(*definition);
 		result->model = BuildSemanticModel(context, *definition, definition->name);
 		result->model->created_on = result->existing->created_on;
+		PrepareSemanticPlaceholder(context, input.binder, result->name, false);
+		PrepareSemanticPlaceholder(context, input.binder, definition->name,
+		                           !StringUtil::CIEquals(definition->name.name, result->name.name));
 	}
 	return std::move(result);
 }

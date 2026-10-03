@@ -215,15 +215,17 @@ SELECT a.status, b.revenue FROM (SELECT status FROM shop GROUP BY status) a JOIN
 closed	50.00
 open	317.00
 
-# a real table with the same name wins
+# a semantic view cannot share its name with a table or view (they share the catalog namespace)
 statement ok
 CREATE TABLE shadowed (x INTEGER);
 
 statement ok
 INSERT INTO shadowed VALUES (42);
 
-statement ok
+statement error
 CREATE SEMANTIC VIEW shadowed TABLES (o AS orders PRIMARY KEY (id)) METRICS (o.n AS COUNT(*));
+----
+Cannot create semantic view "shadowed": a table or view with that name already exists
 
 query I
 SELECT * FROM shadowed;

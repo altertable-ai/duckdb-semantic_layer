@@ -14,6 +14,7 @@
 #include "duckdb/parser/tableref/basetableref.hpp"
 #include "semantic_analysis.hpp"
 #include "semantic_ast_helpers.hpp"
+#include "semantic_catalog.hpp"
 #include "semantic_lowering.hpp"
 #include "semantic_statement_visitor.hpp"
 #include "semantic_view_registry.hpp"
@@ -418,9 +419,12 @@ private:
 		if (!model) {
 			return nullptr;
 		}
-		// a real table or view of that name takes precedence
+		// a real table or view of that name (another catalog's, or a CTE) takes precedence over the semantic view; its
+		// own catalog entry is a placeholder
 		EntryLookupInfo lookup(CatalogType::TABLE_ENTRY, ref.table_name);
-		if (Catalog::GetEntry(context, ref.catalog_name, ref.schema_name, lookup, OnEntryNotFound::RETURN_NULL)) {
+		auto entry =
+		    Catalog::GetEntry(context, ref.catalog_name, ref.schema_name, lookup, OnEntryNotFound::RETURN_NULL);
+		if (entry && !IsSemanticPlaceholder(*entry)) {
 			return nullptr;
 		}
 		return model;

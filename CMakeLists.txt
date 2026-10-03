@@ -25,6 +25,7 @@ set(EXTENSION_SOURCES
     src/parsed_semantic_view.cpp
     src/semantic_analysis.cpp
     src/semantic_bridge.cpp
+    src/semantic_catalog.cpp
     src/semantic_join_scope.cpp
     src/semantic_markers.cpp
     src/semantic_model.cpp
