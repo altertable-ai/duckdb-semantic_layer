@@ -100,8 +100,13 @@ private:
 
 	vector<string> ResolveColumns(const SemanticTable &table, const vector<string> &columns, const string &what) {
 		vector<string> result;
+		case_insensitive_set_t seen;
 		for (auto &column : columns) {
-			result.push_back(ResolveColumn(table, column, what));
+			auto resolved = ResolveColumn(table, column, what);
+			if (!seen.insert(resolved).second) {
+				Fail("Duplicate %s column \"%s\" in logical table \"%s\"", what, resolved, table.name);
+			}
+			result.push_back(std::move(resolved));
 		}
 		return result;
 	}

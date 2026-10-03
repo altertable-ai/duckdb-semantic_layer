@@ -100,3 +100,24 @@ statement error
 CREATE SEMANTIC VIEW sv TABLES (o AS orders PRIMARY KEY (id), c AS customers PRIMARY KEY (id)) METRICS (o.m AS SUM(o.amount), c.m AS COUNT(*), total AS m * 2);
 ----
 Ambiguous name "m"
+
+# Repeated key columns must not make a partial composite key look unique.
+statement error
+CREATE SEMANTIC VIEW duplicate_pk TABLES (c AS customers PRIMARY KEY (id, ID)) METRICS (c.n AS COUNT(*));
+----
+Duplicate PRIMARY KEY column "id"
+
+statement error
+CREATE SEMANTIC VIEW duplicate_unique TABLES (c AS customers UNIQUE (id, ID)) METRICS (c.n AS COUNT(*));
+----
+Duplicate UNIQUE column "id"
+
+statement error
+CREATE SEMANTIC VIEW duplicate_reference TABLES (o AS orders, c AS customers PRIMARY KEY (id, region_id)) RELATIONSHIPS (o (customer_id, id) REFERENCES c (id, ID)) METRICS (o.n AS COUNT(*));
+----
+Duplicate Relationship column "id"
+
+statement error
+CREATE SEMANTIC VIEW duplicate_foreign_key TABLES (o AS orders, c AS customers PRIMARY KEY (id, region_id)) RELATIONSHIPS (o (customer_id, CUSTOMER_ID) REFERENCES c) METRICS (o.n AS COUNT(*));
+----
+Duplicate Relationship column "customer_id"
