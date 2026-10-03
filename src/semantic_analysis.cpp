@@ -93,17 +93,9 @@ idx_t SemanticAnalyzer::FinestTable(const set<idx_t> &tables, const string &what
 	if (tables.empty()) {
 		return DConstants::INVALID_INDEX;
 	}
-	for (auto candidate : tables) {
-		bool reaches_all = true;
-		for (auto other : tables) {
-			if (!model.Reaches(candidate, other)) {
-				reaches_all = false;
-				break;
-			}
-		}
-		if (reaches_all) {
-			return candidate;
-		}
+	auto finest = model.FinestTable(tables);
+	if (finest.IsValid()) {
+		return finest.GetIndex();
 	}
 	vector<string> names;
 	for (auto table : tables) {

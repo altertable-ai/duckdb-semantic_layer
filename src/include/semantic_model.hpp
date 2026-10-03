@@ -11,6 +11,8 @@
 #pragma once
 
 #include "duckdb/common/case_insensitive_map.hpp"
+#include "duckdb/common/optional_idx.hpp"
+#include "duckdb/common/set.hpp"
 #include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
 #include "parsed_semantic_view.hpp"
@@ -154,6 +156,8 @@ public:
 	bool Reaches(idx_t from, idx_t to) const {
 		return path_count[from][to] > 0;
 	}
+	//! The table of `tables` from which every other one is reachable; invalid when there is none (or `tables` is empty)
+	optional_idx FinestTable(const set<idx_t> &tables) const;
 	//! The unique path from -> to (empty when from == to); throws when there are several paths.
 	//! `using_relationships` (USING on metrics) restricts how the tables they reference are reached.
 	vector<SemanticEdge> Path(idx_t from, idx_t to, const vector<idx_t> &using_relationships = {}) const;

@@ -50,26 +50,17 @@ bool SemanticBridgeResolver::TryCandidate(idx_t home, idx_t bridge, const set<id
 		}
 	}
 	// the anchor: the finest table both sides reach
-	vector<idx_t> common;
+	set<idx_t> common;
 	for (idx_t t = 0; t < model.tables.size(); t++) {
 		if (model.Reaches(bridge, t) && model.Reaches(home, t)) {
-			common.push_back(t);
+			common.insert(t);
 		}
 	}
-	idx_t anchor = DConstants::INVALID_INDEX;
-	for (auto candidate : common) {
-		bool finest = true;
-		for (auto other : common) {
-			finest = finest && model.Reaches(candidate, other);
-		}
-		if (finest) {
-			anchor = candidate;
-			break;
-		}
-	}
-	if (anchor == DConstants::INVALID_INDEX) {
+	auto finest = model.FinestTable(common);
+	if (!finest.IsValid()) {
 		return false;
 	}
+	auto anchor = finest.GetIndex();
 	vector<SemanticEdge> anchor_path;
 	if (!PathFrom(bridge, anchor, using_relationships, anchor_path)) {
 		return false;

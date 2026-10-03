@@ -94,6 +94,19 @@ string SemanticModel::MemberDisplayName(idx_t member_idx) const {
 //===--------------------------------------------------------------------===//
 // Graph
 //===--------------------------------------------------------------------===//
+optional_idx SemanticModel::FinestTable(const set<idx_t> &tables) const {
+	for (auto candidate : tables) {
+		bool reaches_all = true;
+		for (auto other : tables) {
+			reaches_all = reaches_all && Reaches(candidate, other);
+		}
+		if (reaches_all) {
+			return candidate;
+		}
+	}
+	return optional_idx();
+}
+
 vector<SemanticEdge> SemanticModel::Path(idx_t from, idx_t to, const vector<idx_t> &using_relationships) const {
 	if (from == to) {
 		return {};
