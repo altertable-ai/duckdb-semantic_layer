@@ -221,3 +221,40 @@ query I
 SELECT name FROM (SHOW SEMANTIC METRICS IN racy);
 ----
 first_metric
+
+# like DROP VIEW / ALTER VIEW: IF EXISTS tolerates a missing schema, not a missing database
+statement ok
+DROP SEMANTIC VIEW IF EXISTS nosuchschema.x;
+
+statement ok
+ALTER SEMANTIC VIEW IF EXISTS nosuchschema.x RENAME TO y;
+
+statement error
+DROP SEMANTIC VIEW nosuchschema.x;
+----
+Schema with name nosuchschema does not exist
+
+statement error
+DROP SEMANTIC VIEW IF EXISTS nosuchdb.main.x;
+----
+Catalog "nosuchdb" does not exist!
+
+# a read-only transaction cannot drop the catalog view of a semantic view, but statements that change nothing pass
+statement ok
+BEGIN TRANSACTION READ ONLY;
+
+statement ok
+DROP SEMANTIC VIEW IF EXISTS missing;
+
+statement error
+DROP SEMANTIC VIEW shop2;
+----
+read-only mode
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM (SHOW SEMANTIC VIEWS LIKE 'shop2');
+----
+1

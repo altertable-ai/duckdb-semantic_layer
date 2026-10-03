@@ -48,14 +48,16 @@ vector<SemanticCatalogColumn> SemanticCatalogColumns(const SemanticModel &model)
 	return result;
 }
 
-//! The catalog holding the placeholder of `name`, or nullptr when it gets none: read-only databases, and catalogs
-//! that are not DuckDB's own (an attached Postgres or SQLite database would get a real view)
+//! The catalog holding the placeholder of `name`, or nullptr when it gets none: a database or schema that does not
+//! exist, read-only databases, and catalogs that are not DuckDB's own (an attached Postgres or SQLite database would
+//! get a real view)
 static optional_ptr<Catalog> PlaceholderCatalog(ClientContext &context, const QualifiedName &name) {
-	auto &catalog = Catalog::GetCatalog(context, name.catalog);
-	if (catalog.IsSystemCatalog() || !catalog.IsDuckCatalog() || catalog.GetAttached().IsReadOnly()) {
+	auto catalog = Catalog::GetCatalogEntry(context, name.catalog);
+	if (!catalog || catalog->IsSystemCatalog() || !catalog->IsDuckCatalog() || catalog->GetAttached().IsReadOnly() ||
+	    !catalog->GetSchema(context, name.schema, OnEntryNotFound::RETURN_NULL)) {
 		return nullptr;
 	}
-	return &catalog;
+	return catalog;
 }
 
 static optional_ptr<CatalogEntry> ExistingEntry(ClientContext &context, const QualifiedName &name) {
@@ -75,7 +77,13 @@ void BindSemanticViewChange(ClientContext &context, optional_ptr<Binder> binder,
 		if (!catalog) {
 			continue;
 		}
-		if (name == &after && !SameView(before, after)) {
+		if (name == &before) {
+			// dropped or renamed: the catalog only changes when the placeholder exists
+			auto entry = ExistingEntry(context, before);
+			if (!entry || !IsSemanticPlaceholder(*entry)) {
+				continue;
+			}
+		} else if (!SameView(before, after)) {
 			auto entry = ExistingEntry(context, after);
 			if (entry && !IsSemanticPlaceholder(*entry)) {
 				throw CatalogException(

@@ -19,7 +19,7 @@ static bool IsSet(const string &part, const string &invalid) {
 }
 
 QualifiedName SemanticViewRegistry::ResolveSchema(ClientContext &context, const string &catalog_p,
-                                                  const string &schema_p) {
+                                                  const string &schema_p, OnEntryNotFound if_not_found) {
 	string catalog = IsSet(catalog_p, INVALID_CATALOG) ? catalog_p : string();
 	string schema = IsSet(schema_p, INVALID_SCHEMA) ? schema_p : string();
 	if (catalog.empty() && !schema.empty()) {
@@ -38,16 +38,18 @@ QualifiedName SemanticViewRegistry::ResolveSchema(ClientContext &context, const 
 	if (schema.empty() || schema == INVALID_SCHEMA) {
 		schema = search_path.GetDefaultSchema(context, catalog);
 	}
-	// validates that the schema exists (and normalizes the spelling of catalog / schema)
-	auto &schema_entry = Catalog::GetSchema(context, catalog, schema);
+	// validates that the database and schema exist (and normalizes the spelling of catalog / schema)
+	Catalog::GetCatalog(context, catalog);
+	auto schema_entry = Catalog::GetSchema(context, catalog, schema, if_not_found);
 	QualifiedName result;
-	result.catalog = schema_entry.ParentCatalog().GetName();
-	result.schema = schema_entry.name;
+	result.catalog = schema_entry ? schema_entry->ParentCatalog().GetName() : catalog;
+	result.schema = schema_entry ? schema_entry->name : schema;
 	return result;
 }
 
-QualifiedName SemanticViewRegistry::ResolveDDLName(ClientContext &context, const QualifiedName &name) {
-	auto result = ResolveSchema(context, name.catalog, name.schema);
+QualifiedName SemanticViewRegistry::ResolveDDLName(ClientContext &context, const QualifiedName &name,
+                                                   OnEntryNotFound if_not_found) {
+	auto result = ResolveSchema(context, name.catalog, name.schema, if_not_found);
 	result.name = name.name;
 	return result;
 }

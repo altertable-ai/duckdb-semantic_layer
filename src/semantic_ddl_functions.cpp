@@ -43,6 +43,10 @@ static void SemanticDDLScan(ClientContext &context, TableFunctionInput &data_p, 
 	output.SetCardinality(1);
 }
 
+static OnEntryNotFound IfNotFound(bool if_exists) {
+	return if_exists ? OnEntryNotFound::RETURN_NULL : OnEntryNotFound::THROW_EXCEPTION;
+}
+
 static void StatusColumn(vector<LogicalType> &return_types, vector<string> &names) {
 	names.emplace_back("status");
 	return_types.emplace_back(LogicalType::VARCHAR);
@@ -111,9 +115,11 @@ struct SemanticDropData : public SemanticDDLData {
 static unique_ptr<FunctionData> SemanticDropBind(ClientContext &context, TableFunctionBindInput &input,
                                                  vector<LogicalType> &return_types, vector<string> &names) {
 	StatusColumn(return_types, names);
-	auto result = make_uniq<SemanticDropData>(input.info->Cast<SemanticViewsFunctionInfo>().state,
-	                                          SemanticViewRegistry::ResolveDDLName(context, NameArguments(input, 0)));
-	result->if_exists = BooleanValue::Get(input.inputs[3]);
+	auto if_exists = BooleanValue::Get(input.inputs[3]);
+	auto result = make_uniq<SemanticDropData>(
+	    input.info->Cast<SemanticViewsFunctionInfo>().state,
+	    SemanticViewRegistry::ResolveDDLName(context, NameArguments(input, 0), IfNotFound(if_exists)));
+	result->if_exists = if_exists;
 	BindSemanticViewChange(context, input.binder, result->name, QualifiedName());
 	return std::move(result);
 }
@@ -148,9 +154,10 @@ static unique_ptr<FunctionData> SemanticAlterBind(ClientContext &context, TableF
                                                   vector<LogicalType> &return_types, vector<string> &names, EDIT edit) {
 	StatusColumn(return_types, names);
 	auto &state = input.info->Cast<SemanticViewsFunctionInfo>().state;
-	auto result =
-	    make_uniq<SemanticAlterData>(state, SemanticViewRegistry::ResolveDDLName(context, NameArguments(input, 0)));
-	result->if_exists = BooleanValue::Get(input.inputs[3]);
+	auto if_exists = BooleanValue::Get(input.inputs[3]);
+	auto result = make_uniq<SemanticAlterData>(
+	    state, SemanticViewRegistry::ResolveDDLName(context, NameArguments(input, 0), IfNotFound(if_exists)));
+	result->if_exists = if_exists;
 	result->existing = state->registry.Get(result->name);
 	if (result->existing) {
 		auto definition = result->existing->definition->Copy();
