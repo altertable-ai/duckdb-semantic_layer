@@ -35,7 +35,7 @@ public:
 
 	void Rewrite(SelectNode &node) {
 		CheckSupported(node);
-		auto orders = OrderExpressions(node);
+		auto orders = ModifierExpressions(node);
 		NormalizeClauses(node, orders);
 		CollectGroups(node);
 		auto aggregated = HasAggregation(orders);
@@ -77,12 +77,16 @@ private:
 		}
 	}
 
-	static vector<unique_ptr<ParsedExpression> *> OrderExpressions(SelectNode &node) {
+	static vector<unique_ptr<ParsedExpression> *> ModifierExpressions(SelectNode &node) {
 		vector<unique_ptr<ParsedExpression> *> result;
 		for (auto &modifier : node.modifiers) {
 			if (modifier->type == ResultModifierType::ORDER_MODIFIER) {
 				for (auto &order : modifier->Cast<OrderModifier>().orders) {
 					result.push_back(&order.expression);
+				}
+			} else if (modifier->type == ResultModifierType::DISTINCT_MODIFIER) {
+				for (auto &target : modifier->Cast<DistinctModifier>().distinct_on_targets) {
+					result.push_back(&target);
 				}
 			}
 		}
@@ -107,6 +111,7 @@ private:
 		}
 		for (auto order : orders) {
 			*order = Normalize(**order);
+			CheckNoWindow(**order);
 		}
 	}
 
@@ -350,7 +355,31 @@ private:
 				return make_uniq<ColumnRefExpression>(FactColumn(i));
 			}
 		}
-		return expr.Copy();
+		if (expr.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+			auto &colref = expr.Cast<ColumnRefExpression>();
+			if (!colref.IsQualified()) {
+				for (idx_t i = 0; i < select.size(); i++) {
+					if (StringUtil::CIEquals(OutputName(i), colref.GetColumnName())) {
+						return expr.Copy();
+					}
+				}
+			}
+			CheckNotMetric(expr);
+			for (auto &item : query.items) {
+				if (item.expression->Equals(expr)) {
+					return ColumnRef(item.alias);
+				}
+			}
+			// A sort or DISTINCT ON key can reference a fact that is not selected. Keep it in the
+			// semantic query's projection so the outer modifier can read it.
+			auto column = FactColumn(query.items.size());
+			AddItem(SemanticMemberKind::FACT, WithoutAlias(expr), column);
+			return ColumnRef(column);
+		}
+		auto result = expr.Copy();
+		ParsedExpressionIterator::EnumerateChildren(
+		    *result, [&](unique_ptr<ParsedExpression> &child) { child = MapToFacts(*child); });
+		return result;
 	}
 
 	string OutputName(idx_t index) {

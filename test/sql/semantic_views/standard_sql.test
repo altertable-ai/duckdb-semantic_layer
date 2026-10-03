@@ -267,3 +267,44 @@ statement error
 SELECT AGG(nope) FROM no_such_table_or_view;
 ----
 Table with name no_such_table_or_view does not exist
+
+# ORDER BY expressions must survive lowering to internally named fact columns.
+query I
+SELECT o.line_count FROM shop ORDER BY o.line_count * -1, o.order_date;
+----
+2
+2
+1
+0
+0
+
+# Sort columns need not occur in the result, and table qualifiers remain valid.
+query I
+SELECT o.status FROM shop ORDER BY o.order_date DESC;
+----
+open
+open
+open
+closed
+open
+
+query I
+SELECT o.line_count AS n FROM shop ORDER BY n DESC, o.order_date;
+----
+2
+2
+1
+0
+0
+
+# DISTINCT ON keys also have to be mapped to the lowered query's columns.
+query II
+SELECT DISTINCT ON (o.status) o.status, o.line_count FROM shop ORDER BY o.status, o.order_date DESC;
+----
+closed	1
+open	0
+
+statement error
+SELECT o.status FROM shop ORDER BY ROW_NUMBER() OVER (ORDER BY o.order_date);
+----
+Window functions are not supported
