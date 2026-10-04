@@ -53,35 +53,6 @@ static void StatusColumn(vector<LogicalType> &return_types, vector<string> &name
 	return_types.emplace_back(LogicalType::VARCHAR);
 }
 
-//! Materializations of `before` whose state `after` does not keep (their tables are dropped once `after` replaced it)
-static vector<shared_ptr<SemanticMaterialization>> RemovedMaterializations(const shared_ptr<SemanticModel> &before,
-                                                                           const shared_ptr<SemanticModel> &after) {
-	vector<shared_ptr<SemanticMaterialization>> result;
-	if (!before) {
-		return result;
-	}
-	for (auto &old : before->materializations) {
-		bool kept = false;
-		if (after) {
-			for (auto &materialization : after->materializations) {
-				kept = kept || SameMaterializationStorage(*materialization, *old);
-			}
-		}
-		if (!kept) {
-			result.push_back(old);
-		}
-	}
-	return result;
-}
-
-//! Drops the tables and metadata of materializations of view `model`
-static void DropMaterializationTables(ClientContext &context, const SemanticModel &model,
-                                      const vector<shared_ptr<SemanticMaterialization>> &materializations) {
-	for (auto &materialization : materializations) {
-		DropSemanticMaterializationTables(context, model, *materialization);
-	}
-}
-
 //===--------------------------------------------------------------------===//
 // CREATE
 //===--------------------------------------------------------------------===//
@@ -95,21 +66,15 @@ struct SemanticCreateData : public SemanticDDLData {
 
 	string Execute(ClientContext &context) const override {
 		auto replace = on_conflict == OnCreateConflict::REPLACE_ON_CONFLICT;
-		if (model && (replace || !state->registry.Get(name))) {
-			auto previous = state->registry.Get(name);
-			ApplySemanticViewChange(context, QualifiedName(), model.get());
-			if (state->registry.Create(model, replace)) {
-				// materializations of a replaced view that the new definition does not keep are gone
-				if (previous) {
-					DropMaterializationTables(context, *previous, RemovedMaterializations(previous, model));
-				}
-				for (auto &stored : obsolete) {
-					DropStoredMaterialization(context, stored);
-				}
-				return "Semantic view " + DisplayName() + " successfully created.";
-			}
-			// created concurrently since bind: restore the placeholder of the registered view
-			ApplySemanticViewChange(context, QualifiedName(), state->registry.Get(name).get());
+		if (model && state->registry.Create(model, replace, [&](shared_ptr<SemanticModel> previous) {
+			    if (previous) {
+				    AdoptMaterializationStates(*model, *previous);
+			    }
+			    ApplySemanticMaterializationChange(context, previous, model, {}, obsolete, [&] {
+				    ApplySemanticViewChange(context, QualifiedName(), model.get());
+			    });
+		    })) {
+			return "Semantic view " + DisplayName() + " successfully created.";
 		}
 		if (on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT) {
 			return DisplayName() + " already exists, statement succeeded.";
@@ -143,12 +108,13 @@ struct SemanticDropData : public SemanticDDLData {
 	bool if_exists;
 
 	string Execute(ClientContext &context) const override {
-		auto previous = state->registry.Get(name);
-		auto dropped_placeholder = ApplySemanticViewChange(context, name, nullptr);
-		if (state->registry.Drop(name) || dropped_placeholder) {
-			if (previous) {
-				DropMaterializationTables(context, *previous, RemovedMaterializations(previous, nullptr));
-			}
+		bool dropped_placeholder = false;
+		auto dropped = state->registry.Drop(name, [&](shared_ptr<SemanticModel> previous) {
+			ApplySemanticMaterializationChange(context, previous, nullptr, {}, {}, [&] {
+				dropped_placeholder = ApplySemanticViewChange(context, name, nullptr);
+			});
+		});
+		if (dropped || dropped_placeholder) {
 			return DisplayName() + " successfully dropped.";
 		}
 		if (if_exists) {
@@ -190,17 +156,12 @@ struct SemanticAlterData : public SemanticDDLData {
 			}
 			throw CatalogException("Semantic view with name \"%s\" does not exist!", name.name);
 		}
-		for (auto &materialization : added) {
-			BuildSemanticMaterialization(context, *model, *materialization);
-		}
-		ApplySemanticViewChange(context, existing->Name(), model.get());
-		if (!state->registry.Replace(*existing, model)) {
-			DropMaterializationTables(context, *model, added);
+		if (!state->registry.Replace(*existing, model, [&] {
+			    ApplySemanticMaterializationChange(context, existing, model, added, {}, [&] {
+				    ApplySemanticViewChange(context, existing->Name(), model.get());
+			    });
+		    })) {
 			throw CatalogException("Semantic view \"%s\" was dropped or altered by a concurrent statement", name.name);
-		}
-		DropMaterializationTables(context, *existing, RemovedMaterializations(existing, model));
-		if (!StringUtil::CIEquals(existing->Name().name, model->Name().name)) {
-			RenameStoredMaterializations(context, *model, existing->Name());
 		}
 		return message;
 	}

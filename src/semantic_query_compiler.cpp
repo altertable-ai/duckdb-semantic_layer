@@ -1,3 +1,4 @@
+#include "semantic_definition_exception.hpp"
 #include "semantic_query_compiler.hpp"
 
 #include "duckdb/common/error_data.hpp"
@@ -15,7 +16,12 @@
 #include "duckdb/parser/result_modifier.hpp"
 #include "duckdb/parser/tableref/joinref.hpp"
 #include "duckdb/planner/binder.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "semantic_ast_helpers.hpp"
+#include "semantic_expression_compiler.hpp"
 #include "semantic_bridge.hpp"
 #include "semantic_join_scope.hpp"
 
@@ -53,105 +59,6 @@ string SemanticDimensionColumn(idx_t dimension) {
 //===--------------------------------------------------------------------===//
 // Expressions
 //===--------------------------------------------------------------------===//
-class SemanticExpressionCompiler {
-public:
-	SemanticExpressionCompiler(const SemanticModel &model, SemanticAnalyzer &analyzer)
-	    : model(model), analyzer(analyzer) {
-	}
-
-	//! A row-level expression, evaluated per row of `scope`'s base in the row context of `context_table`
-	unique_ptr<ParsedExpression> Row(const ParsedExpression &expr, SemanticJoinScope &scope, idx_t context_table,
-	                                 const string &what) {
-		auto ref = SemanticMarkers::Classify(expr);
-		unique_ptr<ParsedExpression> result;
-		if (ref.Is(SemanticRefKind::COLUMN)) {
-			result = scope.ColumnReference(ref.index, ref.column);
-		} else if (ref.Is(SemanticRefKind::MEMBER) && model.members[ref.index].IsRowLevel()) {
-			auto &member = model.members[ref.index];
-			result = Row(*member.resolved, scope, member.table, what);
-		} else if (ref.Is(SemanticRefKind::MEMBER)) {
-			// a metric in a row-level expression: aggregate the finer rows belonging to the current row
-			vector<SemanticAtom> atoms;
-			auto post = analyzer.DecomposeMetric(ref.index, atoms, what);
-			result = ReplaceAtoms(*post,
-			                      [&](idx_t atom) { return ChildAggregate(atoms[atom], context_table, scope, what); });
-		} else if (analyzer.IsAggregate(expr)) {
-			SemanticAtom atom;
-			atom.home = analyzer.AggregateHome(expr.Cast<FunctionExpression>(), context_table, what);
-			atom.aggregate = expr.Copy();
-			atom.context.table = context_table;
-			atom.context.using_relationships = scope.UsingRelationships();
-			result = ChildAggregate(atom, context_table, scope, what);
-		} else {
-			result = expr.Copy();
-			ParsedExpressionIterator::EnumerateChildren(
-			    *result, [&](unique_ptr<ParsedExpression> &child) { child = Row(*child, scope, context_table, what); });
-			return result;
-		}
-		result->alias = expr.alias;
-		return result;
-	}
-
-	//! An aggregate atom over the rows of `scope`'s base
-	unique_ptr<ParsedExpression> Aggregate(const SemanticAtom &atom, SemanticJoinScope &scope, const string &what) {
-		auto result = atom.aggregate->Copy();
-		ParsedExpressionIterator::EnumerateChildren(
-		    *result, [&](unique_ptr<ParsedExpression> &child) { child = Row(*child, scope, atom.home, what); });
-		return result;
-	}
-
-	template <class FUNC>
-	static unique_ptr<ParsedExpression> ReplaceAtoms(const ParsedExpression &expr, FUNC replacement) {
-		auto ref = SemanticMarkers::Classify(expr);
-		if (ref.Is(SemanticRefKind::ATOM)) {
-			auto result = replacement(ref.index);
-			result->alias = expr.alias;
-			return result;
-		}
-		auto result = expr.Copy();
-		ParsedExpressionIterator::EnumerateChildren(
-		    *result, [&](unique_ptr<ParsedExpression> &child) { child = ReplaceAtoms(*child, replacement); });
-		return result;
-	}
-
-private:
-	//! Correlated scalar subquery aggregating the rows of atom.home that belong to the current row of `context`
-	unique_ptr<ParsedExpression> ChildAggregate(const SemanticAtom &atom, idx_t context, SemanticJoinScope &outer,
-	                                            const string &what) {
-		if (context == DConstants::INVALID_INDEX || atom.home == context || !model.Reaches(atom.home, context)) {
-			throw BinderException("%s: cannot aggregate rows of logical table \"%s\" here", what,
-			                      model.tables[atom.home].name);
-		}
-		auto path = model.Path(atom.home, context, atom.context.using_relationships);
-		auto &last = path.back();
-		auto &rel = model.relationships[last.relationship];
-		if (rel.asof_index != DConstants::INVALID_INDEX || rel.is_range) {
-			throw BinderException("%s: aggregating the rows of \"%s\" through the ASOF / range relationship \"%s\" "
-			                      "is not supported",
-			                      what, model.tables[atom.home].name, rel.name);
-		}
-		auto inner = outer.Nested(atom.home, context);
-		auto node = make_uniq<SelectNode>();
-		node->select_list.push_back(Aggregate(atom, inner, what));
-		// correlate the last hop into `context` with the current row
-		auto source = path.size() >= 2 ? path[path.size() - 2].target : atom.home;
-		auto &inner_columns = last.reversed ? rel.to_columns : rel.from_columns;
-		auto &outer_columns = last.reversed ? rel.from_columns : rel.to_columns;
-		auto inner_alias = inner.Ensure(source);
-		auto outer_alias = outer.Ensure(context);
-		vector<unique_ptr<ParsedExpression>> conditions;
-		for (idx_t c = 0; c < inner_columns.size(); c++) {
-			conditions.push_back(Compare(ExpressionType::COMPARE_EQUAL, ColumnRef(inner_columns[c], inner_alias),
-			                             ColumnRef(outer_columns[c], outer_alias)));
-		}
-		node->where_clause = AndAll(std::move(conditions));
-		node->from_table = inner.BuildFrom();
-		return MakeScalarSubquery(std::move(node));
-	}
-
-	const SemanticModel &model;
-	SemanticAnalyzer &analyzer;
-};
 
 namespace {
 
@@ -167,9 +74,10 @@ void MapWindowDimensions(const SemanticModel &model, unique_ptr<ParsedExpression
 		}
 		auto ref = SemanticMarkers::Classify(reference);
 		auto name = ref.Is(SemanticRefKind::MEMBER) ? model.MemberDisplayName(ref.index) : reference.ToString();
-		throw BinderException("Invalid semantic view query: Dimension '%s' used in a window function metric must be "
-		                      "requested in the query.",
-		                      name);
+		throw SemanticDefinitionException(
+		    "Invalid semantic view query: Dimension '%s' used in a window function metric must be "
+		    "requested in the query.",
+		    name);
 	};
 	std::function<void(unique_ptr<ParsedExpression> &)> map_key = [&](unique_ptr<ParsedExpression> &key) {
 		if (SemanticMarkers::Classify(*key).Is(SemanticRefKind::MEMBER)) {
@@ -437,8 +345,8 @@ public:
 		return result;
 	}
 	//! The block as aggregated from its sources (dimensions, then its atoms)
-	unique_ptr<SelectNode> SourceBlock(idx_t b) {
-		return BuildSourceBlock(blocks[b], optional_idx());
+	unique_ptr<SelectNode> SourceBlock(idx_t b, SemanticBlockDependencies &dependencies) {
+		return BuildSourceBlock(blocks[b], optional_idx(), &dependencies);
 	}
 
 	//! SELECT <dimensions>, count(*) AS __sv_rows, <states of the block's atoms> ... GROUP BY <dimensions>
@@ -488,15 +396,25 @@ private:
 		BlockRows result;
 		result.rows = make_uniq<SelectNode>();
 		auto &rows = *result.rows;
+		auto dependencies = scope.Dependencies();
+		if (dependencies) {
+			dependencies->in_dimension = true;
+		}
 		for (idx_t d = 0; d < dimensions.size(); d++) {
 			auto what = ItemWhat(*dimensions[d]);
 			auto expr = bridges.Dimension(*dimensions[d]->resolved, DimensionColumn(d), what);
+			if (expr && dependencies) {
+				throw SemanticDefinitionException("%s: many-to-many bridges cannot be materialized", what);
+			}
 			if (!expr) {
 				expr = compiler.Row(*dimensions[d]->resolved, scope, DConstants::INVALID_INDEX, what);
 			}
 			result.groups.push_back(expr->Copy());
 			expr->alias = DimensionColumn(d);
 			rows.select_list.push_back(std::move(expr));
+		}
+		if (dependencies) {
+			dependencies->in_dimension = false;
 		}
 		idx_t argument_count = 0;
 		auto extract = [&](unique_ptr<ParsedExpression> &argument) {
@@ -576,8 +494,10 @@ private:
 		return BuildSourceBlock(block, tag);
 	}
 
-	unique_ptr<SelectNode> BuildSourceBlock(const Block &block, optional_idx tag) {
-		SemanticJoinScope scope(model, aliases, block.home, block.using_relationships, string(), options.sources);
+	unique_ptr<SelectNode> BuildSourceBlock(const Block &block, optional_idx tag,
+	                                        optional_ptr<SemanticBlockDependencies> dependencies = nullptr) {
+		SemanticJoinScope scope(model, aliases, block.home, block.using_relationships, string(), options.sources,
+		                        dependencies);
 		BlockBridges bridges(model, analyzer, compiler, aliases, block.home, block.using_relationships,
 		                     options.sources);
 		auto parts = BuildRows(block, scope, bridges);
@@ -762,7 +682,8 @@ SemanticQuerySpec SemanticQueryCompiler::Resolve(const vector<ParsedSemanticQuer
 		if (!item.expression) {
 			auto table = model.FindTable(item.star_table);
 			if (!table.IsValid()) {
-				throw BinderException("Unknown logical table \"%s\" in \"%s.*\"", item.star_table, item.star_table);
+				throw SemanticDefinitionException("Unknown logical table \"%s\" in \"%s.*\"", item.star_table,
+				                                  item.star_table);
 			}
 			for (idx_t m = 0; m < model.members.size(); m++) {
 				auto &member = model.members[m];
@@ -797,17 +718,18 @@ void SemanticQueryCompiler::SplitItems(const SemanticQuerySpec &spec, vector<con
 	case_insensitive_set_t output_names;
 	for (auto &item : spec.items) {
 		if (!output_names.insert(item.output_name).second) {
-			throw BinderException("Duplicate output column name \"%s\" in SEMANTIC_VIEW; use an alias",
-			                      item.output_name);
+			throw SemanticDefinitionException("Duplicate output column name \"%s\" in SEMANTIC_VIEW; use an alias",
+			                                  item.output_name);
 		}
 		auto aggregates = analyzer.ContainsAggregateOrMetric(*item.resolved);
 		if (item.kind == SemanticMemberKind::METRIC && !aggregates) {
-			throw BinderException("%s: a METRICS expression must aggregate (use a metric or an aggregate function); "
-			                      "use DIMENSIONS or FACTS for row-level values",
-			                      ItemWhat(item));
+			throw SemanticDefinitionException(
+			    "%s: a METRICS expression must aggregate (use a metric or an aggregate function); "
+			    "use DIMENSIONS or FACTS for row-level values",
+			    ItemWhat(item));
 		}
 		if (item.kind != SemanticMemberKind::METRIC && aggregates) {
-			throw BinderException("%s: metrics and aggregates are only allowed in METRICS", ItemWhat(item));
+			throw SemanticDefinitionException("%s: metrics and aggregates are only allowed in METRICS", ItemWhat(item));
 		}
 		auto &list = item.kind == SemanticMemberKind::METRIC      ? metrics
 		             : item.kind == SemanticMemberKind::DIMENSION ? dimensions
@@ -815,10 +737,10 @@ void SemanticQueryCompiler::SplitItems(const SemanticQuerySpec &spec, vector<con
 		list.push_back(&item);
 	}
 	if (!facts.empty() && !metrics.empty()) {
-		throw BinderException("Cannot specify FACTS and METRICS in the same SEMANTIC_VIEW clause");
+		throw SemanticDefinitionException("Cannot specify FACTS and METRICS in the same SEMANTIC_VIEW clause");
 	}
 	if (spec.where && analyzer.ContainsAggregateOrMetric(*spec.where)) {
-		throw BinderException("The WHERE clause of SEMANTIC_VIEW can only reference dimensions and facts");
+		throw SemanticDefinitionException("The WHERE clause of SEMANTIC_VIEW can only reference dimensions and facts");
 	}
 	// row-level tables referenced by dimensions / facts / WHERE
 	for (auto &item : spec.items) {
@@ -846,6 +768,34 @@ unique_ptr<SelectStatement> SemanticQueryCompiler::Compile(const SemanticQuerySp
 	return CompileRowQuery(compiler, aliases, spec, !dimensions.empty(), !facts.empty(), row_tables, options);
 }
 
+//! Binding can introduce reads through macros and views that were absent from the compiled AST.
+//! Match every physical scan occurrence against the sources emitted by the semantic compiler.
+static void VerifyBoundSources(const SemanticModel &model, LogicalOperator &op, map<idx_t, idx_t> &remaining,
+                               SemanticBlockDependencies &dependencies) {
+	if (op.type == LogicalOperatorType::LOGICAL_GET) {
+		auto table = op.Cast<LogicalGet>().GetTable();
+		bool accounted = false;
+		if (table) {
+			for (auto &entry : remaining) {
+				auto &source = model.tables[entry.first];
+				if (entry.second && source.catalog_name == table->ParentCatalog().GetName() &&
+				    source.schema_name == table->ParentSchema().name && source.table_name == table->name) {
+					entry.second--;
+					accounted = true;
+					break;
+				}
+			}
+		}
+		if (!accounted) {
+			dependencies.complete = false;
+			dependencies.Unsupported("binding introduces source reads outside the compiled semantic dependencies");
+		}
+	}
+	for (auto &child : op.children) {
+		VerifyBoundSources(model, *child, remaining, dependencies);
+	}
+}
+
 vector<SemanticBlockPlan> SemanticQueryCompiler::PlanBlocks(const SemanticQuerySpec &spec) {
 	vector<const SemanticQueryItem *> dimensions;
 	vector<const SemanticQueryItem *> facts;
@@ -862,13 +812,16 @@ vector<SemanticBlockPlan> SemanticQueryCompiler::PlanBlocks(const SemanticQueryS
 		// the atom types: bind the block as aggregated from its sources (dimensions come first)
 		auto node = make_uniq<SelectNode>();
 		node->select_list.push_back(make_uniq<StarExpression>());
-		node->from_table = MakeSubqueryRef(metric_compiler.SourceBlock(b), "__sv_probe");
+		node->from_table = MakeSubqueryRef(metric_compiler.SourceBlock(b, plan.dependencies), "__sv_probe");
 		auto limit = make_uniq<LimitModifier>();
 		limit->limit = make_uniq<ConstantExpression>(Value::BIGINT(0));
 		node->modifiers.push_back(std::move(limit));
 		auto statement = MakeSelectStatement(std::move(node));
 		auto binder = Binder::CreateBinder(analyzer.Context());
-		auto types = binder->Bind(statement->Cast<SQLStatement>()).types;
+		auto bound = binder->Bind(statement->Cast<SQLStatement>());
+		auto remaining = plan.dependencies.scans;
+		VerifyBoundSources(model, *bound.plan, remaining, plan.dependencies);
+		auto &types = bound.types;
 		for (idx_t k = 0; k < plan.atoms.size(); k++) {
 			plan.atom_types.push_back(types[dimensions.size() + k]);
 		}
@@ -908,11 +861,12 @@ unique_ptr<SelectStatement> SemanticQueryCompiler::CompileRowQuery(SemanticExpre
 		base = analyzer.FinestTable(row_tables, "Invalid SEMANTIC_VIEW query");
 	}
 	if (base == DConstants::INVALID_INDEX) {
-		throw BinderException("SEMANTIC_VIEW must reference at least one dimension or fact");
+		throw SemanticDefinitionException("SEMANTIC_VIEW must reference at least one dimension or fact");
 	}
 	if (has_facts && has_dimensions && row_tables.size() > 1) {
-		throw BinderException("When FACTS and DIMENSIONS are both specified, all facts and dimensions (including "
-		                      "those in the WHERE clause) must be defined in the same logical table");
+		throw SemanticDefinitionException(
+		    "When FACTS and DIMENSIONS are both specified, all facts and dimensions (including "
+		    "those in the WHERE clause) must be defined in the same logical table");
 	}
 	SemanticJoinScope scope(model, aliases, base, {}, string(), options.sources);
 	auto node = make_uniq<SelectNode>();
@@ -969,9 +923,9 @@ void ProbeSemanticModelTypes(ClientContext &context, SemanticModel &model) {
 			member.type = binder->Bind(statement->Cast<SQLStatement>()).types[column];
 		} catch (std::exception &ex) {
 			ErrorData error(ex);
-			throw BinderException("Invalid semantic view \"%s\": %s \"%s\": %s", model.Name().name,
-			                      SemanticModel::KindDisplayName(member.Kind()), model.MemberDisplayName(m),
-			                      error.RawMessage());
+			throw SemanticDefinitionException("Invalid semantic view \"%s\": %s \"%s\": %s", model.Name().name,
+			                                  SemanticModel::KindDisplayName(member.Kind()), model.MemberDisplayName(m),
+			                                  error.RawMessage());
 		}
 	}
 }

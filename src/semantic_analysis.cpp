@@ -1,3 +1,4 @@
+#include "semantic_definition_exception.hpp"
 #include "semantic_analysis.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
@@ -69,18 +70,18 @@ void SemanticAnalyzer::RowTables(const ParsedExpression &expr, idx_t context_tab
 			return;
 		}
 		if (context_table == DConstants::INVALID_INDEX) {
-			throw BinderException("%s: metric \"%s\" cannot be used in a row-level expression", what,
-			                      model.MemberDisplayName(ref.index));
+			throw SemanticDefinitionException("%s: metric \"%s\" cannot be used in a row-level expression", what,
+			                                  model.MemberDisplayName(ref.index));
 		}
 		tables.insert(context_table);
 		return;
 	}
 	if (expr.GetExpressionClass() == ExpressionClass::WINDOW) {
-		throw BinderException("%s: window functions are not allowed in row-level expressions", what);
+		throw SemanticDefinitionException("%s: window functions are not allowed in row-level expressions", what);
 	}
 	if (IsAggregate(expr)) {
 		if (context_table == DConstants::INVALID_INDEX) {
-			throw BinderException("%s cannot contain an aggregate", what);
+			throw SemanticDefinitionException("%s cannot contain an aggregate", what);
 		}
 		tables.insert(context_table);
 		return;
@@ -101,8 +102,8 @@ idx_t SemanticAnalyzer::FinestTable(const set<idx_t> &tables, const string &what
 	for (auto table : tables) {
 		names.push_back("\"" + model.tables[table].name + "\"");
 	}
-	throw BinderException("%s: logical tables %s are not related through relationships", what,
-	                      StringUtil::Join(names, ", "));
+	throw SemanticDefinitionException("%s: logical tables %s are not related through relationships", what,
+	                                  StringUtil::Join(names, ", "));
 }
 
 idx_t SemanticAnalyzer::AggregateHome(const FunctionExpression &aggregate, idx_t context_table, const string &what) {
@@ -113,9 +114,10 @@ idx_t SemanticAnalyzer::AggregateHome(const FunctionExpression &aggregate, idx_t
 		tables.insert(context_table);
 	}
 	if (tables.empty()) {
-		throw BinderException("%s: cannot determine the logical table of %s; define it as a metric of a logical "
-		                      "table instead",
-		                      what, aggregate.ToString());
+		throw SemanticDefinitionException(
+		    "%s: cannot determine the logical table of %s; define it as a metric of a logical "
+		    "table instead",
+		    what, aggregate.ToString());
 	}
 	return FinestTable(tables, what);
 }
@@ -199,15 +201,15 @@ unique_ptr<ParsedExpression> SemanticAnalyzer::Decompose(const ParsedExpression 
 		switch (ref.kind) {
 		case SemanticRefKind::MEMBER:
 			if (model.members[ref.index].Kind() != SemanticMemberKind::METRIC) {
-				throw BinderException("%s cannot reference \"%s\" outside of an aggregate", what,
-				                      model.MemberDisplayName(ref.index));
+				throw SemanticDefinitionException("%s cannot reference \"%s\" outside of an aggregate", what,
+				                                  model.MemberDisplayName(ref.index));
 			}
 			node = Decompose(*model.members[ref.index].resolved, MetricContext(ref.index, context), atoms, what);
 			node->alias = alias;
 			return;
 		case SemanticRefKind::COLUMN:
-			throw BinderException("%s cannot reference \"%s.%s\" outside of an aggregate", what,
-			                      model.tables[ref.index].name, ref.column);
+			throw SemanticDefinitionException("%s cannot reference \"%s.%s\" outside of an aggregate", what,
+			                                  model.tables[ref.index].name, ref.column);
 		default:
 			break;
 		}
@@ -244,14 +246,15 @@ unique_ptr<ParsedExpression> SemanticAnalyzer::Decompose(const ParsedExpression 
 			for (auto &child : node->Cast<FunctionExpression>().children) {
 				auto excluded = SemanticMarkers::Classify(*child);
 				if (!excluded.Is(SemanticRefKind::MEMBER) || !model.members[excluded.index].IsRowLevel()) {
-					throw BinderException("%s: PARTITION BY EXCLUDING only accepts dimensions", what);
+					throw SemanticDefinitionException("%s: PARTITION BY EXCLUDING only accepts dimensions", what);
 				}
 			}
 			return;
 		}
 		if (ref.Is(SemanticRefKind::COLUMN)) {
-			throw BinderException("%s: the window clause must reference dimensions or metrics, not column \"%s.%s\"",
-			                      what, model.tables[ref.index].name, ref.column);
+			throw SemanticDefinitionException(
+			    "%s: the window clause must reference dimensions or metrics, not column \"%s.%s\"", what,
+			    model.tables[ref.index].name, ref.column);
 		}
 		if (IsAggregate(*node) || ref.Is(SemanticRefKind::MEMBER)) {
 			rewrite(node);

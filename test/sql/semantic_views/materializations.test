@@ -33,6 +33,9 @@ ALTER SEMANTIC VIEW shop ADD MATERIALIZATION fine AS
   DIMENSIONS c.segment, c.country, o.day
   METRICS o.revenue, o.order_count, o.qty_count, o.avg_qty, o.max_amount, o.min_amount, o.distinct_customers;
 
+statement ok
+SET VARIABLE shop__fine__0 = (SELECT tables[1] FROM (SHOW SEMANTIC MATERIALIZATIONS IN shop) WHERE name = 'fine');
+
 query IIIIIIII
 SELECT name, dimensions, metrics, refresh_mode, incremental, not_incremental_reason, last_refresh, len(tables) FROM (SHOW SEMANTIC MATERIALIZATIONS IN shop);
 ----
@@ -40,7 +43,7 @@ fine	[c.segment, c.country, o.day]	[o.revenue, o.order_count, o.qty_count, o.avg
 
 # the stored state: per group, the number of rows and the state of every aggregate (AVG as sum + count, ...)
 query IIIIIII
-SELECT __sv_d0, __sv_d1, __sv_d2, __sv_rows, s0_sum, s0_cnt, s3_sum FROM __semantic_materializations.shop__fine__0 ORDER BY ALL;
+SELECT __sv_d0, __sv_d1, __sv_d2, __sv_rows, s0_sum, s0_cnt, s3_sum FROM query_table(getvariable('shop__fine__0')) ORDER BY ALL;
 ----
 pro	FR	2024-02-01	1	100.00	1	2
 pro	NULL	2024-02-02	1	1.00	1	1
@@ -273,14 +276,14 @@ statement ok
 ALTER SEMANTIC VIEW store DROP MATERIALIZATION customers_by_segment;
 
 query I
-SELECT table_name FROM duckdb_tables() WHERE schema_name = '__semantic_materializations' ORDER BY 1;
+SELECT regexp_replace(table_name, '__[0-9a-f]{32}$', '') FROM duckdb_tables() WHERE schema_name = '__semantic_materializations' ORDER BY 1;
 ----
 __sv_materializations
 shop__fine__0
 
 # the metadata records every materialization (definition, tables, watermark), under the view's current name
 query III
-SELECT view_name, name, tables FROM __semantic_materializations.__sv_materializations;
+SELECT view_name, name, list_transform(tables, t -> regexp_replace(t, '__[0-9a-f]{32}$', '')) FROM __semantic_materializations.__sv_materializations;
 ----
 store	fine	[shop__fine__0]
 

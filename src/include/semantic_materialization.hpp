@@ -56,15 +56,6 @@ struct SemanticMaterializedAtom {
 	vector<string> StateColumns() const;
 };
 
-//! A nested (child) aggregation in the rows of a block: the rows of `table` matching a row of `parent` (a table of
-//! the block) on `columns` = `parent_columns`, aggregated per row of `parent`
-struct SemanticMaterializedChild {
-	idx_t table;
-	idx_t parent;
-	vector<string> columns;
-	vector<string> parent_columns;
-};
-
 //! One physical table: the atoms of a materialization aggregated over the same home table
 struct SemanticMaterializedBlock {
 	idx_t home;
@@ -75,7 +66,8 @@ struct SemanticMaterializedBlock {
 	//! Logical tables read by nested aggregations, and those of them maintainable incrementally (direct child tables
 	//! aggregating their own columns)
 	set<idx_t> nested_tables;
-	vector<SemanticMaterializedChild> children;
+	vector<SemanticChildDependency> children;
+	bool dependencies_complete = true;
 
 	//! Every logical table whose changes can change the block
 	set<idx_t> SourceTables() const {
@@ -90,11 +82,15 @@ struct SemanticMaterializationState {
 	mutex lock;
 	//! Held for the duration of a refresh (refreshes of a materialization are serialized)
 	mutex refresh_lock;
+	//! Current metadata owner, shared across renamed models and their already-bound refreshes.
+	QualifiedName owner;
 	//! Physical location, set by the first build
 	string catalog;
 	string schema;
 	vector<string> tables;
 	bool built = false;
+	//! A removed state cannot be rebuilt by a refresh that was bound before the DDL transition.
+	bool retired = false;
 	//! Per DuckLake catalog of the sources, the snapshot the materialization is correct at (empty: untracked)
 	map<string, idx_t> watermark;
 	//! When the materialization was last known to be fresh
@@ -151,22 +147,17 @@ struct SemanticStoredMaterialization {
 //! define yet: reattached as they are when their definition did not change, else to be rebuilt by the next refresh.
 //! Returns those that no longer apply to the view (their tables are dropped once the view is created).
 vector<SemanticStoredMaterialization> RestoreSemanticMaterializations(ClientContext &context, SemanticModel &model);
-//! Drops the tables and the metadata of a stored materialization
-void DropStoredMaterialization(ClientContext &context, const SemanticStoredMaterialization &stored);
-//! Records that the materializations of `model` now belong to a view renamed from `previous_name`
-void RenameStoredMaterializations(ClientContext &context, const SemanticModel &model,
-                                  const QualifiedName &previous_name);
+//! Stages storage changes before publishing a DDL registry transition. The placeholder is changed after all
+//! storage operations have succeeded, and before their transactions commit.
+void ApplySemanticMaterializationChange(ClientContext &context, const shared_ptr<SemanticModel> &before,
+                                        const shared_ptr<SemanticModel> &after,
+                                        const vector<shared_ptr<SemanticMaterialization>> &added,
+                                        const vector<SemanticStoredMaterialization> &obsolete,
+                                        const std::function<void()> &placeholder);
 
-//! Builds a materialization of a model that is about to be registered (ADD MATERIALIZATION)
-void BuildSemanticMaterialization(ClientContext &context, const SemanticModel &model,
-                                  const SemanticMaterialization &materialization);
 //! Brings a materialization up to date; returns a description of what was done
 string RefreshSemanticMaterialization(ClientContext &context, const SemanticModel &model,
                                       const SemanticMaterialization &materialization, SemanticRefreshMode mode);
-//! Drops the physical tables of a materialization (they may not exist)
-void DropSemanticMaterializationTables(ClientContext &context, const SemanticModel &model,
-                                       const SemanticMaterialization &materialization);
-
 //! Whether a materialization can currently answer queries, and why not
 struct SemanticMaterializationStatus {
 	bool usable = false;

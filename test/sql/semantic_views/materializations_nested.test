@@ -62,12 +62,24 @@ ALTER SEMANTIC VIEW nested ADD MATERIALIZATION full_copy REFRESH_MODE = FULL AS
   DIMENSIONS c.segment, r.region METRICS c.avg_total, c.total, c.max_total, c.customers, c.balance, o.unpaid_orders;
 
 statement ok
+SET VARIABLE nested__full_copy__0 = (SELECT tables[1] FROM (SHOW SEMANTIC MATERIALIZATIONS IN nested) WHERE name = 'full_copy');
+SET VARIABLE nested__full_copy__1 = (SELECT tables[2] FROM (SHOW SEMANTIC MATERIALIZATIONS IN nested) WHERE name = 'full_copy');
+
+statement ok
 ALTER SEMANTIC VIEW nested ADD MATERIALIZATION incr REFRESH_MODE = INCREMENTAL AS
   DIMENSIONS c.segment, r.region METRICS c.avg_total, c.total, c.max_total, c.customers, c.balance, o.unpaid_orders;
 
 statement ok
+SET VARIABLE nested__incr__0 = (SELECT tables[1] FROM (SHOW SEMANTIC MATERIALIZATIONS IN nested) WHERE name = 'incr');
+SET VARIABLE nested__incr__1 = (SELECT tables[2] FROM (SHOW SEMANTIC MATERIALIZATIONS IN nested) WHERE name = 'incr');
+
+statement ok
 ALTER SEMANTIC VIEW nested ADD MATERIALIZATION auto_copy AS
   DIMENSIONS c.segment, r.region METRICS c.avg_total, c.total, c.max_total, c.customers, c.balance, o.unpaid_orders;
+
+statement ok
+SET VARIABLE nested__auto_copy__0 = (SELECT tables[1] FROM (SHOW SEMANTIC MATERIALIZATIONS IN nested) WHERE name = 'auto_copy');
+SET VARIABLE nested__auto_copy__1 = (SELECT tables[2] FROM (SHOW SEMANTIC MATERIALIZATIONS IN nested) WHERE name = 'auto_copy');
 
 query IIII
 SELECT name, incremental, not_incremental_reason, len(tables) FROM (SHOW SEMANTIC MATERIALIZATIONS IN nested) ORDER BY name;
@@ -82,10 +94,10 @@ CREATE MACRO diff(a, b) AS TABLE
 
 statement ok
 CREATE MACRO compare_copies() AS TABLE
-  SELECT (FROM diff('__semantic_materializations.nested__incr__0', '__semantic_materializations.nested__full_copy__0'))
-       + (FROM diff('__semantic_materializations.nested__incr__1', '__semantic_materializations.nested__full_copy__1'))
-       + (FROM diff('__semantic_materializations.nested__auto_copy__0', '__semantic_materializations.nested__full_copy__0'))
-       + (FROM diff('__semantic_materializations.nested__auto_copy__1', '__semantic_materializations.nested__full_copy__1')) AS differences;
+  SELECT (FROM diff(getvariable('nested__incr__0'), getvariable('nested__full_copy__0')))
+       + (FROM diff(getvariable('nested__incr__1'), getvariable('nested__full_copy__1')))
+       + (FROM diff(getvariable('nested__auto_copy__0'), getvariable('nested__full_copy__0')))
+       + (FROM diff(getvariable('nested__auto_copy__1'), getvariable('nested__full_copy__1'))) AS differences;
 
 statement ok
 CREATE MACRO hand_written() AS TABLE

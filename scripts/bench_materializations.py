@@ -47,6 +47,11 @@ def build_script(rows: int, data_dir: str) -> str:
         "ALTER SEMANTIC VIEW sales_sv ADD MATERIALIZATION full_copy REFRESH_MODE = FULL AS DIMENSIONS c.segment, p.category METRICS s.revenue, s.units, s.sale_count, s.avg_amount;",
         "ALTER SEMANTIC VIEW sales_sv ADD MATERIALIZATION incr REFRESH_MODE = INCREMENTAL AS DIMENSIONS c.segment, p.category METRICS s.revenue, s.units, s.sale_count, s.avg_amount;",
         "ALTER SEMANTIC VIEW sales_sv ADD MATERIALIZATION auto AS DIMENSIONS c.segment, p.category METRICS s.revenue, s.units, s.sale_count, s.avg_amount;",
+        ".timer off",
+        "SET VARIABLE incr_table = (SELECT tables[1] FROM (SHOW SEMANTIC MATERIALIZATIONS IN sales_sv) WHERE name = 'incr');",
+        "SET VARIABLE full_table = (SELECT tables[1] FROM (SHOW SEMANTIC MATERIALIZATIONS IN sales_sv) WHERE name = 'full_copy');",
+        "SET VARIABLE auto_table = (SELECT tables[1] FROM (SHOW SEMANTIC MATERIALIZATIONS IN sales_sv) WHERE name = 'auto');",
+        ".timer on",
         ".print MARK:query_from_materialization",
         "SELECT count(*) FROM SEMANTIC_VIEW(sales_sv DIMENSIONS c.segment METRICS s.revenue, s.avg_amount);",
         "SET semantic_view_materializations = false;",
@@ -82,7 +87,7 @@ def build_script(rows: int, data_dir: str) -> str:
                 "ALTER SEMANTIC VIEW sales_sv REFRESH MATERIALIZATION auto;",
                 ".timer off",
                 f".print MARK:check:{label}",
-                "SELECT count(*) AS differences FROM ((SELECT * FROM __semantic_materializations.sales_sv__incr__0 EXCEPT ALL SELECT * FROM __semantic_materializations.sales_sv__full_copy__0) UNION ALL (SELECT * FROM __semantic_materializations.sales_sv__full_copy__0 EXCEPT ALL SELECT * FROM __semantic_materializations.sales_sv__incr__0) UNION ALL (SELECT * FROM __semantic_materializations.sales_sv__auto__0 EXCEPT ALL SELECT * FROM __semantic_materializations.sales_sv__full_copy__0) UNION ALL (SELECT * FROM __semantic_materializations.sales_sv__full_copy__0 EXCEPT ALL SELECT * FROM __semantic_materializations.sales_sv__auto__0));",
+                "SELECT count(*) AS differences FROM ((SELECT * FROM query_table(getvariable('incr_table')) EXCEPT ALL SELECT * FROM query_table(getvariable('full_table'))) UNION ALL (SELECT * FROM query_table(getvariable('full_table')) EXCEPT ALL SELECT * FROM query_table(getvariable('incr_table'))) UNION ALL (SELECT * FROM query_table(getvariable('auto_table')) EXCEPT ALL SELECT * FROM query_table(getvariable('full_table'))) UNION ALL (SELECT * FROM query_table(getvariable('full_table')) EXCEPT ALL SELECT * FROM query_table(getvariable('auto_table'))));",
             ]
     return "\n".join(line for line in lines if line) + "\n"
 

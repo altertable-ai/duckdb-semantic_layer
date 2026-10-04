@@ -59,32 +59,59 @@ string SemanticViewRegistry::Key(const QualifiedName &name) {
 	       StringUtil::Lower(name.name);
 }
 
-bool SemanticViewRegistry::Create(shared_ptr<SemanticModel> model, bool replace) {
-	lock_guard<mutex> guard(lock);
+bool SemanticViewRegistry::Create(shared_ptr<SemanticModel> model, bool replace,
+                                  const std::function<void(shared_ptr<SemanticModel>)> &prepare) {
+	lock_guard<mutex> writing(ddl_lock);
 	auto key = Key(model->Name());
-	if (!replace && views.find(key) != views.end()) {
-		return false;
+	shared_ptr<SemanticModel> previous;
+	{
+		lock_guard<mutex> guard(lock);
+		auto current = views.find(key);
+		if (current != views.end()) {
+			if (!replace) {
+				return false;
+			}
+			previous = current->second;
+		}
 	}
+	if (prepare) {
+		prepare(previous);
+	}
+	lock_guard<mutex> guard(lock);
 	views[key] = std::move(model);
 	return true;
 }
 
-bool SemanticViewRegistry::Drop(const QualifiedName &name) {
+bool SemanticViewRegistry::Drop(const QualifiedName &name,
+                                const std::function<void(shared_ptr<SemanticModel>)> &prepare) {
+	lock_guard<mutex> writing(ddl_lock);
+	auto previous = Get(name);
+	if (prepare) {
+		prepare(previous);
+	}
 	lock_guard<mutex> guard(lock);
 	return views.erase(Key(name)) > 0;
 }
 
-bool SemanticViewRegistry::Replace(const SemanticModel &expected, shared_ptr<SemanticModel> model) {
-	lock_guard<mutex> guard(lock);
+bool SemanticViewRegistry::Replace(const SemanticModel &expected, shared_ptr<SemanticModel> model,
+                                   const std::function<void()> &prepare) {
+	lock_guard<mutex> writing(ddl_lock);
 	auto old_key = Key(expected.Name());
 	auto new_key = Key(model->Name());
-	auto current = views.find(old_key);
-	if (current == views.end() || current->second.get() != &expected) {
-		return false;
+	{
+		lock_guard<mutex> guard(lock);
+		auto current = views.find(old_key);
+		if (current == views.end() || current->second.get() != &expected) {
+			return false;
+		}
+		if (new_key != old_key && views.find(new_key) != views.end()) {
+			throw CatalogException("Semantic view with name \"%s\" already exists", model->Name().name);
+		}
 	}
-	if (new_key != old_key && views.find(new_key) != views.end()) {
-		throw CatalogException("Semantic view with name \"%s\" already exists", model->Name().name);
+	if (prepare) {
+		prepare();
 	}
+	lock_guard<mutex> guard(lock);
 	views.erase(old_key);
 	views[new_key] = std::move(model);
 	return true;

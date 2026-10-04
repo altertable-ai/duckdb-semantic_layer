@@ -46,10 +46,13 @@ statement ok
 ALTER SEMANTIC VIEW shop ADD MATERIALIZATION totals IN lake.analytics AS METRICS o.revenue, o.order_count;
 
 statement ok
+SET VARIABLE shop__totals__0 = (SELECT tables[1] FROM (SHOW SEMANTIC MATERIALIZATIONS IN shop) WHERE name = 'totals');
+
+statement ok
 ALTER SEMANTIC VIEW shop ADD MATERIALIZATION mem_copy IN mem AS DIMENSIONS c.segment METRICS o.revenue, o.order_count;
 
 query IIII
-SELECT name, storage, tables, usable FROM (SHOW SEMANTIC MATERIALIZATIONS IN shop) ORDER BY name;
+SELECT name, storage, list_transform(tables, t -> regexp_replace(t, '__[0-9a-f]{32}$', '')), usable FROM (SHOW SEMANTIC MATERIALIZATIONS IN shop) ORDER BY name;
 ----
 lake_copy	lake.__semantic_materializations	[lake.__semantic_materializations.shop__lake_copy__0]	true
 local_copy	materializations_persistence.__semantic_materializations	[materializations_persistence.__semantic_materializations.shop__local_copy__0]	true
@@ -58,13 +61,13 @@ totals	lake.analytics	[lake.analytics.shop__totals__0]	true
 
 # every target is written the same way: the tables, and a metadata row next to them
 query II
-SELECT name, tables FROM lake.__semantic_materializations.__sv_materializations ORDER BY name;
+SELECT name, list_transform(tables, t -> regexp_replace(t, '__[0-9a-f]{32}$', '')) FROM lake.__semantic_materializations.__sv_materializations ORDER BY name;
 ----
 lake_copy	[shop__lake_copy__0]
 totals	[shop__totals__0]
 
 query III
-SELECT __sv_rows, s0_sum, s1_cnt FROM lake.analytics.shop__totals__0;
+SELECT __sv_rows, s0_sum, s1_cnt FROM query_table(getvariable('shop__totals__0'));
 ----
 3	35	3
 
@@ -110,7 +113,7 @@ statement ok
 ALTER SEMANTIC VIEW shop REFRESH MATERIALIZATION totals;
 
 query III
-SELECT __sv_rows, s0_sum, s1_cnt FROM lake.analytics.shop__totals__0;
+SELECT __sv_rows, s0_sum, s1_cnt FROM query_table(getvariable('shop__totals__0'));
 ----
 4	135	4
 
@@ -198,7 +201,7 @@ SELECT count(*) FROM lake.__semantic_materializations.__sv_materializations;
 0
 
 query I
-SELECT table_name FROM duckdb_tables() WHERE schema_name IN ('__semantic_materializations', 'analytics') ORDER BY ALL;
+SELECT regexp_replace(table_name, '__[0-9a-f]{32}$', '') FROM duckdb_tables() WHERE schema_name IN ('__semantic_materializations', 'analytics') ORDER BY ALL;
 ----
 __sv_materializations
 __sv_materializations
@@ -306,7 +309,7 @@ SELECT name, last_refresh_detail, usable FROM (SHOW SEMANTIC MATERIALIZATIONS IN
 kept	initial build	true
 
 query I
-SELECT table_name FROM duckdb_tables() WHERE table_name LIKE 'v\_\_%' ESCAPE '\';
+SELECT regexp_replace(table_name, '__[0-9a-f]{32}$', '') FROM duckdb_tables() WHERE table_name LIKE 'v\_\_%' ESCAPE '\';
 ----
 v__kept__0
 

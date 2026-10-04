@@ -49,6 +49,7 @@ struct SemanticBlockPlan {
 	vector<SemanticAtom> atoms;
 	//! Result type of every atom
 	vector<LogicalType> atom_types;
+	SemanticBlockDependencies dependencies;
 };
 
 //! A block of a query read from a materialization: SELECT <dimensions>, <aggregates> FROM table WHERE where GROUP BY

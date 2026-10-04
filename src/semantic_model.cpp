@@ -1,3 +1,4 @@
+#include "semantic_definition_exception.hpp"
 #include "semantic_model.hpp"
 
 #include "duckdb/common/exception.hpp"
@@ -167,17 +168,20 @@ vector<SemanticEdge> SemanticModel::Path(idx_t from, idx_t to, const vector<idx_
 	case SemanticPathResult::FOUND:
 		return path;
 	case SemanticPathResult::UNREACHABLE:
-		throw BinderException("Semantic view \"%s\": logical table \"%s\" is not reachable from \"%s\" through "
-		                      "many-to-one relationships",
-		                      Name().name, tables[to].name, tables[from].name);
+		throw SemanticDefinitionException(
+		    "Semantic view \"%s\": logical table \"%s\" is not reachable from \"%s\" through "
+		    "many-to-one relationships",
+		    Name().name, tables[to].name, tables[from].name);
 	case SemanticPathResult::EXCLUDED_BY_USING:
-		throw BinderException("Semantic view \"%s\": the USING relationships of the metric do not connect \"%s\" to "
-		                      "\"%s\"",
-		                      Name().name, tables[from].name, tables[to].name);
+		throw SemanticDefinitionException(
+		    "Semantic view \"%s\": the USING relationships of the metric do not connect \"%s\" to "
+		    "\"%s\"",
+		    Name().name, tables[from].name, tables[to].name);
 	case SemanticPathResult::AMBIGUOUS:
-		throw BinderException("Semantic view \"%s\": multiple relationship paths from \"%s\" to \"%s\"; specify "
-		                      "USING (<relationship>) on the metric to choose one",
-		                      Name().name, tables[from].name, tables[to].name);
+		throw SemanticDefinitionException(
+		    "Semantic view \"%s\": multiple relationship paths from \"%s\" to \"%s\"; specify "
+		    "USING (<relationship>) on the metric to choose one",
+		    Name().name, tables[from].name, tables[to].name);
 	}
 	throw InternalException("unknown SemanticPathResult");
 }
@@ -283,14 +287,14 @@ static unique_ptr<ParsedExpression> ResolveColumnRef(const SemanticModel &model,
 	switch (ref.kind) {
 	case SemanticRefKind::MEMBER:
 		if (!context.allow_private && model.members[ref.index].IsPrivate()) {
-			throw BinderException("%sSemantic expression \"%s\" is PRIVATE and cannot be queried", ErrorPrefix(context),
-			                      model.MemberDisplayName(ref.index));
+			throw SemanticDefinitionException("%sSemantic expression \"%s\" is PRIVATE and cannot be queried",
+			                                  ErrorPrefix(context), model.MemberDisplayName(ref.index));
 		}
 		return SemanticMarkers::Member(ref.index);
 	case SemanticRefKind::COLUMN:
 		return SemanticMarkers::Column(ref.index, ref.column);
 	default:
-		throw BinderException("%s%s", ErrorPrefix(context), error);
+		throw SemanticDefinitionException("%s%s", ErrorPrefix(context), error);
 	}
 }
 
@@ -307,7 +311,7 @@ static void ResolveRecursive(const SemanticModel &model, unique_ptr<ParsedExpres
 		return;
 	}
 	if (expr->GetExpressionClass() == ExpressionClass::STAR) {
-		throw BinderException("%s'*' is not supported here", ErrorPrefix(context));
+		throw SemanticDefinitionException("%s'*' is not supported here", ErrorPrefix(context));
 	}
 	// subqueries are left untouched (they must be uncorrelated); their IN-operand is resolved
 	ParsedExpressionIterator::EnumerateChildren(

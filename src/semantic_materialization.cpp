@@ -1,3 +1,4 @@
+#include "semantic_definition_exception.hpp"
 #include "semantic_materialization.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
@@ -23,280 +24,11 @@
 namespace duckdb {
 
 //===--------------------------------------------------------------------===//
-// Aggregate state
-//===--------------------------------------------------------------------===//
-string SemanticAggregateKindToString(SemanticAggregateKind kind) {
-	switch (kind) {
-	case SemanticAggregateKind::SUM:
-		return "SUM";
-	case SemanticAggregateKind::COUNT:
-		return "COUNT";
-	case SemanticAggregateKind::AVG:
-		return "AVG";
-	case SemanticAggregateKind::MIN:
-		return "MIN";
-	case SemanticAggregateKind::MAX:
-		return "MAX";
-	default:
-		return "OPAQUE";
-	}
-}
-
-SemanticAggregateKind ClassifySemanticAggregate(const ParsedExpression &expr, const LogicalType &type) {
-	auto &function = expr.Cast<FunctionExpression>();
-	if (function.distinct || function.export_state || (function.order_bys && !function.order_bys->orders.empty())) {
-		return SemanticAggregateKind::OPAQUE;
-	}
-	auto name = StringUtil::Lower(function.function_name);
-	if (name == "count_star" && function.children.empty()) {
-		return SemanticAggregateKind::COUNT;
-	}
-	if (function.children.size() != 1) {
-		return SemanticAggregateKind::OPAQUE;
-	}
-	if (name == "sum") {
-		return SemanticAggregateKind::SUM;
-	}
-	if (name == "count") {
-		return SemanticAggregateKind::COUNT;
-	}
-	if ((name == "avg" || name == "mean") && type.id() == LogicalTypeId::DOUBLE) {
-		// sum / count reproduces the average of numbers (DOUBLE); averages of other types are stored as is
-		return SemanticAggregateKind::AVG;
-	}
-	if (name == "min") {
-		return SemanticAggregateKind::MIN;
-	}
-	if (name == "max") {
-		return SemanticAggregateKind::MAX;
-	}
-	return SemanticAggregateKind::OPAQUE;
-}
-
-vector<string> SemanticMaterializedAtom::StateColumns() const {
-	switch (kind) {
-	case SemanticAggregateKind::SUM:
-	case SemanticAggregateKind::AVG:
-		return {prefix + "_sum", prefix + "_cnt"};
-	case SemanticAggregateKind::COUNT:
-		return {prefix + "_cnt"};
-	case SemanticAggregateKind::MIN:
-		return {prefix + "_min"};
-	case SemanticAggregateKind::MAX:
-		return {prefix + "_max"};
-	default:
-		return {prefix + "_val"};
-	}
-}
-
-static unique_ptr<ParsedExpression> Call(const string &name, vector<unique_ptr<ParsedExpression>> children) {
-	return make_uniq<FunctionExpression>(name, std::move(children));
-}
-
-static unique_ptr<ParsedExpression> Call(const string &name, unique_ptr<ParsedExpression> child) {
-	vector<unique_ptr<ParsedExpression>> children;
-	children.push_back(std::move(child));
-	return Call(name, std::move(children));
-}
-
-vector<unique_ptr<ParsedExpression>> SemanticStateExpressions(const SemanticMaterializedAtom &atom,
-                                                              const FunctionExpression &compiled) {
-	// the same aggregate (and FILTER) over the same argument, decomposed into its state
-	auto over_argument = [&](const string &name) {
-		auto result = Call(name, compiled.children[0]->Copy());
-		result->Cast<FunctionExpression>().filter = compiled.filter ? compiled.filter->Copy() : nullptr;
-		return result;
-	};
-	vector<unique_ptr<ParsedExpression>> result;
-	switch (atom.kind) {
-	case SemanticAggregateKind::SUM:
-	case SemanticAggregateKind::AVG:
-		result.push_back(over_argument("sum"));
-		result.push_back(over_argument("count"));
-		break;
-	default:
-		result.push_back(compiled.Copy());
-		break;
-	}
-	auto columns = atom.StateColumns();
-	for (idx_t c = 0; c < result.size(); c++) {
-		result[c]->alias = columns[c];
-	}
-	return result;
-}
-
-unique_ptr<ParsedExpression> SemanticRollupExpression(const SemanticMaterializedAtom &atom, const string &alias) {
-	auto column = [&](const string &suffix) {
-		return ColumnRef(atom.prefix + suffix, alias);
-	};
-	unique_ptr<ParsedExpression> result;
-	switch (atom.kind) {
-	case SemanticAggregateKind::SUM:
-		result = Call("sum", column("_sum"));
-		break;
-	case SemanticAggregateKind::COUNT: {
-		// COUNT over no rows is 0, SUM over no rows is NULL
-		auto coalesce = make_uniq<OperatorExpression>(ExpressionType::OPERATOR_COALESCE);
-		coalesce->children.push_back(Call("sum", column("_cnt")));
-		coalesce->children.push_back(make_uniq<ConstantExpression>(Value::BIGINT(0)));
-		result = std::move(coalesce);
-		break;
-	}
-	case SemanticAggregateKind::AVG: {
-		vector<unique_ptr<ParsedExpression>> count;
-		count.push_back(Call("sum", column("_cnt")));
-		count.push_back(make_uniq<ConstantExpression>(Value::BIGINT(0)));
-		vector<unique_ptr<ParsedExpression>> division;
-		division.push_back(make_uniq<CastExpression>(LogicalType::DOUBLE, Call("sum", column("_sum"))));
-		division.push_back(Call("nullif", std::move(count)));
-		result = make_uniq<FunctionExpression>("/", std::move(division), nullptr, nullptr, false, true);
-		break;
-	}
-	case SemanticAggregateKind::MIN:
-		result = Call("min", column("_min"));
-		break;
-	case SemanticAggregateKind::MAX:
-		result = Call("max", column("_max"));
-		break;
-	default:
-		result = Call("any_value", column("_val"));
-		break;
-	}
-	return make_uniq<CastExpression>(atom.type, std::move(result));
-}
-
-//===--------------------------------------------------------------------===//
 // Planning
 //===--------------------------------------------------------------------===//
 string SemanticMaterialization::TableName(idx_t block) const {
 	return QuoteIdentifier(state->catalog) + "." + QuoteIdentifier(state->schema) + "." +
 	       QuoteIdentifier(state->tables[block]);
-}
-
-//! Whether evaluating `expr` per row reads rows we cannot attribute to a single row of its table (child aggregations,
-//! subqueries), so that changes of other tables could change it unnoticed
-static bool ReadsOtherRows(const SemanticModel &model, SemanticAnalyzer &analyzer, const ParsedExpression &expr) {
-	if (expr.GetExpressionClass() == ExpressionClass::SUBQUERY || analyzer.IsAggregate(expr)) {
-		return true;
-	}
-	auto ref = SemanticMarkers::Classify(expr);
-	if (ref.Is(SemanticRefKind::MEMBER)) {
-		return ReadsOtherRows(model, analyzer, *model.members[ref.index].resolved);
-	}
-	bool found = false;
-	ParsedExpressionIterator::EnumerateChildren(
-	    expr, [&](const ParsedExpression &child) { found = found || ReadsOtherRows(model, analyzer, child); });
-	return found;
-}
-
-//! Finds the nested (child) aggregations of a block's row-level expressions, the way the query compiler expands
-//! them into correlated subqueries, and records the tables they read and whether incremental refresh can follow
-//! their changes
-class NestedAggregates {
-public:
-	NestedAggregates(const SemanticModel &model, SemanticAnalyzer &analyzer, SemanticMaterializedBlock &block,
-	                 const string &what)
-	    : model(model), analyzer(analyzer), block(block), what(what) {
-	}
-
-	//! Collects the nested aggregations of `expr`, evaluated per row of `context`
-	void Collect(const ParsedExpression &expr, idx_t context, idx_t depth = 0) {
-		auto ref = SemanticMarkers::Classify(expr);
-		if (expr.GetExpressionClass() == ExpressionClass::SUBQUERY) {
-			Unsupported("a metric uses a subquery");
-		} else if (ref.Is(SemanticRefKind::MEMBER) && model.members[ref.index].IsRowLevel()) {
-			auto &member = model.members[ref.index];
-			Collect(*member.resolved, member.table, depth);
-		} else if (ref.Is(SemanticRefKind::MEMBER)) {
-			vector<SemanticAtom> atoms;
-			analyzer.DecomposeMetric(ref.index, atoms, what);
-			for (auto &atom : atoms) {
-				Add(atom, context, depth);
-			}
-		} else if (analyzer.IsAggregate(expr)) {
-			SemanticAtom atom;
-			atom.home = analyzer.AggregateHome(expr.Cast<FunctionExpression>(), context, what);
-			atom.aggregate = expr.Copy();
-			atom.context.using_relationships = block.using_relationships;
-			Add(atom, context, depth);
-		} else {
-			ParsedExpressionIterator::EnumerateChildren(
-			    expr, [&](const ParsedExpression &child) { Collect(child, context, depth); });
-		}
-	}
-
-	//! Why incremental refresh cannot follow the changes of the nested aggregations (empty: it can)
-	string unsupported;
-
-private:
-	//! The rows of atom.home belonging to the current row of `context`, aggregated
-	void Add(const SemanticAtom &atom, idx_t context, idx_t depth) {
-		block.nested_tables.insert(atom.home);
-		set<idx_t> read;
-		ParsedExpressionIterator::EnumerateChildren(*atom.aggregate, [&](const ParsedExpression &child) {
-			analyzer.RowTables(child, atom.home, read, what);
-			Collect(child, atom.home, depth + 1);
-		});
-		bool own_columns = true;
-		for (auto table : read) {
-			if (table == atom.home) {
-				continue;
-			}
-			own_columns = false;
-			auto from = model.Reaches(context, table) ? context : atom.home;
-			for (auto &edge : model.Path(from, table, atom.context.using_relationships)) {
-				block.nested_tables.insert(edge.target);
-			}
-		}
-		if (context == DConstants::INVALID_INDEX || !model.Reaches(atom.home, context)) {
-			Unsupported("a metric aggregates rows of logical table \"" + model.tables[atom.home].name + "\"");
-			return;
-		}
-		auto path = model.Path(atom.home, context, atom.context.using_relationships);
-		if (depth > 0 || path.size() != 1 || !own_columns || block.tables.count(atom.home) ||
-		    !block.tables.count(context)) {
-			Unsupported("a metric aggregates rows of logical table \"" + model.tables[atom.home].name +
-			            "\" in a way incremental refresh does not follow (only aggregations of the columns of a table "
-			            "directly referencing a table of the materialization are)");
-			return;
-		}
-		auto &rel = model.relationships[path[0].relationship];
-		SemanticMaterializedChild child;
-		child.table = atom.home;
-		child.parent = context;
-		child.columns = path[0].reversed ? rel.to_columns : rel.from_columns;
-		child.parent_columns = path[0].reversed ? rel.from_columns : rel.to_columns;
-		for (auto &existing : block.children) {
-			if (existing.table == child.table && existing.parent == child.parent && existing.columns == child.columns) {
-				return;
-			}
-		}
-		block.children.push_back(std::move(child));
-	}
-
-	void Unsupported(const string &reason) {
-		if (unsupported.empty()) {
-			unsupported = reason;
-		}
-	}
-
-	const SemanticModel &model;
-	SemanticAnalyzer &analyzer;
-	SemanticMaterializedBlock &block;
-	const string &what;
-};
-
-//! Adds the tables on the join path from `home` to every table `expr` reads
-static void CollectPathTables(const SemanticModel &model, SemanticAnalyzer &analyzer, const ParsedExpression &expr,
-                              idx_t context, const SemanticMaterializedBlock &block, set<idx_t> &tables,
-                              const string &what) {
-	set<idx_t> read;
-	analyzer.RowTables(expr, context, read, what);
-	for (auto table : read) {
-		for (auto &edge : model.Path(block.home, table, block.using_relationships)) {
-			tables.insert(edge.target);
-		}
-	}
 }
 
 shared_ptr<SemanticMaterialization> PlanSemanticMaterialization(ClientContext &context, SemanticModel &model,
@@ -327,79 +59,62 @@ shared_ptr<SemanticMaterialization> PlanSemanticMaterialization(ClientContext &c
 	}
 	result->dimension_count = result->dimension_names.size();
 	if (result->metric_names.empty()) {
-		throw BinderException("%s: a materialization needs at least one metric", what);
+		throw SemanticDefinitionException("%s: a materialization needs at least one metric", what);
 	}
 	vector<SemanticBlockPlan> plans;
 	try {
 		plans = compiler.PlanBlocks(result->spec);
+	} catch (SemanticDefinitionException &ex) {
+		ErrorData error(ex);
+		throw SemanticDefinitionException("%s: %s", what, error.RawMessage());
 	} catch (std::exception &ex) {
 		ErrorData error(ex);
 		throw BinderException("%s: %s", what, error.RawMessage());
 	}
 	idx_t atom_count = 0;
-	vector<string> nested_unsupported;
+
 	for (auto &plan : plans) {
 		if (plan.non_additive_member != DConstants::INVALID_INDEX) {
-			throw BinderException("%s: semi-additive metric \"%s\" (NON ADDITIVE BY) cannot be materialized", what,
-			                      model.MemberDisplayName(plan.non_additive_member));
+			throw SemanticDefinitionException(
+			    "%s: semi-additive metric \"%s\" (NON ADDITIVE BY) cannot be materialized", what,
+			    model.MemberDisplayName(plan.non_additive_member));
 		}
 		SemanticMaterializedBlock block;
 		block.home = plan.home;
 		block.using_relationships = plan.using_relationships;
-		block.tables.insert(plan.home);
-		for (idx_t d = 0; d < result->dimension_count; d++) {
-			set<idx_t> read;
-			analyzer.RowTables(*result->spec.items[d].resolved, DConstants::INVALID_INDEX, read, what);
-			for (auto table : read) {
-				if (!model.Reaches(plan.home, table)) {
-					throw BinderException("%s: dimension \"%s\" is not reachable from logical table \"%s\" through "
-					                      "many-to-one relationships (many-to-many bridges cannot be materialized)",
-					                      what, result->dimension_names[d], model.tables[plan.home].name);
-				}
-			}
-			CollectPathTables(model, analyzer, *result->spec.items[d].resolved, DConstants::INVALID_INDEX, block,
-			                  block.tables, what);
-		}
+		block.tables = std::move(plan.dependencies.tables);
+		block.nested_tables = std::move(plan.dependencies.nested_tables);
+		block.children = std::move(plan.dependencies.children);
+		block.dependencies_complete = plan.dependencies.complete;
 		for (idx_t k = 0; k < plan.atoms.size(); k++) {
 			SemanticMaterializedAtom atom;
 			atom.kind = ClassifySemanticAggregate(*plan.atoms[k].aggregate, plan.atom_types[k]);
 			atom.type = plan.atom_types[k];
 			atom.prefix = "s" + to_string(atom_count++);
-			ParsedExpressionIterator::EnumerateChildren(*plan.atoms[k].aggregate, [&](const ParsedExpression &child) {
-				CollectPathTables(model, analyzer, child, plan.atoms[k].home, block, block.tables, what);
-			});
 			atom.atom = std::move(plan.atoms[k]);
 			block.atoms.push_back(std::move(atom));
 		}
-		NestedAggregates nested(model, analyzer, block, what);
-		for (idx_t d = 0; d < result->dimension_count; d++) {
-			nested.Collect(*result->spec.items[d].resolved, DConstants::INVALID_INDEX);
+		for (auto &child : block.children) {
+			if (block.tables.count(child.table) || !block.tables.count(child.parent)) {
+				plan.dependencies.Unsupported("a child aggregation overlaps the block's row joins");
+			}
 		}
-		for (auto &atom : block.atoms) {
-			ParsedExpressionIterator::EnumerateChildren(
-			    *atom.atom.aggregate, [&](const ParsedExpression &child) { nested.Collect(child, atom.atom.home); });
+		if (!plan.dependencies.incremental_reason.empty() && result->incremental_reason.empty()) {
+			result->incremental_reason = plan.dependencies.incremental_reason;
 		}
-		nested_unsupported.push_back(nested.unsupported);
 		result->blocks.push_back(std::move(block));
 	}
 	// incremental maintenance: every block must read plain many-to-one joins of DuckLake tables, row by row
-	result->incremental = true;
+	result->incremental = result->incremental_reason.empty();
 	auto unsupported = [&](const string &reason) {
 		if (result->incremental) {
 			result->incremental = false;
 			result->incremental_reason = reason;
 		}
 	};
-	for (idx_t d = 0; d < result->dimension_count; d++) {
-		if (ReadsOtherRows(model, analyzer, *result->spec.items[d].resolved)) {
-			unsupported("dimension \"" + result->dimension_names[d] + "\" aggregates rows or uses a subquery");
-		}
-	}
 	for (idx_t b = 0; b < result->blocks.size(); b++) {
 		auto &block = result->blocks[b];
-		if (!nested_unsupported[b].empty()) {
-			unsupported(nested_unsupported[b]);
-		}
+
 		for (auto table : block.tables) {
 			for (auto &edge : model.Path(block.home, table, block.using_relationships)) {
 				auto &rel = model.relationships[edge.relationship];
@@ -429,9 +144,6 @@ shared_ptr<SemanticMaterialization> PlanSemanticMaterialization(ClientContext &c
 		throw BinderException("%s: materializations are stored in DuckDB databases or DuckLake catalogs, not in "
 		                      "\"%s\" (%s)",
 		                      what, catalog->GetName(), type);
-	}
-	if (catalog->GetAttached().IsReadOnly()) {
-		throw BinderException("%s: database \"%s\" is read-only", what, catalog->GetName());
 	}
 	result->storage_catalog = catalog->GetName();
 	result->storage_schema = parsed.storage_schema.empty() ? SEMANTIC_MATERIALIZATION_SCHEMA : parsed.storage_schema;
@@ -496,11 +208,12 @@ map<string, vector<SemanticSourceTable>> SemanticMaterializationSources(ClientCo
                                                                         bool &all_tracked) {
 	map<string, vector<SemanticSourceTable>> result;
 	set<idx_t> tables;
+	all_tracked = true;
 	for (auto &block : materialization.blocks) {
+		all_tracked = all_tracked && block.dependencies_complete;
 		auto sources = block.SourceTables();
 		tables.insert(sources.begin(), sources.end());
 	}
-	all_tracked = true;
 	for (auto table : tables) {
 		string reason;
 		auto source = ClassifySemanticSource(context, model, table, reason);
@@ -537,11 +250,15 @@ SemanticMaterializationStatus GetMaterializationStatus(ClientContext &context, c
 		}
 	}
 	string stale_reason;
-	if (watermark.empty()) {
+	bool all_tracked;
+	auto sources = SemanticMaterializationSources(context, model, materialization, all_tracked);
+	bool covered = all_tracked && sources.size() == watermark.size();
+	for (auto &source : sources) {
+		covered = covered && watermark.count(source.first);
+	}
+	if (!covered || watermark.empty()) {
 		stale_reason = "its sources are not change-tracked (only DuckLake tables are), so its freshness is unknown";
 	} else {
-		bool all_tracked;
-		auto sources = SemanticMaterializationSources(context, model, materialization, all_tracked);
 		SemanticChangeTracker tracker(context);
 		map<string, idx_t> current;
 		for (auto &entry : watermark) {

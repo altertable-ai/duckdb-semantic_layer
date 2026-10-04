@@ -1,0 +1,104 @@
+# name: test/sql/semantic_views/materializations_atomic_ddl.test
+# description: storage failures leave registry, materialization state and physical tables intact
+# group: [semantic_views]
+
+require semantic_views
+
+statement ok
+CREATE TABLE t (id INTEGER, amount INTEGER);
+INSERT INTO t VALUES (1, 10);
+CREATE SEMANTIC VIEW v TABLES (t AS t PRIMARY KEY (id)) METRICS (t.total AS SUM(amount));
+ALTER SEMANTIC VIEW v ADD MATERIALIZATION m AS METRICS t.total;
+ALTER SEMANTIC VIEW v SET MAX_STALENESS = 3600;
+ALTER TABLE __semantic_materializations.__sv_materializations ADD PRIMARY KEY (view_catalog, view_schema, view_name, name);
+CREATE TABLE __semantic_materializations.blocker (view_catalog VARCHAR, view_schema VARCHAR, view_name VARCHAR, name VARCHAR,
+  FOREIGN KEY (view_catalog, view_schema, view_name, name) REFERENCES __semantic_materializations.__sv_materializations (view_catalog, view_schema, view_name, name));
+INSERT INTO __semantic_materializations.blocker VALUES ('memory', 'main', 'v', 'm');
+
+statement error
+ALTER SEMANTIC VIEW v DROP MATERIALIZATION m;
+----
+foreign key
+
+query II
+SELECT name, usable FROM (SHOW SEMANTIC MATERIALIZATIONS IN v);
+----
+m	true
+
+statement error
+ALTER SEMANTIC VIEW v RENAME TO renamed;
+----
+foreign key
+
+query I
+SELECT * FROM SEMANTIC_VIEW(v METRICS t.total);
+----
+10
+
+statement error
+CREATE OR REPLACE SEMANTIC VIEW v TABLES (t AS t PRIMARY KEY (id)) METRICS (t.n AS COUNT(*));
+----
+foreign key
+
+query I
+SELECT * FROM SEMANTIC_VIEW(v METRICS t.total);
+----
+10
+
+statement error
+DROP SEMANTIC VIEW v;
+----
+foreign key
+
+query II
+SELECT name, usable FROM (SHOW SEMANTIC MATERIALIZATIONS IN v);
+----
+m	true
+
+statement ok
+DELETE FROM __semantic_materializations.blocker;
+DROP SEMANTIC VIEW v;
+
+query I
+SELECT count(*) FROM __semantic_materializations.__sv_materializations;
+----
+0
+
+# A failure in another storage database rolls back the already staged operations in the first one.
+statement ok
+ATTACH ':memory:' AS other;
+CREATE SEMANTIC VIEW multi TABLES (t AS t PRIMARY KEY (id)) METRICS (t.total AS SUM(amount));
+ALTER SEMANTIC VIEW multi ADD MATERIALIZATION local_copy AS METRICS t.total;
+ALTER SEMANTIC VIEW multi ADD MATERIALIZATION remote_copy IN other AS METRICS t.total;
+ALTER SEMANTIC VIEW multi SET MAX_STALENESS = 3600;
+ALTER TABLE other.__semantic_materializations.__sv_materializations ADD PRIMARY KEY (view_catalog, view_schema, view_name, name);
+USE other.__semantic_materializations;
+CREATE TABLE blocker (view_catalog VARCHAR, view_schema VARCHAR, view_name VARCHAR, name VARCHAR,
+  FOREIGN KEY (view_catalog, view_schema, view_name, name) REFERENCES __sv_materializations (view_catalog, view_schema, view_name, name));
+USE memory.main;
+INSERT INTO other.__semantic_materializations.blocker VALUES ('memory', 'main', 'multi', 'remote_copy');
+
+statement error
+DROP SEMANTIC VIEW multi;
+----
+foreign key
+
+query II
+SELECT name, usable FROM (SHOW SEMANTIC MATERIALIZATIONS IN multi) ORDER BY name;
+----
+local_copy	true
+remote_copy	true
+
+query I
+SELECT count(*) FROM __semantic_materializations.__sv_materializations WHERE view_name = 'multi';
+----
+1
+
+statement ok
+DELETE FROM other.__semantic_materializations.blocker;
+DROP SEMANTIC VIEW multi;
+
+query I
+SELECT (SELECT count(*) FROM __semantic_materializations.__sv_materializations) + (SELECT count(*) FROM other.__semantic_materializations.__sv_materializations);
+----
+0

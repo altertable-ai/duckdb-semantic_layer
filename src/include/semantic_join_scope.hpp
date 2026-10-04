@@ -14,6 +14,7 @@
 #include "duckdb/common/string.hpp"
 #include "duckdb/common/to_string.hpp"
 #include "semantic_model.hpp"
+#include "semantic_query_dependencies.hpp"
 
 namespace duckdb {
 
@@ -40,7 +41,8 @@ class SemanticJoinScope {
 public:
 	SemanticJoinScope(const SemanticModel &model, SemanticAliasGenerator &aliases, idx_t base,
 	                  vector<idx_t> using_relationships, string prefix = string(),
-	                  optional_ptr<const SemanticTableSources> sources = nullptr);
+	                  optional_ptr<const SemanticTableSources> sources = nullptr,
+	                  optional_ptr<SemanticBlockDependencies> dependencies = nullptr);
 
 	//! Scope of a correlated subquery over `base`: tables reachable from `outer_context` (the row the subquery
 	//! belongs to) resolve in this scope instead
@@ -57,6 +59,16 @@ public:
 	//! small join of those values with the range table instead of a range join over every row.
 	unique_ptr<ParsedExpression> ColumnReference(idx_t table, const string &column);
 	unique_ptr<TableRef> BuildFrom() const;
+
+	optional_ptr<SemanticBlockDependencies> Dependencies() const {
+		return dependencies;
+	}
+	idx_t Depth() const {
+		return depth;
+	}
+	bool ReadsOnlyBase() const {
+		return present.size() == 1 && !reads_outer;
+	}
 
 private:
 	struct Joined {
@@ -77,6 +89,9 @@ private:
 	vector<idx_t> using_relationships;
 	string prefix;
 	optional_ptr<const SemanticTableSources> sources;
+	optional_ptr<SemanticBlockDependencies> dependencies;
+	idx_t depth = 0;
+	bool reads_outer = false;
 	optional_ptr<SemanticJoinScope> outer;
 	idx_t outer_context = DConstants::INVALID_INDEX;
 	vector<Joined> joins;

@@ -372,7 +372,9 @@ DuckDB database, file or in-memory, or DuckLake catalog; `IN lake.analytics` als
 group of the materialization's dimensions and holds the *state* of every aggregate rather than its final value, so
 that coarser queries and incremental refreshes stay exact: `SUM` stores a sum and a count, `AVG` a sum and a count,
 `COUNT` a count, `MIN` / `MAX` the extreme value, plus the number of rows of the group. Other aggregates
-(`COUNT(DISTINCT ...)`, `median`, ...) are stored as they are.
+(`COUNT(DISTINCT ...)`, `median`, ...) are stored as they are. Physical table names include a persisted allocation ID,
+so identically named views in different schemas or databases have separate storage; renames keep the same tables.
+Restoration rejects legacy allocations claimed by multiple owners and preserves their tables and metadata.
 
 **When a query uses it.** A block of a query is read from a materialization when the materialization stores all of
 its aggregates, the query's dimensions and `WHERE` clause can be computed from the stored dimensions (for example
@@ -386,7 +388,9 @@ materializations and blocks computed from the sources. `semantic_view_sql()` sho
 **Freshness.** Materializations of DuckLake tables record the snapshot they were built at; a query uses one only if
 none of its sources changed since (or within `MAX_STALENESS`, see below). DuckDB tables have no change tracking, so a
 materialization over them is used only when the semantic view sets `MAX_STALENESS` (seconds since its last refresh);
-otherwise queries read the sources. Prepared statements check freshness again at every execution.
+otherwise queries read the sources. SQL subqueries can read sources outside the semantic model, and user-defined SQL
+macros can be replaced without changing any source snapshot. Materializations using either have unknown freshness
+and require `MAX_STALENESS` to be read. Prepared statements check freshness again at every execution.
 `SHOW SEMANTIC MATERIALIZATIONS` tells whether each materialization is usable and why not.
 
 **Refresh.** `REFRESH MATERIALIZATION` brings a materialization up to date in its own transaction, using its
@@ -414,7 +418,7 @@ metadata, reads their inserted and deleted rows since the last refresh (`ducklak
   affected group of an aggregate stored as is.
 
 A refresh falls back to a full rebuild (or fails in `INCREMENTAL` mode) when a source is not a DuckLake table, a
-dimension aggregates other rows, a metric uses a subquery or a nested aggregation of anything but the columns of a
+dimension aggregates other rows, a metric uses a subquery, a replaceable SQL macro, or a nested aggregation of anything but the columns of a
 table directly referencing a table of the materialization, a join uses an `ASOF` or range relationship, the change
 history since the last refresh was expired, the definition of a source table changed (altered, dropped or
 re-created: changes to other tables do not matter), or the materialization's table is missing. Without source
@@ -431,6 +435,11 @@ with the new definition is rebuilt by its next refresh; one the new definition c
 a materialization that is already stored with the same definition reattaches it too. `DROP SEMANTIC VIEW` and
 `DROP MATERIALIZATION` drop the tables and their records; renaming the view keeps them. A DuckLake catalog attached
 under another name is found again (materializations stored in in-memory databases are gone with them).
+
+Valid materializations can be reattached from read-only storage; adding, refreshing, dropping or renaming them
+requires writable storage. DDL stages its storage changes before publishing the new semantic view, so a failed
+build or storage update leaves the registered view intact. Tables and metadata change together in each storage
+database. Changes spanning multiple databases prepare all operations before committing each database separately.
 
 Materializations cannot include semi-additive metrics or dimensions reached through a many-to-many bridge.
 

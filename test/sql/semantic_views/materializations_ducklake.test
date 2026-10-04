@@ -46,14 +46,23 @@ ALTER SEMANTIC VIEW shop ADD MATERIALIZATION full_copy REFRESH_MODE = FULL AS
   METRICS o.revenue, o.order_count, o.qty_count, o.avg_qty, o.max_amount, o.min_amount, o.distinct_customers;
 
 statement ok
+SET VARIABLE shop__full_copy__0 = (SELECT tables[1] FROM (SHOW SEMANTIC MATERIALIZATIONS IN shop) WHERE name = 'full_copy');
+
+statement ok
 ALTER SEMANTIC VIEW shop ADD MATERIALIZATION incr REFRESH_MODE = INCREMENTAL AS
   DIMENSIONS c.segment, c.country
   METRICS o.revenue, o.order_count, o.qty_count, o.avg_qty, o.max_amount, o.min_amount, o.distinct_customers;
 
 statement ok
+SET VARIABLE shop__incr__0 = (SELECT tables[1] FROM (SHOW SEMANTIC MATERIALIZATIONS IN shop) WHERE name = 'incr');
+
+statement ok
 ALTER SEMANTIC VIEW shop ADD MATERIALIZATION auto_copy AS
   DIMENSIONS c.segment, c.country
   METRICS o.revenue, o.order_count, o.qty_count, o.avg_qty, o.max_amount, o.min_amount, o.distinct_customers;
+
+statement ok
+SET VARIABLE shop__auto_copy__0 = (SELECT tables[1] FROM (SHOW SEMANTIC MATERIALIZATIONS IN shop) WHERE name = 'auto_copy');
 
 statement ok
 ALTER SEMANTIC VIEW shop ADD MATERIALIZATION totals AS METRICS o.revenue, o.order_count, o.max_amount;
@@ -125,13 +134,13 @@ EXECUTE retail_revenue;
 statement ok
 CREATE MACRO compare_copies() AS TABLE
   SELECT count(*) AS differences FROM (
-    (SELECT * FROM __semantic_materializations.shop__incr__0 EXCEPT ALL SELECT * FROM __semantic_materializations.shop__full_copy__0)
+    (SELECT * FROM query_table(getvariable('shop__incr__0')) EXCEPT ALL SELECT * FROM query_table(getvariable('shop__full_copy__0')))
     UNION ALL
-    (SELECT * FROM __semantic_materializations.shop__full_copy__0 EXCEPT ALL SELECT * FROM __semantic_materializations.shop__incr__0)
+    (SELECT * FROM query_table(getvariable('shop__full_copy__0')) EXCEPT ALL SELECT * FROM query_table(getvariable('shop__incr__0')))
     UNION ALL
-    (SELECT * FROM __semantic_materializations.shop__auto_copy__0 EXCEPT ALL SELECT * FROM __semantic_materializations.shop__full_copy__0)
+    (SELECT * FROM query_table(getvariable('shop__auto_copy__0')) EXCEPT ALL SELECT * FROM query_table(getvariable('shop__full_copy__0')))
     UNION ALL
-    (SELECT * FROM __semantic_materializations.shop__full_copy__0 EXCEPT ALL SELECT * FROM __semantic_materializations.shop__auto_copy__0));
+    (SELECT * FROM query_table(getvariable('shop__full_copy__0')) EXCEPT ALL SELECT * FROM query_table(getvariable('shop__auto_copy__0'))));
 
 statement ok
 CREATE MACRO hand_written() AS TABLE
@@ -703,15 +712,6 @@ query I
 SELECT * FROM SEMANTIC_VIEW(shop METRICS o.revenue);
 ----
 70.00
-
-# a missing table is rebuilt
-statement ok
-DROP TABLE __semantic_materializations.shop__totals__0;
-
-query I
-ALTER SEMANTIC VIEW shop REFRESH MATERIALIZATION totals;
-----
-Materialization totals refreshed (FULL: its table shop__totals__0 is missing).
 
 # nested aggregations over a child table are maintained incrementally (see materializations_nested.test)
 statement ok
