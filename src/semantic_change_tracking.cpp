@@ -57,51 +57,103 @@ unique_ptr<MaterializedQueryResult> SemanticChangeTracker::Run(const string &sql
 	return result;
 }
 
-idx_t SemanticChangeTracker::CurrentSnapshot(const string &catalog) {
-	auto result = Run("SELECT id FROM ducklake_current_snapshot(" + Literal(catalog) + ")");
-	return result->GetValue(0, 0).GetValue<idx_t>();
-}
-
-bool SemanticChangeTracker::SnapshotAvailable(const string &catalog, idx_t snapshot) {
-	auto result = Run("SELECT count(*) FROM ducklake_snapshots(" + Literal(catalog) +
-	                  ") WHERE snapshot_id = " + to_string(snapshot));
-	return result->GetValue(0, 0).GetValue<int64_t>() > 0;
-}
-
-bool SemanticChangeTracker::SchemaChanged(const SemanticSourceTable &table, idx_t from, idx_t to) {
-	// conservative: any schema change of the catalog in (from, to] counts (DuckLake bumps schema_version on DDL)
-	auto result = Run("SELECT count(DISTINCT schema_version) FROM ducklake_snapshots(" + Literal(table.catalog) +
-	                  ") WHERE snapshot_id IN (" + to_string(from) + ", " + to_string(to) + ")");
-	return result->GetValue(0, 0).GetValue<int64_t>() != 1;
-}
-
-SemanticTableChanges SemanticChangeTracker::RowChanges(const SemanticSourceTable &table, idx_t from, idx_t to) {
-	// every snapshot lists the ids of the tables it changed, per kind of change; tables of the same name in other
-	// schemas are counted too (conservative)
-	auto ids = "(SELECT list(table_id::VARCHAR) FROM ducklake_table_info(" + Literal(table.catalog) +
-	           ") WHERE table_name = " + Literal(table.table) + ")";
-	auto result = Run("SELECT kind, bool_or(len(list_intersect(ids, " + ids +
-	                  ")) > 0) FROM (SELECT unnest(map_keys(changes)) AS kind, unnest(map_values(changes)) AS ids FROM "
-	                  "ducklake_snapshots(" +
-	                  Literal(table.catalog) + ") WHERE snapshot_id > " + to_string(from) +
-	                  " AND snapshot_id <= " + to_string(to) + ") GROUP BY kind");
-	SemanticTableChanges changes;
+SemanticCatalogChanges SemanticChangeTracker::CatalogChanges(const string &catalog, optional_idx since) {
+	auto name = Literal(catalog);
+	string sql =
+	    "SELECT 'current' AS kind, NULL::VARCHAR AS value, NULL::VARCHAR AS extra, id::BIGINT AS snapshot FROM "
+	    "ducklake_current_snapshot(" +
+	    name + ")";
+	if (since.IsValid()) {
+		auto from = to_string(since.GetIndex());
+		sql += " UNION ALL SELECT 'available', NULL, NULL, count(*) FROM ducklake_snapshots(" + name +
+		       ") WHERE snapshot_id = " + from;
+		sql += " UNION ALL SELECT 'table', table_name, schema_id::VARCHAR, table_id FROM ducklake_table_info(" + name +
+		       ")";
+		sql += " UNION ALL SELECT kind, unnest(ids), NULL, snapshot_id FROM (SELECT snapshot_id, "
+		       "unnest(map_keys(changes)) "
+		       "AS kind, unnest(map_values(changes)) AS ids FROM ducklake_snapshots(" +
+		       name + ") WHERE snapshot_id > " + from + ")";
+	}
+	auto result = Run(sql);
+	SemanticCatalogChanges changes;
+	vector<pair<idx_t, pair<string, string>>> raw;
 	for (idx_t row = 0; row < result->RowCount(); row++) {
 		auto kind = result->GetValue(0, row).ToString();
-		if (!result->GetValue(1, row).GetValue<bool>()) {
-			continue;
+		auto snapshot = result->GetValue(3, row);
+		if (kind == "current") {
+			changes.current = snapshot.GetValue<idx_t>();
+		} else if (kind == "available") {
+			changes.available = snapshot.GetValue<int64_t>() > 0;
+		} else if (kind == "table") {
+			changes.tables.push_back(
+			    {result->GetValue(1, row).ToString(), snapshot.ToString(), result->GetValue(2, row).ToString()});
+		} else if (!result->GetValue(1, row).IsNull()) {
+			raw.emplace_back(snapshot.GetValue<idx_t>(), make_pair(kind, result->GetValue(1, row).ToString()));
 		}
-		if (kind == "tables_inserted_into" || kind == "inlined_insert") {
-			changes.inserted = true;
-		} else if (kind == "tables_deleted_from" || kind == "inlined_delete") {
-			changes.deleted = true;
-		} else {
-			// any other change of the table: assume rows were both inserted and deleted
-			changes.inserted = true;
-			changes.deleted = true;
+	}
+	// snapshots committed after the current one was read belong to the next refresh
+	for (auto &entry : raw) {
+		if (entry.first <= changes.current) {
+			changes.changes.push_back(std::move(entry.second));
 		}
 	}
 	return changes;
+}
+
+static bool IsSchemaChange(const string &kind) {
+	return StringUtil::StartsWith(kind, "tables_created") || StringUtil::StartsWith(kind, "tables_dropped") ||
+	       StringUtil::StartsWith(kind, "tables_altered") || StringUtil::StartsWith(kind, "schemas_") ||
+	       StringUtil::StartsWith(kind, "views_") || StringUtil::Contains(kind, "macros_");
+}
+
+SemanticTableChanges SemanticCatalogChanges::RowChanges(const SemanticSourceTable &table) const {
+	// tables of the same name in other schemas are counted too (the table info has no schema names): conservative
+	case_insensitive_set_t ids;
+	for (auto &entry : tables) {
+		if (StringUtil::CIEquals(entry.name, table.table)) {
+			ids.insert(entry.id);
+		}
+	}
+	SemanticTableChanges result;
+	for (auto &change : changes) {
+		if (IsSchemaChange(change.first) || !ids.count(change.second)) {
+			continue;
+		}
+		if (change.first == "tables_inserted_into" || change.first == "inlined_insert") {
+			result.inserted = true;
+		} else if (change.first == "tables_deleted_from" || change.first == "inlined_delete") {
+			result.deleted = true;
+		} else {
+			// any other change of the table's data: assume rows were both inserted and deleted
+			result.inserted = true;
+			result.deleted = true;
+		}
+	}
+	return result;
+}
+
+bool SemanticCatalogChanges::SchemaChanged(const SemanticSourceTable &table) const {
+	case_insensitive_set_t ids;
+	case_insensitive_set_t schema_ids;
+	for (auto &entry : tables) {
+		if (StringUtil::CIEquals(entry.name, table.table)) {
+			ids.insert(entry.id);
+			schema_ids.insert(entry.schema_id);
+		}
+	}
+	if (ids.empty()) {
+		return true;
+	}
+	auto qualified = table.schema + "." + table.table;
+	for (auto &change : changes) {
+		auto &kind = change.first;
+		if (((kind == "tables_altered" || kind == "tables_dropped") && ids.count(change.second)) ||
+		    (kind == "tables_created" && StringUtil::CIEquals(change.second, qualified)) ||
+		    (kind == "schemas_dropped" && schema_ids.count(change.second))) {
+			return true;
+		}
+	}
+	return false;
 }
 
 string SemanticChangeTracker::ChangesSQL(const SemanticSourceTable &table, idx_t from, idx_t to,

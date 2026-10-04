@@ -675,6 +675,21 @@ ALTER SEMANTIC VIEW shop REFRESH MATERIALIZATION totals;
 ----
 <REGEX>:Materialization totals refreshed \(FULL: the changes since snapshot \d+ of lake are no longer available\)\.
 
+# DDL on another table of the catalog does not prevent incremental refreshes
+statement ok
+CREATE TABLE lake.unrelated (x INTEGER);
+
+statement ok
+ALTER TABLE lake.unrelated ADD COLUMN y INTEGER;
+
+statement ok
+INSERT INTO lake.orders VALUES (14, 1, 0.00, 1);
+
+query I
+ALTER SEMANTIC VIEW shop REFRESH MATERIALIZATION totals;
+----
+Materialization totals refreshed (INCREMENTAL: 1 group(s) changed).
+
 # a schema change of a source: full rebuild
 statement ok
 ALTER TABLE lake.orders ADD COLUMN note VARCHAR;
@@ -682,7 +697,7 @@ ALTER TABLE lake.orders ADD COLUMN note VARCHAR;
 query I
 ALTER SEMANTIC VIEW shop REFRESH MATERIALIZATION totals;
 ----
-Materialization totals refreshed (FULL: the schema of lake changed since the last refresh).
+Materialization totals refreshed (FULL: the definition of lake.main.orders changed since the last refresh).
 
 query I
 SELECT * FROM SEMANTIC_VIEW(shop METRICS o.revenue);

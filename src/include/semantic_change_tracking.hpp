@@ -41,6 +41,28 @@ struct SemanticTableChanges {
 	}
 };
 
+//! What happened in a DuckLake catalog since a snapshot, read from its snapshot metadata (no data is read)
+struct SemanticCatalogChanges {
+	//! The latest snapshot
+	idx_t current = 0;
+	//! Whether the changes since the requested snapshot are still available (it was not expired)
+	bool available = true;
+
+	//! The kinds of row changes of `table` since the requested snapshot (an update deletes and inserts a row id)
+	SemanticTableChanges RowChanges(const SemanticSourceTable &table) const;
+	//! Whether the definition of `table` changed (altered, dropped or recreated, or its schema dropped)
+	bool SchemaChanged(const SemanticSourceTable &table) const;
+
+	//! The (kind, value) entries of the snapshots' change maps, and the current tables (name, id, schema id)
+	vector<pair<string, string>> changes;
+	struct Table {
+		string name;
+		string id;
+		string schema_id;
+	};
+	vector<Table> tables;
+};
+
 //! How logical table `table` can be tracked; `reason` explains why it cannot
 SemanticSourceTable ClassifySemanticSource(ClientContext &context, const SemanticModel &model, idx_t table,
                                            string &reason);
@@ -54,18 +76,8 @@ public:
 		return connection;
 	}
 
-	//! The latest snapshot of a DuckLake catalog
-	idx_t CurrentSnapshot(const string &catalog);
-	//! Whether the changes since `snapshot` are still available (the snapshot was not expired)
-	bool SnapshotAvailable(const string &catalog, idx_t snapshot);
-	//! Whether the definition of `table` changed (altered, dropped, recreated) in (from, to]
-	bool SchemaChanged(const SemanticSourceTable &table, idx_t from, idx_t to);
-	//! Whether rows of `table` were inserted / deleted in (from, to], from the snapshots' metadata (no data is read);
-	//! an update is a deletion and an insertion of the same row id
-	SemanticTableChanges RowChanges(const SemanticSourceTable &table, idx_t from, idx_t to);
-	bool RowsChanged(const SemanticSourceTable &table, idx_t from, idx_t to) {
-		return RowChanges(table, from, to).Any();
-	}
+	//! The current snapshot of a DuckLake catalog and, when `since` is valid, what changed after it (one query)
+	SemanticCatalogChanges CatalogChanges(const string &catalog, optional_idx since);
 
 	//! The changed rows of `table` in (from, to] (rowid, snapshot_id, change_type 'insert' / 'delete', its columns),
 	//! reading only the kinds of changes in `changes` (deleted rows are expensive to read: their values are fetched

@@ -1,3 +1,7 @@
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/entry_lookup_info.hpp"
+#include "duckdb/parser/expression/star_expression.hpp"
+#include "duckdb/parser/query_node/set_operation_node.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/to_string.hpp"
@@ -126,30 +130,40 @@ public:
 			watermark = state.watermark;
 			built = state.built;
 		}
+		// what happened in every source catalog since the last refresh (one metadata query each)
+		map<string, SemanticCatalogChanges> changes;
 		map<string, idx_t> current;
 		if (all_tracked) {
 			for (auto &entry : tracked) {
-				if (!current.count(entry.second.catalog)) {
-					current[entry.second.catalog] = tracker.CurrentSnapshot(entry.second.catalog);
+				auto &catalog = entry.second.catalog;
+				if (changes.count(catalog)) {
+					continue;
 				}
+				optional_idx since;
+				auto previous = watermark.find(catalog);
+				if (built && previous != watermark.end()) {
+					since = previous->second;
+				}
+				changes[catalog] = tracker.CatalogChanges(catalog, since);
+				current[catalog] = changes[catalog].current;
 			}
-		}
-		auto why_full = initial ? string("initial build") : FullRefreshReason(mode, built, watermark, current);
-		if (!initial && mode == SemanticRefreshMode::INCREMENTAL && !why_full.empty()) {
-			throw BinderException("Materialization \"%s\" cannot be refreshed incrementally: %s", materialization.name,
-			                      why_full);
 		}
 		string outcome;
 		string detail;
 		connection.BeginTransaction();
 		try {
+			auto why_full = initial ? string("initial build") : FullRefreshReason(mode, built, watermark, changes);
+			if (!initial && mode == SemanticRefreshMode::INCREMENTAL && !why_full.empty()) {
+				throw BinderException("Materialization \"%s\" cannot be refreshed incrementally: %s",
+				                      materialization.name, why_full);
+			}
 			if (!why_full.empty()) {
 				FullBuild(current);
 				outcome = "FULL";
 				detail = why_full;
 			} else {
 				string rebuilt;
-				auto groups = IncrementalRefresh(mode, watermark, current, rebuilt);
+				auto groups = IncrementalRefresh(mode, watermark, current, changes, rebuilt);
 				outcome = groups.IsValid() ? "INCREMENTAL" : "NONE";
 				detail = groups.IsValid() ? to_string(groups.GetIndex()) + " group(s) changed" : "no source changes";
 				if (!rebuilt.empty()) {
@@ -179,9 +193,9 @@ public:
 	}
 
 private:
-	//! Why the refresh must rebuild everything; empty when it can be incremental
+	//! Why the refresh must rebuild everything; empty when it can be incremental (runs in the refresh's transaction)
 	string FullRefreshReason(SemanticRefreshMode mode, bool built, const map<string, idx_t> &watermark,
-	                         const map<string, idx_t> &current) {
+	                         const map<string, SemanticCatalogChanges> &changes) {
 		if (mode == SemanticRefreshMode::FULL) {
 			return "FULL refresh requested";
 		}
@@ -191,39 +205,41 @@ private:
 		if (!built || watermark.empty()) {
 			return "it was not built from tracked snapshots";
 		}
-		for (auto &entry : current) {
+		for (auto &entry : changes) {
 			auto previous = watermark.find(entry.first);
 			if (previous == watermark.end()) {
 				return "it was not built from tracked snapshots";
 			}
-			if (previous->second == entry.second) {
+			if (previous->second == entry.second.current) {
 				continue;
 			}
-			if (!tracker.SnapshotAvailable(entry.first, previous->second)) {
+			if (!entry.second.available) {
 				return "the changes since snapshot " + to_string(previous->second) + " of " + entry.first +
 				       " are no longer available";
 			}
 			for (auto &source : tracked) {
-				if (source.second.catalog == entry.first &&
-				    tracker.SchemaChanged(source.second, previous->second, entry.second)) {
-					return "the schema of " + entry.first + " changed since the last refresh";
+				if (source.second.catalog == entry.first && entry.second.SchemaChanged(source.second)) {
+					return "the definition of " + source.second.catalog + "." + source.second.schema + "." +
+					       source.second.table + " changed since the last refresh";
 				}
 			}
 		}
 		for (idx_t b = 0; b < materialization.blocks.size(); b++) {
-			auto result = connection.Query("SELECT 1 FROM " + materialization.TableName(b) + " LIMIT 0");
-			if (result->HasError()) {
+			EntryLookupInfo lookup(CatalogType::TABLE_ENTRY, state.tables[b]);
+			if (!Catalog::GetEntry(*connection.context, state.catalog, state.schema, lookup,
+			                       OnEntryNotFound::RETURN_NULL)) {
 				return "its table " + state.tables[b] + " is missing";
 			}
 		}
 		return string();
 	}
 
-	void Execute(const string &sql) {
+	unique_ptr<MaterializedQueryResult> Execute(const string &sql) {
 		auto result = connection.Query(sql);
 		if (result->HasError()) {
 			result->ThrowError("semantic view materialization: ");
 		}
+		return result;
 	}
 
 	void Execute(unique_ptr<SQLStatement> statement) {
@@ -234,14 +250,10 @@ private:
 	}
 
 	idx_t Count(const string &table) {
-		auto result = connection.Query("SELECT count(*) FROM " + table);
-		if (result->HasError()) {
-			result->ThrowError("semantic view materialization: ");
-		}
-		return result->GetValue(0, 0).GetValue<idx_t>();
+		return Execute("SELECT count(*) FROM " + table)->GetValue(0, 0).GetValue<idx_t>();
 	}
 
-	//! CREATE [OR REPLACE] [TEMP] TABLE <catalog>.<schema>.<table> AS <select>
+	//! CREATE OR REPLACE [TEMP] TABLE <catalog>.<schema>.<table> AS <select>
 	void CreateTableAs(const string &catalog, const string &schema, const string &table,
 	                   unique_ptr<SelectStatement> select, bool temporary) {
 		auto info = make_uniq<CreateTableInfo>(catalog, schema, table);
@@ -290,21 +302,19 @@ private:
 	//! instead: moving the rows that reach the changed rows scans its home table twice (as of before and as of now),
 	//! while rebuilding it scans it once. `rebuilt` describes those blocks.
 	optional_idx IncrementalRefresh(SemanticRefreshMode mode, const map<string, idx_t> &watermark,
-	                                const map<string, idx_t> &current, string &rebuilt) {
+	                                const map<string, idx_t> &current,
+	                                const map<string, SemanticCatalogChanges> &changes, string &rebuilt) {
 		optional_idx changed_groups;
 		for (idx_t b = 0; b < materialization.blocks.size(); b++) {
 			set<idx_t> changed;
 			for (auto table : materialization.blocks[b].tables) {
 				auto &source = tracked.at(table);
-				auto from = watermark.at(source.catalog);
-				auto to = current.at(source.catalog);
-				if (from == to) {
+				if (watermark.at(source.catalog) == current.at(source.catalog)) {
 					continue;
 				}
-				if (!row_changes.count(table)) {
-					row_changes[table] = tracker.RowChanges(source, from, to);
-				}
-				if (row_changes[table].Any()) {
+				auto kinds = changes.at(source.catalog).RowChanges(source);
+				if (kinds.Any()) {
+					row_changes[table] = kinds;
 					changed.insert(table);
 				}
 			}
@@ -342,57 +352,43 @@ private:
 		return name;
 	}
 
-	//! Adds the state query of block `b` over `sources` (restricted by `filter`) as a delta part with `sign`
+	//! The state query of block `b` over `sources` (restricted by `filter`), as a delta part with `sign`
 	void AddPart(idx_t b, const RefreshSources &sources, const SemanticRowFilter &filter, int sign,
-	             vector<pair<string, int>> &parts) {
+	             vector<pair<unique_ptr<SelectStatement>, int>> &parts) {
 		SemanticCompileOptions options;
 		options.sources = &sources;
 		options.row_filter = filter;
-		auto name = "__sv_part" + to_string(parts.size());
-		CreateTempTableAs(name, States(b, options));
-		parts.emplace_back(name, sign);
+		parts.emplace_back(States(b, options), sign);
 	}
 
 	idx_t RefreshBlock(idx_t b, const set<idx_t> &changed, const map<string, idx_t> &watermark,
 	                   const map<string, idx_t> &current) {
 		auto &block = materialization.blocks[b];
 		bool home_changed = changed.count(block.home) > 0;
-		vector<pair<string, int>> parts;
+		vector<pair<unique_ptr<SelectStatement>, int>> parts;
+		string home_changes;
 		// 1. changed rows of the home table: + their new image (joined as of now), - their old image (as of before)
 		if (home_changed) {
-			auto changes = Changes(block.home, watermark, current);
-			Execute("CREATE OR REPLACE TEMP TABLE __sv_changed_rows AS SELECT DISTINCT rowid FROM " + changes);
+			home_changes = Changes(block.home, watermark, current);
 			RefreshSources new_rows(model, tracked, current);
-			new_rows.replacements[block.home] = ChangedRowImages(changes, true);
+			new_rows.replacements[block.home] = ChangedRowImages(home_changes, true);
 			AddPart(b, new_rows, nullptr, 1, parts);
 			RefreshSources old_rows(model, tracked, watermark);
-			old_rows.replacements[block.home] = ChangedRowImages(changes, false);
+			old_rows.replacements[block.home] = ChangedRowImages(home_changes, false);
 			AddPart(b, old_rows, nullptr, -1, parts);
 		}
 		// 2. unchanged home rows that reach a changed row of another table: + as of now, - as of before
-		vector<idx_t> referenced;
+		map<idx_t, string> referenced;
 		for (auto table : changed) {
 			if (table != block.home) {
-				referenced.push_back(table);
+				referenced[table] = Changes(table, watermark, current);
 			}
 		}
 		if (!referenced.empty()) {
-			for (auto table : referenced) {
-				auto path = model.Path(block.home, table, block.using_relationships);
-				auto &edge = path.back();
-				auto &rel = model.relationships[edge.relationship];
-				auto &keys = edge.reversed ? rel.from_columns : rel.to_columns;
-				vector<string> quoted;
-				for (auto &key : keys) {
-					quoted.push_back(QuoteIdentifier(key));
-				}
-				Execute("CREATE OR REPLACE TEMP TABLE __sv_keys" + to_string(table) + " AS SELECT DISTINCT " +
-				        Join(quoted, ", ") + " FROM " + Changes(table, watermark, current));
-			}
 			auto filter = [&](SemanticJoinScope &scope, const vector<unique_ptr<ParsedExpression>> &) {
-				vector<unique_ptr<ParsedExpression>> reaching;
-				for (auto table : referenced) {
-					auto path = model.Path(block.home, table, block.using_relationships);
+				unique_ptr<ParsedExpression> result;
+				for (auto &entry : referenced) {
+					auto path = model.Path(block.home, entry.first, block.using_relationships);
 					auto &edge = path.back();
 					auto &rel = model.relationships[edge.relationship];
 					auto parent = path.size() >= 2 ? path[path.size() - 2].target : block.home;
@@ -402,20 +398,16 @@ private:
 					for (auto &column : parent_columns) {
 						values.push_back(scope.ColumnReference(parent, column));
 					}
-					reaching.push_back(ExistsIn("__sv_keys" + to_string(table), keys, std::move(values), false));
-				}
-				unique_ptr<ParsedExpression> result;
-				for (auto &condition : reaching) {
+					auto reaching = ExistsIn(entry.second, keys, std::move(values), false);
 					result = result ? make_uniq<ConjunctionExpression>(ExpressionType::CONJUNCTION_OR,
-					                                                   std::move(result), std::move(condition))
-					                : std::move(condition);
+					                                                   std::move(result), std::move(reaching))
+					                : std::move(reaching);
 				}
 				if (home_changed) {
 					vector<unique_ptr<ParsedExpression>> rowid;
 					rowid.push_back(scope.ColumnReference(block.home, "rowid"));
-					auto changed_row = ExistsIn("__sv_changed_rows", {"rowid"}, std::move(rowid), false);
-					auto unchanged =
-					    make_uniq<OperatorExpression>(ExpressionType::OPERATOR_NOT, std::move(changed_row));
+					auto unchanged = make_uniq<OperatorExpression>(
+					    ExpressionType::OPERATOR_NOT, ExistsIn(home_changes, {"rowid"}, std::move(rowid), false));
 					result = make_uniq<ConjunctionExpression>(ExpressionType::CONJUNCTION_AND, std::move(unchanged),
 					                                          std::move(result));
 				}
@@ -426,11 +418,12 @@ private:
 			RefreshSources before(model, tracked, watermark);
 			AddPart(b, before, filter, -1, parts);
 		}
-		return MergeDelta(b, parts, current);
+		return MergeDelta(b, std::move(parts), current);
 	}
 
-	//! Combines the delta parts per group and merges them into the block's table
-	idx_t MergeDelta(idx_t b, const vector<pair<string, int>> &parts, const map<string, idx_t> &current) {
+	//! Combines the delta parts per group and merges them into the block's table (MERGE, then removes the groups
+	//! left without rows); groups whose MIN / MAX lost rows, or with opaque aggregates, are recomputed
+	idx_t MergeDelta(idx_t b, vector<pair<unique_ptr<SelectStatement>, int>> parts, const map<string, idx_t> &current) {
 		auto &block = materialization.blocks[b];
 		auto table = materialization.TableName(b);
 		auto dimensions = DimensionColumns();
@@ -439,10 +432,11 @@ private:
 			return "CASE WHEN __sv_sign > 0 THEN coalesce(" + column + ", 0) ELSE -coalesce(" + column + ", 0) END";
 		};
 		// the delta: per group, the signed sum of the parts' states
-		vector<string> delta_columns = dimensions;
+		vector<string> delta_columns;
 		delta_columns.push_back("sum(" + signed_value(MATERIALIZED_ROWS_COLUMN) + ") AS " + MATERIALIZED_ROWS_COLUMN);
 		delta_columns.push_back("sum(CASE WHEN __sv_sign < 0 THEN __sv_rows ELSE 0 END) AS __sv_removed");
-		bool may_recompute = false;
+		bool opaque = false;
+		bool extremes = false;
 		for (auto &atom : block.atoms) {
 			auto columns = atom.StateColumns();
 			switch (atom.kind) {
@@ -454,25 +448,42 @@ private:
 				}
 				break;
 			case SemanticAggregateKind::MIN:
-				delta_columns.push_back("min(CASE WHEN __sv_sign > 0 THEN " + columns[0] + " END) AS " + columns[0]);
-				may_recompute = true;
+			case SemanticAggregateKind::MAX: {
+				auto function = atom.kind == SemanticAggregateKind::MIN ? "min" : "max";
+				delta_columns.push_back(string(function) + "(CASE WHEN __sv_sign > 0 THEN " + columns[0] + " END) AS " +
+				                        columns[0]);
+				extremes = true;
 				break;
-			case SemanticAggregateKind::MAX:
-				delta_columns.push_back("max(CASE WHEN __sv_sign > 0 THEN " + columns[0] + " END) AS " + columns[0]);
-				may_recompute = true;
-				break;
+			}
 			default:
-				may_recompute = true;
+				opaque = true;
 				break;
 			}
 		}
-		vector<string> unions;
-		for (auto &part : parts) {
-			unions.push_back("SELECT *, " + to_string(part.second) + " AS __sv_sign FROM " + part.first);
+		auto delta = make_uniq<SelectNode>();
+		for (auto &dimension : dimensions) {
+			delta->select_list.push_back(ColumnRef(dimension));
+			delta->groups.group_expressions.push_back(ColumnRef(dimension));
 		}
-		Execute("CREATE OR REPLACE TEMP TABLE __sv_delta AS SELECT " + Join(delta_columns, ", ") + " FROM (" +
-		        Join(unions, " UNION ALL BY NAME ") + ")" + (grouped ? " GROUP BY " + Join(dimensions, ", ") : ""));
-		// merged groups: stored state + delta
+		for (auto &expr : Parser::ParseExpressionList(Join(delta_columns, ", "))) {
+			delta->select_list.push_back(std::move(expr));
+		}
+		auto unions = make_uniq<SetOperationNode>();
+		unions->setop_type = SetOperationType::UNION_BY_NAME;
+		unions->setop_all = true;
+		for (auto &part : parts) {
+			auto signed_part = make_uniq<SelectNode>();
+			signed_part->select_list.push_back(make_uniq<StarExpression>());
+			auto sign = make_uniq<ConstantExpression>(Value::INTEGER(part.second));
+			sign->alias = "__sv_sign";
+			signed_part->select_list.push_back(std::move(sign));
+			signed_part->from_table = make_uniq<SubqueryRef>(std::move(part.first), "__sv_part");
+			unions->children.push_back(std::move(signed_part));
+		}
+		GroupByAll(*delta);
+		delta->from_table = MakeSubqueryRef(std::move(unions), "__sv_parts");
+		CreateTempTableAs("__sv_delta", MakeSelectStatement(std::move(delta)));
+		// merge it: stored state + delta
 		vector<string> matches;
 		for (auto &dimension : dimensions) {
 			matches.push_back("__sv_m." + dimension + " IS NOT DISTINCT FROM __sv_d." + dimension);
@@ -481,14 +492,14 @@ private:
 		auto plus = [](const string &column) {
 			return "coalesce(__sv_m." + column + ", 0) + coalesce(__sv_d." + column + ", 0)";
 		};
-		vector<string> merged_columns;
 		vector<string> stored_columns = dimensions;
-		for (auto &dimension : dimensions) {
-			merged_columns.push_back("__sv_d." + dimension);
-		}
-		merged_columns.push_back(plus(MATERIALIZED_ROWS_COLUMN) + " AS " + MATERIALIZED_ROWS_COLUMN);
 		stored_columns.push_back(MATERIALIZED_ROWS_COLUMN);
-		vector<string> recompute;
+		vector<string> updates {string(MATERIALIZED_ROWS_COLUMN) + " = " + plus(MATERIALIZED_ROWS_COLUMN)};
+		vector<string> inserted;
+		for (auto &dimension : dimensions) {
+			inserted.push_back("__sv_d." + dimension);
+		}
+		inserted.push_back("coalesce(__sv_d.__sv_rows, 0)");
 		for (auto &atom : block.atoms) {
 			auto columns = atom.StateColumns();
 			for (auto &column : columns) {
@@ -497,43 +508,58 @@ private:
 			switch (atom.kind) {
 			case SemanticAggregateKind::SUM:
 			case SemanticAggregateKind::AVG:
-				merged_columns.push_back("CASE WHEN " + plus(columns[1]) + " = 0 THEN NULL ELSE " + plus(columns[0]) +
-				                         " END AS " + columns[0]);
-				merged_columns.push_back(plus(columns[1]) + " AS " + columns[1]);
+				updates.push_back(columns[0] + " = CASE WHEN " + plus(columns[1]) + " = 0 THEN NULL ELSE " +
+				                  plus(columns[0]) + " END");
+				updates.push_back(columns[1] + " = " + plus(columns[1]));
+				inserted.push_back("CASE WHEN coalesce(__sv_d." + columns[1] + ", 0) = 0 THEN NULL ELSE __sv_d." +
+				                   columns[0] + " END");
+				inserted.push_back("coalesce(__sv_d." + columns[1] + ", 0)");
 				break;
 			case SemanticAggregateKind::COUNT:
-				merged_columns.push_back(plus(columns[0]) + " AS " + columns[0]);
+				updates.push_back(columns[0] + " = " + plus(columns[0]));
+				inserted.push_back("coalesce(__sv_d." + columns[0] + ", 0)");
 				break;
 			case SemanticAggregateKind::MIN:
 			case SemanticAggregateKind::MAX: {
 				// a group that only gained rows keeps the least / greatest value; one that lost rows is recomputed
 				auto merge = atom.kind == SemanticAggregateKind::MIN ? "least" : "greatest";
-				merged_columns.push_back(string(merge) + "(__sv_m." + columns[0] + ", __sv_d." + columns[0] + ") AS " +
-				                         columns[0]);
-				recompute.push_back("coalesce(__sv_d.__sv_removed, 0) > 0");
+				updates.push_back(columns[0] + " = " + merge + "(__sv_m." + columns[0] + ", __sv_d." + columns[0] +
+				                  ")");
+				inserted.push_back("__sv_d." + columns[0]);
 				break;
 			}
 			default:
-				merged_columns.push_back("CAST(NULL AS " + atom.type.ToString() + ") AS " + columns[0]);
-				recompute.push_back("true");
+				inserted.push_back("CAST(NULL AS " + atom.type.ToString() + ")");
 				break;
 			}
 		}
-		merged_columns.push_back((recompute.empty() ? string("false") : Join(recompute, " OR ")) +
-		                         " AS __sv_recompute");
-		Execute("CREATE OR REPLACE TEMP TABLE __sv_merged AS SELECT " + Join(merged_columns, ", ") +
-		        " FROM __sv_delta AS __sv_d LEFT JOIN " + table + " AS __sv_m ON " + match);
-		// replace the affected groups; groups without rows disappear (the only group of an ungrouped block stays)
-		Execute("DELETE FROM " + table + " AS __sv_m WHERE EXISTS (SELECT 1 FROM __sv_delta AS __sv_d WHERE " + match +
-		        ")");
-		auto keep = string(grouped ? " AND " + string(MATERIALIZED_ROWS_COLUMN) + " > 0" : "");
-		Execute("INSERT INTO " + table + " (" + Join(stored_columns, ", ") + ") SELECT " + Join(stored_columns, ", ") +
-		        " FROM __sv_merged WHERE NOT __sv_recompute" + keep);
-		if (may_recompute) {
+		auto merged =
+		    Execute("MERGE INTO " + table + " AS __sv_m USING __sv_delta AS __sv_d ON " + match +
+		            " WHEN MATCHED THEN UPDATE SET " + Join(updates, ", ") + " WHEN NOT MATCHED THEN INSERT (" +
+		            Join(stored_columns, ", ") + ") VALUES (" + Join(inserted, ", ") + ")");
+		auto changed_groups = merged->GetValue(0, 0).GetValue<idx_t>();
+		if (grouped) {
+			// groups without rows disappear (the only group of an ungrouped block stays)
+			Execute("DELETE FROM " + table + " WHERE " + MATERIALIZED_ROWS_COLUMN + " = 0");
+		}
+		if (opaque || extremes) {
+			auto recompute = opaque ? string("true") : string("coalesce(__sv_removed, 0) > 0");
 			Execute("CREATE OR REPLACE TEMP TABLE __sv_recompute AS SELECT " +
-			        (grouped ? Join(dimensions, ", ") : string("1 AS __sv_all")) +
-			        " FROM __sv_merged WHERE __sv_recompute" + keep);
+			        (grouped ? Join(dimensions, ", ") : string("1 AS __sv_all")) + " FROM __sv_delta WHERE " +
+			        recompute);
 			if (Count("__sv_recompute") > 0) {
+				if (grouped) {
+					vector<string> recompute_matches;
+					for (auto &dimension : dimensions) {
+						recompute_matches.push_back("__sv_r." + dimension + " IS NOT DISTINCT FROM __sv_m." +
+						                            dimension);
+					}
+					Execute("DELETE FROM " + table +
+					        " AS __sv_m WHERE EXISTS (SELECT 1 FROM __sv_recompute AS __sv_r WHERE " +
+					        Join(recompute_matches, " AND ") + ")");
+				} else {
+					Execute("DELETE FROM " + table);
+				}
 				RefreshSources now(model, tracked, current);
 				SemanticCompileOptions options;
 				options.sources = &now;
@@ -551,7 +577,7 @@ private:
 				        Join(stored_columns, ", ") + " FROM __sv_recomputed");
 			}
 		}
-		return Count("__sv_delta");
+		return changed_groups;
 	}
 
 	ClientContext &context;

@@ -394,18 +394,17 @@ SemanticMaterializationStatus GetMaterializationStatus(ClientContext &context, c
 		SemanticChangeTracker tracker(context);
 		map<string, idx_t> current;
 		for (auto &entry : watermark) {
-			auto snapshot = tracker.CurrentSnapshot(entry.first);
-			current[entry.first] = snapshot;
-			if (snapshot == entry.second) {
+			auto changes = tracker.CatalogChanges(entry.first, entry.second);
+			current[entry.first] = changes.current;
+			if (changes.current == entry.second) {
 				continue;
 			}
-			if (!tracker.SnapshotAvailable(entry.first, entry.second)) {
+			if (!changes.available) {
 				stale_reason = "the changes since its snapshot are no longer available";
 				break;
 			}
 			for (auto &source : sources[entry.first]) {
-				if (tracker.SchemaChanged(source, entry.second, snapshot) ||
-				    tracker.RowsChanged(source, entry.second, snapshot)) {
+				if (changes.SchemaChanged(source) || changes.RowChanges(source).Any()) {
 					stale_reason = "source " + source.catalog + "." + source.schema + "." + source.table +
 					               " changed since its last refresh";
 					break;
