@@ -6,7 +6,7 @@ Usage:
 
 Creates a DuckLake catalog in --dir holding a star schema (sales -> customers, sales -> products), a semantic view and
 two identical materializations (revenue, units, counts and averages by customer segment and product category): one
-refreshed FULL, one INCREMENTAL. For each change size (1 row, 1,000 rows, 100,000 rows, ~1% of the rows) and change
+refreshed FULL, one INCREMENTAL, one AUTO. For each change size (1 row, 1,000 rows, 100,000 rows, ~1% of the rows) and change
 kind (updates, inserts, deletes, a dimension-table update), it applies the change, times both refreshes and checks
 that both materializations hold exactly the same state. It also times a semantic query read from the materialization
 vs computed from the sources.
@@ -46,6 +46,7 @@ def build_script(rows: int, data_dir: str) -> str:
         ".print MARK:initial_full_build",
         "ALTER SEMANTIC VIEW sales_sv ADD MATERIALIZATION full_copy REFRESH_MODE = FULL AS DIMENSIONS c.segment, p.category METRICS s.revenue, s.units, s.sale_count, s.avg_amount;",
         "ALTER SEMANTIC VIEW sales_sv ADD MATERIALIZATION incr REFRESH_MODE = INCREMENTAL AS DIMENSIONS c.segment, p.category METRICS s.revenue, s.units, s.sale_count, s.avg_amount;",
+        "ALTER SEMANTIC VIEW sales_sv ADD MATERIALIZATION auto AS DIMENSIONS c.segment, p.category METRICS s.revenue, s.units, s.sale_count, s.avg_amount;",
         ".print MARK:query_from_materialization",
         "SELECT count(*) FROM SEMANTIC_VIEW(sales_sv DIMENSIONS c.segment METRICS s.revenue, s.avg_amount);",
         "SET semantic_view_materializations = false;",
@@ -77,9 +78,11 @@ def build_script(rows: int, data_dir: str) -> str:
                 "ALTER SEMANTIC VIEW sales_sv REFRESH MATERIALIZATION full_copy;",
                 f".print MARK:incremental:{label}",
                 "ALTER SEMANTIC VIEW sales_sv REFRESH MATERIALIZATION incr;",
+                f".print MARK:auto:{label}",
+                "ALTER SEMANTIC VIEW sales_sv REFRESH MATERIALIZATION auto;",
                 ".timer off",
                 f".print MARK:check:{label}",
-                "SELECT count(*) AS differences FROM ((SELECT * FROM __semantic_materializations.sales_sv__incr__0 EXCEPT ALL SELECT * FROM __semantic_materializations.sales_sv__full_copy__0) UNION ALL (SELECT * FROM __semantic_materializations.sales_sv__full_copy__0 EXCEPT ALL SELECT * FROM __semantic_materializations.sales_sv__incr__0));",
+                "SELECT count(*) AS differences FROM ((SELECT * FROM __semantic_materializations.sales_sv__incr__0 EXCEPT ALL SELECT * FROM __semantic_materializations.sales_sv__full_copy__0) UNION ALL (SELECT * FROM __semantic_materializations.sales_sv__full_copy__0 EXCEPT ALL SELECT * FROM __semantic_materializations.sales_sv__incr__0) UNION ALL (SELECT * FROM __semantic_materializations.sales_sv__auto__0 EXCEPT ALL SELECT * FROM __semantic_materializations.sales_sv__full_copy__0) UNION ALL (SELECT * FROM __semantic_materializations.sales_sv__full_copy__0 EXCEPT ALL SELECT * FROM __semantic_materializations.sales_sv__auto__0));",
             ]
     return "\n".join(line for line in lines if line) + "\n"
 
@@ -126,13 +129,14 @@ def main() -> None:
     for key in ("initial_full_build", "query_from_sources", "query_from_materialization", "refresh_no_changes"):
         print(f"{key:<30} {timings.get(key, float('nan')):>10.3f} s")
     print()
-    print(f"{'change':<28} {'full (s)':>10} {'incremental (s)':>16} {'speedup':>9} {'identical':>10}")
+    print(f"{'change':<28} {'full (s)':>9} {'INCREMENTAL (s)':>16} {'speedup':>8} {'AUTO (s)':>9} {'speedup':>8} {'identical':>10}")
     for key in [k for k in timings if k.startswith("full:")]:
         label = key[5:]
         full = timings[key]
         incremental = timings.get("incremental:" + label, float("nan"))
+        auto = timings.get("auto:" + label, float("nan"))
         identical = "yes" if checks.get(label) == "0" else f"NO ({checks.get(label)})"
-        print(f"{label:<28} {full:>10.3f} {incremental:>16.3f} {full / incremental:>8.1f}x {identical:>10}")
+        print(f"{label:<28} {full:>9.3f} {incremental:>16.3f} {full / incremental:>7.1f}x {auto:>9.3f} {full / auto:>7.1f}x {identical:>10}")
 
 
 if __name__ == "__main__":
