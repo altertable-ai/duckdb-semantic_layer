@@ -113,6 +113,51 @@ struct ParsedSemanticVerifiedQuery {
 	static ParsedSemanticVerifiedQuery Deserialize(Deserializer &deserializer);
 };
 
+//! One entry of a DIMENSIONS / METRICS / FACTS list in SEMANTIC_VIEW(...)
+struct ParsedSemanticQueryItem {
+	SemanticMemberKind kind = SemanticMemberKind::DIMENSION;
+	//! null for a wildcard (`table.*`)
+	unique_ptr<ParsedExpression> expression;
+	//! Logical table of a wildcard
+	string star_table;
+	string alias;
+
+	void Serialize(Serializer &serializer) const;
+	static ParsedSemanticQueryItem Deserialize(Deserializer &deserializer);
+};
+
+//! How REFRESH MATERIALIZATION brings a materialization up to date
+enum class SemanticRefreshMode : uint8_t {
+	//! incremental when the sources and metrics allow it, else a full rebuild
+	AUTO = 0,
+	FULL = 1,
+	//! fails when incremental maintenance is not possible
+	INCREMENTAL = 2
+};
+
+string SemanticRefreshModeToString(SemanticRefreshMode mode);
+
+//! ALTER SEMANTIC VIEW ... ADD MATERIALIZATION <name> [REFRESH_MODE = ...] AS DIMENSIONS ... METRICS ...
+struct ParsedSemanticMaterialization {
+	string name;
+	//! Dimension and metric items, as in SEMANTIC_VIEW(...)
+	vector<ParsedSemanticQueryItem> items;
+	SemanticRefreshMode refresh_mode = SemanticRefreshMode::AUTO;
+	//! Accepted for compatibility, unused
+	string warehouse;
+
+	void Serialize(Serializer &serializer) const;
+	static ParsedSemanticMaterialization Deserialize(Deserializer &deserializer);
+};
+
+//! The BLOB payload of ADD MATERIALIZATION
+struct ParsedSemanticMaterializationPayload {
+	ParsedSemanticMaterialization materialization;
+
+	void Serialize(Serializer &serializer) const;
+	static unique_ptr<ParsedSemanticMaterializationPayload> Deserialize(Deserializer &deserializer);
+};
+
 struct ParsedSemanticView {
 	QualifiedName name;
 	vector<ParsedSemanticTable> tables;
@@ -128,23 +173,11 @@ struct ParsedSemanticView {
 	vector<ParsedSemanticVerifiedQuery> verified_queries;
 	vector<ParsedSemanticTag> tags;
 	bool copy_grants = false;
+	vector<ParsedSemanticMaterialization> materializations;
 
 	unique_ptr<ParsedSemanticView> Copy() const;
 	void Serialize(Serializer &serializer) const;
 	static unique_ptr<ParsedSemanticView> Deserialize(Deserializer &deserializer);
-};
-
-//! One entry of a DIMENSIONS / METRICS / FACTS list in SEMANTIC_VIEW(...)
-struct ParsedSemanticQueryItem {
-	SemanticMemberKind kind = SemanticMemberKind::DIMENSION;
-	//! null for a wildcard (`table.*`)
-	unique_ptr<ParsedExpression> expression;
-	//! Logical table of a wildcard
-	string star_table;
-	string alias;
-
-	void Serialize(Serializer &serializer) const;
-	static ParsedSemanticQueryItem Deserialize(Deserializer &deserializer);
 };
 
 struct ParsedSemanticQuery {

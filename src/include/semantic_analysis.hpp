@@ -41,6 +41,10 @@ class SemanticAnalyzer {
 public:
 	SemanticAnalyzer(const SemanticModel &model, ClientContext &context);
 
+	ClientContext &Context() const {
+		return context;
+	}
+
 	//! Whether `expr` is a call to an aggregate function
 	bool IsAggregate(const ParsedExpression &expr);
 	//! Whether `expr` contains an aggregate or a metric reference (not looking into subqueries)

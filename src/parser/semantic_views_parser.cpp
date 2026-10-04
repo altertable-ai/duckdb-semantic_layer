@@ -54,7 +54,7 @@ bool SemanticViewsParser::ContainsSemanticSyntax(const string &sql) {
 			if (StringUtil::CIEquals(text, "semantic") &&
 			    (StringUtil::CIEquals(next, "view") || StringUtil::CIEquals(next, "views") ||
 			     StringUtil::CIEquals(next, "dimensions") || StringUtil::CIEquals(next, "metrics") ||
-			     StringUtil::CIEquals(next, "facts"))) {
+			     StringUtil::CIEquals(next, "facts") || StringUtil::CIEquals(next, "materializations"))) {
 				return true;
 			}
 		}

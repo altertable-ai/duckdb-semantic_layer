@@ -26,8 +26,11 @@ set(EXTENSION_SOURCES
     src/semantic_analysis.cpp
     src/semantic_bridge.cpp
     src/semantic_catalog.cpp
+    src/semantic_change_tracking.cpp
     src/semantic_join_scope.cpp
     src/semantic_markers.cpp
+    src/semantic_materialization.cpp
+    src/semantic_materialization_refresh.cpp
     src/semantic_model.cpp
     src/semantic_model_builder.cpp
     src/semantic_query_compiler.cpp

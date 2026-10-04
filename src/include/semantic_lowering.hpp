@@ -31,6 +31,16 @@ static constexpr const char *SEMANTIC_VIEW_DROP_FUNCTION = "__semantic_view_drop
 static constexpr const char *SEMANTIC_VIEW_RENAME_FUNCTION = "__semantic_view_rename";
 //! (catalog, schema, name, if_exists BOOLEAN, comment VARCHAR - NULL unsets it)
 static constexpr const char *SEMANTIC_VIEW_SET_COMMENT_FUNCTION = "__semantic_view_set_comment";
+//! (catalog, schema, name, if_exists BOOLEAN, seconds BIGINT - NULL unsets it)
+static constexpr const char *SEMANTIC_VIEW_SET_MAX_STALENESS_FUNCTION = "__semantic_view_set_max_staleness";
+//! (catalog, schema, name, if_exists BOOLEAN, materialization BLOB, if_not_exists BOOLEAN)
+static constexpr const char *SEMANTIC_VIEW_ADD_MATERIALIZATION_FUNCTION = "__semantic_view_add_materialization";
+//! (catalog, schema, name, if_exists BOOLEAN, materialization VARCHAR, materialization_if_exists BOOLEAN)
+static constexpr const char *SEMANTIC_VIEW_DROP_MATERIALIZATION_FUNCTION = "__semantic_view_drop_materialization";
+//! (catalog, schema, name, if_exists BOOLEAN, materialization VARCHAR, mode VARCHAR - NULL: its REFRESH_MODE)
+static constexpr const char *SEMANTIC_VIEW_REFRESH_MATERIALIZATION_FUNCTION = "__semantic_view_refresh_materialization";
+//! (catalog, schema, name): name '' = the views of the current schema
+static constexpr const char *SEMANTIC_VIEW_SHOW_MATERIALIZATIONS_FUNCTION = "__semantic_view_show_materializations";
 //! (catalog, schema, name)
 static constexpr const char *SEMANTIC_VIEW_DESCRIBE_FUNCTION = "__semantic_view_describe";
 //! (catalog, schema): '' matches any
@@ -47,6 +57,15 @@ struct SemanticLowering {
 	static unique_ptr<TableRef> Drop(const QualifiedName &name, bool if_exists);
 	static unique_ptr<TableRef> Rename(const QualifiedName &name, bool if_exists, const string &new_name);
 	static unique_ptr<TableRef> SetComment(const QualifiedName &name, bool if_exists, const Value &comment);
+	static unique_ptr<TableRef> SetMaxStaleness(const QualifiedName &name, bool if_exists, const Value &seconds);
+	static unique_ptr<TableRef> AddMaterialization(const QualifiedName &name, bool if_exists,
+	                                               const ParsedSemanticMaterialization &materialization,
+	                                               bool if_not_exists);
+	static unique_ptr<TableRef> DropMaterialization(const QualifiedName &name, bool if_exists,
+	                                                const string &materialization, bool materialization_if_exists);
+	static unique_ptr<TableRef> RefreshMaterialization(const QualifiedName &name, bool if_exists,
+	                                                   const string &materialization, const Value &mode);
+	static unique_ptr<TableRef> ShowMaterializations(const QualifiedName &view);
 	static unique_ptr<TableRef> Describe(const QualifiedName &name);
 	static unique_ptr<TableRef> ShowViews(const QualifiedName &scope);
 	static unique_ptr<TableRef> ShowMembers(SemanticMemberKind kind, const QualifiedName &view);

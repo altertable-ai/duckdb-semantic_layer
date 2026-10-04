@@ -51,6 +51,48 @@ unique_ptr<TableRef> SemanticLowering::SetComment(const QualifiedName &name, boo
 	return Call(SEMANTIC_VIEW_SET_COMMENT_FUNCTION, NameValues(name, {Value::BOOLEAN(if_exists), comment}));
 }
 
+unique_ptr<TableRef> SemanticLowering::SetMaxStaleness(const QualifiedName &name, bool if_exists,
+                                                       const Value &seconds) {
+	return Call(SEMANTIC_VIEW_SET_MAX_STALENESS_FUNCTION, NameValues(name, {Value::BOOLEAN(if_exists), seconds}));
+}
+
+unique_ptr<TableRef> SemanticLowering::AddMaterialization(const QualifiedName &name, bool if_exists,
+                                                          const ParsedSemanticMaterialization &materialization,
+                                                          bool if_not_exists) {
+	ParsedSemanticMaterializationPayload payload;
+	payload.materialization.name = materialization.name;
+	payload.materialization.refresh_mode = materialization.refresh_mode;
+	payload.materialization.warehouse = materialization.warehouse;
+	for (auto &item : materialization.items) {
+		ParsedSemanticQueryItem copy;
+		copy.kind = item.kind;
+		copy.expression = item.expression ? item.expression->Copy() : nullptr;
+		copy.star_table = item.star_table;
+		copy.alias = item.alias;
+		payload.materialization.items.push_back(std::move(copy));
+	}
+	return Call(SEMANTIC_VIEW_ADD_MATERIALIZATION_FUNCTION,
+	            NameValues(name, {Value::BOOLEAN(if_exists), Encode(payload), Value::BOOLEAN(if_not_exists)}));
+}
+
+unique_ptr<TableRef> SemanticLowering::DropMaterialization(const QualifiedName &name, bool if_exists,
+                                                           const string &materialization,
+                                                           bool materialization_if_exists) {
+	return Call(SEMANTIC_VIEW_DROP_MATERIALIZATION_FUNCTION,
+	            NameValues(name, {Value::BOOLEAN(if_exists), Value(materialization),
+	                              Value::BOOLEAN(materialization_if_exists)}));
+}
+
+unique_ptr<TableRef> SemanticLowering::RefreshMaterialization(const QualifiedName &name, bool if_exists,
+                                                              const string &materialization, const Value &mode) {
+	return Call(SEMANTIC_VIEW_REFRESH_MATERIALIZATION_FUNCTION,
+	            NameValues(name, {Value::BOOLEAN(if_exists), Value(materialization), mode}));
+}
+
+unique_ptr<TableRef> SemanticLowering::ShowMaterializations(const QualifiedName &view) {
+	return Call(SEMANTIC_VIEW_SHOW_MATERIALIZATIONS_FUNCTION, NameValues(view));
+}
+
 unique_ptr<TableRef> SemanticLowering::Describe(const QualifiedName &name) {
 	return Call(SEMANTIC_VIEW_DESCRIBE_FUNCTION, NameValues(name));
 }

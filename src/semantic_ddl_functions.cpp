@@ -4,6 +4,7 @@
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "semantic_catalog.hpp"
 #include "semantic_lowering.hpp"
+#include "semantic_materialization.hpp"
 #include "semantic_view_registry.hpp"
 #include "semantic_views_functions.hpp"
 
@@ -52,6 +53,34 @@ static void StatusColumn(vector<LogicalType> &return_types, vector<string> &name
 	return_types.emplace_back(LogicalType::VARCHAR);
 }
 
+//! Materializations of `before` whose state `after` does not keep (their tables are dropped once `after` replaced it)
+static vector<shared_ptr<SemanticMaterialization>> RemovedMaterializations(const shared_ptr<SemanticModel> &before,
+                                                                           const shared_ptr<SemanticModel> &after) {
+	vector<shared_ptr<SemanticMaterialization>> result;
+	if (!before) {
+		return result;
+	}
+	for (auto &old : before->materializations) {
+		bool kept = false;
+		if (after) {
+			for (auto &materialization : after->materializations) {
+				kept = kept || materialization->state == old->state;
+			}
+		}
+		if (!kept) {
+			result.push_back(old);
+		}
+	}
+	return result;
+}
+
+static void DropMaterializationTables(ClientContext &context,
+                                      const vector<shared_ptr<SemanticMaterialization>> &materializations) {
+	for (auto &materialization : materializations) {
+		DropSemanticMaterializationTables(context, *materialization);
+	}
+}
+
 //===--------------------------------------------------------------------===//
 // CREATE
 //===--------------------------------------------------------------------===//
@@ -64,8 +93,11 @@ struct SemanticCreateData : public SemanticDDLData {
 	string Execute(ClientContext &context) const override {
 		auto replace = on_conflict == OnCreateConflict::REPLACE_ON_CONFLICT;
 		if (model && (replace || !state->registry.Get(name))) {
+			auto previous = state->registry.Get(name);
 			ApplySemanticViewChange(context, QualifiedName(), model.get());
 			if (state->registry.Create(model, replace)) {
+				// a replaced view's materializations are gone
+				DropMaterializationTables(context, RemovedMaterializations(previous, nullptr));
 				return "Semantic view " + DisplayName() + " successfully created.";
 			}
 			// created concurrently since bind: restore the placeholder of the registered view
@@ -101,8 +133,10 @@ struct SemanticDropData : public SemanticDDLData {
 	bool if_exists;
 
 	string Execute(ClientContext &context) const override {
+		auto previous = state->registry.Get(name);
 		auto dropped_placeholder = ApplySemanticViewChange(context, name, nullptr);
 		if (state->registry.Drop(name) || dropped_placeholder) {
+			DropMaterializationTables(context, RemovedMaterializations(previous, nullptr));
 			return DisplayName() + " successfully dropped.";
 		}
 		if (if_exists) {
@@ -133,6 +167,9 @@ struct SemanticAlterData : public SemanticDDLData {
 	//! The view as found at bind time, and its altered version; null when the view does not exist
 	shared_ptr<SemanticModel> existing;
 	shared_ptr<SemanticModel> model;
+	//! Materializations the altered view adds (built before it replaces the view)
+	vector<shared_ptr<SemanticMaterialization>> added;
+	string message = "Statement executed successfully.";
 
 	string Execute(ClientContext &context) const override {
 		if (!existing) {
@@ -141,11 +178,16 @@ struct SemanticAlterData : public SemanticDDLData {
 			}
 			throw CatalogException("Semantic view with name \"%s\" does not exist!", name.name);
 		}
+		for (auto &materialization : added) {
+			BuildSemanticMaterialization(context, *model, *materialization);
+		}
 		ApplySemanticViewChange(context, existing->Name(), model.get());
 		if (!state->registry.Replace(*existing, model)) {
+			DropMaterializationTables(context, added);
 			throw CatalogException("Semantic view \"%s\" was dropped or altered by a concurrent statement", name.name);
 		}
-		return "Statement executed successfully.";
+		DropMaterializationTables(context, RemovedMaterializations(existing, model));
+		return message;
 	}
 };
 
@@ -164,6 +206,16 @@ static unique_ptr<FunctionData> SemanticAlterBind(ClientContext &context, TableF
 		edit(*definition);
 		result->model = BuildSemanticModel(context, *definition, definition->name);
 		result->model->created_on = result->existing->created_on;
+		AdoptMaterializationStates(*result->model, *result->existing);
+		for (auto &materialization : result->model->materializations) {
+			bool adopted = false;
+			for (auto &old : result->existing->materializations) {
+				adopted = adopted || old->state == materialization->state;
+			}
+			if (!adopted) {
+				result->added.push_back(materialization);
+			}
+		}
 		BindSemanticViewChange(context, input.binder, result->name, definition->name);
 	}
 	return std::move(result);
@@ -183,6 +235,124 @@ static unique_ptr<FunctionData> SemanticSetCommentBind(ClientContext &context, T
 	                         [&](ParsedSemanticView &definition) { definition.comment = comment; });
 }
 
+static unique_ptr<FunctionData> SemanticSetMaxStalenessBind(ClientContext &context, TableFunctionBindInput &input,
+                                                            vector<LogicalType> &return_types, vector<string> &names) {
+	auto &seconds = input.inputs[4];
+	if (!seconds.IsNull() && seconds.GetValue<int64_t>() < 0) {
+		throw BinderException("MAX_STALENESS must not be negative");
+	}
+	return SemanticAlterBind(context, input, return_types, names, [&](ParsedSemanticView &definition) {
+		definition.has_max_staleness = !seconds.IsNull();
+		definition.max_staleness = seconds.IsNull() ? 0 : seconds.GetValue<int64_t>();
+	});
+}
+
+//===--------------------------------------------------------------------===//
+// Materializations
+//===--------------------------------------------------------------------===//
+static idx_t FindMaterialization(const ParsedSemanticView &definition, const string &name) {
+	for (idx_t m = 0; m < definition.materializations.size(); m++) {
+		if (StringUtil::CIEquals(definition.materializations[m].name, name)) {
+			return m;
+		}
+	}
+	return DConstants::INVALID_INDEX;
+}
+
+static unique_ptr<FunctionData> SemanticAddMaterializationBind(ClientContext &context, TableFunctionBindInput &input,
+                                                               vector<LogicalType> &return_types,
+                                                               vector<string> &names) {
+	auto payload = SemanticLowering::Decode<ParsedSemanticMaterializationPayload>(input.inputs[4]);
+	auto materialization = &payload->materialization;
+	auto if_not_exists = BooleanValue::Get(input.inputs[5]);
+	bool skipped = false;
+	auto result = SemanticAlterBind(context, input, return_types, names, [&](ParsedSemanticView &definition) {
+		if (FindMaterialization(definition, materialization->name) != DConstants::INVALID_INDEX) {
+			if (!if_not_exists) {
+				throw CatalogException("Materialization \"%s\" already exists in semantic view \"%s\"",
+				                       materialization->name, definition.name.name);
+			}
+			skipped = true;
+			return;
+		}
+		definition.materializations.push_back(std::move(*materialization));
+	});
+	auto &data = result->Cast<SemanticAlterData>();
+	if (data.existing) {
+		data.message =
+		    skipped ? "Materialization already exists, statement succeeded." : "Materialization successfully added.";
+	}
+	return result;
+}
+
+static unique_ptr<FunctionData> SemanticDropMaterializationBind(ClientContext &context, TableFunctionBindInput &input,
+                                                                vector<LogicalType> &return_types,
+                                                                vector<string> &names) {
+	auto name = StringArgument(input, 4);
+	auto if_exists = BooleanValue::Get(input.inputs[5]);
+	return SemanticAlterBind(context, input, return_types, names, [&](ParsedSemanticView &definition) {
+		auto index = FindMaterialization(definition, name);
+		if (index == DConstants::INVALID_INDEX) {
+			if (!if_exists) {
+				throw CatalogException("Materialization \"%s\" does not exist in semantic view \"%s\"", name,
+				                       definition.name.name);
+			}
+			return;
+		}
+		definition.materializations.erase(definition.materializations.begin() + NumericCast<int64_t>(index));
+	});
+}
+
+//! REFRESH MATERIALIZATION: brings the materialization up to date (in its own transaction)
+struct SemanticRefreshData : public SemanticDDLData {
+	using SemanticDDLData::SemanticDDLData;
+	bool if_exists;
+	shared_ptr<SemanticModel> model;
+	shared_ptr<SemanticMaterialization> materialization;
+	SemanticRefreshMode mode;
+
+	string Execute(ClientContext &context) const override {
+		if (!model) {
+			if (if_exists) {
+				return "Statement executed successfully.";
+			}
+			throw CatalogException("Semantic view with name \"%s\" does not exist!", name.name);
+		}
+		return RefreshSemanticMaterialization(context, *model, *materialization, mode);
+	}
+};
+
+static unique_ptr<FunctionData> SemanticRefreshMaterializationBind(ClientContext &context,
+                                                                   TableFunctionBindInput &input,
+                                                                   vector<LogicalType> &return_types,
+                                                                   vector<string> &names) {
+	StatusColumn(return_types, names);
+	auto &state = input.info->Cast<SemanticViewsFunctionInfo>().state;
+	auto if_exists = BooleanValue::Get(input.inputs[3]);
+	auto result = make_uniq<SemanticRefreshData>(
+	    state, SemanticViewRegistry::ResolveDDLName(context, NameArguments(input, 0), IfNotFound(if_exists)));
+	result->if_exists = if_exists;
+	result->model = state->registry.Get(result->name);
+	if (result->model) {
+		auto materialization_name = StringArgument(input, 4);
+		for (auto &materialization : result->model->materializations) {
+			if (StringUtil::CIEquals(materialization->name, materialization_name)) {
+				result->materialization = materialization;
+			}
+		}
+		if (!result->materialization) {
+			throw CatalogException("Materialization \"%s\" does not exist in semantic view \"%s\"",
+			                       materialization_name, result->name.name);
+		}
+		auto mode = StringArgument(input, 5);
+		result->mode = mode == "FULL"          ? SemanticRefreshMode::FULL
+		               : mode == "INCREMENTAL" ? SemanticRefreshMode::INCREMENTAL
+		               : mode == "AUTO"        ? SemanticRefreshMode::AUTO
+		                                       : result->materialization->refresh_mode;
+	}
+	return std::move(result);
+}
+
 void RegisterSemanticDDLFunctions(ExtensionLoader &loader, shared_ptr<SemanticViewsState> state) {
 	auto name_and = [](vector<LogicalType> extra) {
 		vector<LogicalType> result(3, LogicalType::VARCHAR);
@@ -200,6 +370,21 @@ void RegisterSemanticDDLFunctions(ExtensionLoader &loader, shared_ptr<SemanticVi
 	loader.RegisterFunction(SemanticViewsTableFunction(
 	    SEMANTIC_VIEW_SET_COMMENT_FUNCTION, name_and({LogicalType::BOOLEAN, LogicalType::VARCHAR}), SemanticDDLScan,
 	    SemanticSetCommentBind, SemanticDDLInit, state));
+	loader.RegisterFunction(SemanticViewsTableFunction(
+	    SEMANTIC_VIEW_SET_MAX_STALENESS_FUNCTION, name_and({LogicalType::BOOLEAN, LogicalType::BIGINT}),
+	    SemanticDDLScan, SemanticSetMaxStalenessBind, SemanticDDLInit, state));
+	loader.RegisterFunction(
+	    SemanticViewsTableFunction(SEMANTIC_VIEW_ADD_MATERIALIZATION_FUNCTION,
+	                               name_and({LogicalType::BOOLEAN, LogicalType::BLOB, LogicalType::BOOLEAN}),
+	                               SemanticDDLScan, SemanticAddMaterializationBind, SemanticDDLInit, state));
+	loader.RegisterFunction(
+	    SemanticViewsTableFunction(SEMANTIC_VIEW_DROP_MATERIALIZATION_FUNCTION,
+	                               name_and({LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::BOOLEAN}),
+	                               SemanticDDLScan, SemanticDropMaterializationBind, SemanticDDLInit, state));
+	loader.RegisterFunction(
+	    SemanticViewsTableFunction(SEMANTIC_VIEW_REFRESH_MATERIALIZATION_FUNCTION,
+	                               name_and({LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::VARCHAR}),
+	                               SemanticDDLScan, SemanticRefreshMaterializationBind, SemanticDDLInit, state));
 }
 
 } // namespace duckdb

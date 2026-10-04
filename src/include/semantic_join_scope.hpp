@@ -27,10 +27,20 @@ private:
 	idx_t next = 0;
 };
 
+//! Where compiled queries read logical tables from, instead of their definitions (materialization refreshes read the
+//! sources at a snapshot, or only the rows that changed)
+class SemanticTableSources {
+public:
+	virtual ~SemanticTableSources() = default;
+	//! The table reference of logical table `table` (the caller sets its alias)
+	virtual unique_ptr<TableRef> Source(idx_t table) const = 0;
+};
+
 class SemanticJoinScope {
 public:
 	SemanticJoinScope(const SemanticModel &model, SemanticAliasGenerator &aliases, idx_t base,
-	                  vector<idx_t> using_relationships, string prefix = string());
+	                  vector<idx_t> using_relationships, string prefix = string(),
+	                  optional_ptr<const SemanticTableSources> sources = nullptr);
 
 	//! Scope of a correlated subquery over `base`: tables reachable from `outer_context` (the row the subquery
 	//! belongs to) resolve in this scope instead
@@ -56,6 +66,7 @@ private:
 	};
 
 	string AliasOf(idx_t table) const;
+	unique_ptr<TableRef> Source(idx_t table) const;
 	bool BelongsToOuter(idx_t table) const;
 	unique_ptr<ParsedExpression> RangeLookup(const vector<SemanticEdge> &path, idx_t range_at, idx_t table,
 	                                         const string &column);
@@ -65,6 +76,7 @@ private:
 	idx_t base;
 	vector<idx_t> using_relationships;
 	string prefix;
+	optional_ptr<const SemanticTableSources> sources;
 	optional_ptr<SemanticJoinScope> outer;
 	idx_t outer_context = DConstants::INVALID_INDEX;
 	vector<Joined> joins;

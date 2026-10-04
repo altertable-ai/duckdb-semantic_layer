@@ -198,6 +198,7 @@ void ParsedSemanticView::Serialize(Serializer &serializer) const {
 	serializer.WriteProperty(113, "verified_queries", verified_queries);
 	serializer.WriteProperty(114, "tags", tags);
 	serializer.WriteProperty(115, "copy_grants", copy_grants);
+	serializer.WritePropertyWithDefault(116, "materializations", materializations);
 }
 
 unique_ptr<ParsedSemanticView> ParsedSemanticView::Deserialize(Deserializer &deserializer) {
@@ -216,6 +217,46 @@ unique_ptr<ParsedSemanticView> ParsedSemanticView::Deserialize(Deserializer &des
 	result->verified_queries = deserializer.ReadProperty<vector<ParsedSemanticVerifiedQuery>>(113, "verified_queries");
 	result->tags = deserializer.ReadProperty<vector<ParsedSemanticTag>>(114, "tags");
 	result->copy_grants = deserializer.ReadProperty<bool>(115, "copy_grants");
+	result->materializations =
+	    deserializer.ReadPropertyWithDefault<vector<ParsedSemanticMaterialization>>(116, "materializations");
+	return result;
+}
+
+string SemanticRefreshModeToString(SemanticRefreshMode mode) {
+	switch (mode) {
+	case SemanticRefreshMode::FULL:
+		return "FULL";
+	case SemanticRefreshMode::INCREMENTAL:
+		return "INCREMENTAL";
+	default:
+		return "AUTO";
+	}
+}
+
+void ParsedSemanticMaterialization::Serialize(Serializer &serializer) const {
+	serializer.WriteProperty(100, "name", name);
+	serializer.WriteProperty(101, "items", items);
+	serializer.WriteProperty<uint8_t>(102, "refresh_mode", static_cast<uint8_t>(refresh_mode));
+	serializer.WriteProperty(103, "warehouse", warehouse);
+}
+
+void ParsedSemanticMaterializationPayload::Serialize(Serializer &serializer) const {
+	serializer.WriteProperty(100, "materialization", materialization);
+}
+
+unique_ptr<ParsedSemanticMaterializationPayload>
+ParsedSemanticMaterializationPayload::Deserialize(Deserializer &deserializer) {
+	auto result = make_uniq<ParsedSemanticMaterializationPayload>();
+	result->materialization = deserializer.ReadProperty<ParsedSemanticMaterialization>(100, "materialization");
+	return result;
+}
+
+ParsedSemanticMaterialization ParsedSemanticMaterialization::Deserialize(Deserializer &deserializer) {
+	ParsedSemanticMaterialization result;
+	result.name = deserializer.ReadProperty<string>(100, "name");
+	result.items = deserializer.ReadProperty<vector<ParsedSemanticQueryItem>>(101, "items");
+	result.refresh_mode = static_cast<SemanticRefreshMode>(deserializer.ReadProperty<uint8_t>(102, "refresh_mode"));
+	result.warehouse = deserializer.ReadProperty<string>(103, "warehouse");
 	return result;
 }
 

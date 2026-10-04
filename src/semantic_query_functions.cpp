@@ -6,7 +6,9 @@
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckdb/parser/tableref/table_function_ref.hpp"
+#include "duckdb/planner/binder.hpp"
 #include "semantic_lowering.hpp"
+#include "semantic_materialization.hpp"
 #include "semantic_query_compiler.hpp"
 #include "semantic_sql_rewrite.hpp"
 #include "semantic_statement_visitor.hpp"
@@ -18,16 +20,24 @@ namespace duckdb {
 
 //! The subquery a SEMANTIC_VIEW(...) call (lowered payload) compiles to
 static unique_ptr<TableRef> CompileSemanticQuery(ClientContext &context, SemanticViewsState &state,
-                                                 const Value &payload) {
+                                                 const Value &payload, optional_ptr<Binder> binder) {
 	auto query = SemanticLowering::Decode<ParsedSemanticQuery>(payload);
 	auto model = state.registry.GetOrThrow(context, query->view);
 	SemanticQueryCompiler compiler(*model, context);
 	auto spec = compiler.Resolve(query->items, query->where.get());
-	return make_uniq<SubqueryRef>(compiler.Compile(spec), model->Name().name);
+	SemanticMaterializationMatcher materializations(context, *model);
+	SemanticCompileOptions options;
+	options.materializations = &materializations;
+	auto compiled = compiler.Compile(spec, options);
+	if (materializations.UsedMaterialization() && binder) {
+		// a prepared statement reading a materialization is planned again (freshness checked) at every execution
+		binder->SetAlwaysRequireRebind();
+	}
+	return make_uniq<SubqueryRef>(std::move(compiled), model->Name().name);
 }
 
 static unique_ptr<TableRef> SemanticQueryBindReplace(ClientContext &context, TableFunctionBindInput &input) {
-	return CompileSemanticQuery(context, GetSemanticViewsState(input), input.inputs[0]);
+	return CompileSemanticQuery(context, GetSemanticViewsState(input), input.inputs[0], input.binder);
 }
 
 //===--------------------------------------------------------------------===//
@@ -49,7 +59,8 @@ protected:
 		if (!StringUtil::CIEquals(function.function_name, SEMANTIC_VIEW_QUERY_FUNCTION)) {
 			return;
 		}
-		auto replacement = CompileSemanticQuery(context, state, function.children[0]->Cast<ConstantExpression>().value);
+		auto replacement =
+		    CompileSemanticQuery(context, state, function.children[0]->Cast<ConstantExpression>().value, nullptr);
 		if (!ref->alias.empty()) {
 			replacement->alias = ref->alias;
 		}
