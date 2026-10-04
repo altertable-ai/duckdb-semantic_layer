@@ -56,6 +56,15 @@ struct SemanticMaterializedAtom {
 	vector<string> StateColumns() const;
 };
 
+//! A nested (child) aggregation in the rows of a block: the rows of `table` matching a row of `parent` (a table of
+//! the block) on `columns` = `parent_columns`, aggregated per row of `parent`
+struct SemanticMaterializedChild {
+	idx_t table;
+	idx_t parent;
+	vector<string> columns;
+	vector<string> parent_columns;
+};
+
 //! One physical table: the atoms of a materialization aggregated over the same home table
 struct SemanticMaterializedBlock {
 	idx_t home;
@@ -63,6 +72,17 @@ struct SemanticMaterializedBlock {
 	vector<SemanticMaterializedAtom> atoms;
 	//! Logical tables the block reads (home, tables on the join paths of its dimensions and arguments)
 	set<idx_t> tables;
+	//! Logical tables read by nested aggregations, and those of them maintainable incrementally (direct child tables
+	//! aggregating their own columns)
+	set<idx_t> nested_tables;
+	vector<SemanticMaterializedChild> children;
+
+	//! Every logical table whose changes can change the block
+	set<idx_t> SourceTables() const {
+		auto result = tables;
+		result.insert(nested_tables.begin(), nested_tables.end());
+		return result;
+	}
 };
 
 //! Mutable state of a materialization, shared by the successive models of its semantic view (ALTER)

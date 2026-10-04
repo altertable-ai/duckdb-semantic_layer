@@ -228,7 +228,7 @@ public:
 	    : context(context), model(model), materialization(materialization), state(*materialization.state),
 	      tracker(context), connection(tracker.GetConnection()), compiler(model, context) {
 		for (auto &block : materialization.blocks) {
-			for (auto table : block.tables) {
+			for (auto table : block.SourceTables()) {
 				string reason;
 				auto source = ClassifySemanticSource(context, model, table, reason);
 				if (source.Tracked()) {
@@ -329,14 +329,12 @@ private:
 		if (mode == SemanticRefreshMode::FULL) {
 			return "FULL refresh requested";
 		}
-		if (!materialization.incremental) {
-			return materialization.incremental_reason;
-		}
 		if (!built && !unbuilt_reason.empty()) {
 			return unbuilt_reason;
 		}
 		if (!built || watermark.empty()) {
-			return "it was not built from tracked snapshots";
+			return materialization.incremental ? "it was not built from tracked snapshots"
+			                                   : materialization.incremental_reason;
 		}
 		for (auto &entry : changes) {
 			auto previous = watermark.find(entry.first);
@@ -362,6 +360,15 @@ private:
 			if (!Catalog::GetEntry(*connection.context, state.catalog, state.schema, lookup,
 			                       OnEntryNotFound::RETURN_NULL)) {
 				return "its table " + state.tables[b] + " is missing";
+			}
+		}
+		// a materialization that cannot follow changes is rebuilt once its sources changed
+		if (!materialization.incremental) {
+			for (auto &source : tracked) {
+				auto &catalog = changes.at(source.second.catalog);
+				if (watermark.at(source.second.catalog) != catalog.current && catalog.RowChanges(source.second).Any()) {
+					return materialization.incremental_reason;
+				}
 			}
 		}
 		return string();
@@ -440,7 +447,7 @@ private:
 		optional_idx changed_groups;
 		for (idx_t b = 0; b < materialization.blocks.size(); b++) {
 			set<idx_t> changed;
-			for (auto table : materialization.blocks[b].tables) {
+			for (auto table : materialization.blocks[b].SourceTables()) {
 				auto &source = tracked.at(table);
 				if (watermark.at(source.catalog) == current.at(source.catalog)) {
 					continue;
@@ -462,7 +469,8 @@ private:
 				CreateTableAs(state.catalog, state.schema, state.tables[b], States(b, options), false);
 				for (auto table : changed) {
 					if (table != home) {
-						rebuilt = "rebuilt because dimension table \"" + model.tables[table].name + "\" changed";
+						auto kind = materialization.blocks[b].tables.count(table) ? "dimension table" : "child table";
+						rebuilt = "rebuilt because " + string(kind) + " \"" + model.tables[table].name + "\" changed";
 					}
 				}
 				continue;
@@ -510,28 +518,44 @@ private:
 			old_rows.replacements[block.home] = ChangedRowImages(home_changes, false);
 			AddPart(b, old_rows, nullptr, -1, parts);
 		}
-		// 2. unchanged home rows that reach a changed row of another table: + as of now, - as of before
-		map<idx_t, string> referenced;
+		// 2. unchanged home rows that reach a changed row of another table, or whose nested aggregations read changed
+		// rows of a child table: + as of now, - as of before
+		struct Link {
+			//! changed rows (temp table) and their columns matching `parent_columns` of table `parent`
+			string changes;
+			vector<string> columns;
+			idx_t parent;
+			vector<string> parent_columns;
+		};
+		vector<Link> links;
 		for (auto table : changed) {
-			if (table != block.home) {
-				referenced[table] = Changes(table, watermark, current);
+			if (table == block.home) {
+				continue;
+			}
+			auto changes = Changes(table, watermark, current);
+			if (block.tables.count(table)) {
+				auto path = model.Path(block.home, table, block.using_relationships);
+				auto &edge = path.back();
+				auto &rel = model.relationships[edge.relationship];
+				auto parent = path.size() >= 2 ? path[path.size() - 2].target : block.home;
+				links.push_back({changes, edge.reversed ? rel.from_columns : rel.to_columns, parent,
+				                 edge.reversed ? rel.to_columns : rel.from_columns});
+			}
+			for (auto &child : block.children) {
+				if (child.table == table) {
+					links.push_back({changes, child.columns, child.parent, child.parent_columns});
+				}
 			}
 		}
-		if (!referenced.empty()) {
+		if (!links.empty()) {
 			auto filter = [&](SemanticJoinScope &scope, const vector<unique_ptr<ParsedExpression>> &) {
 				unique_ptr<ParsedExpression> result;
-				for (auto &entry : referenced) {
-					auto path = model.Path(block.home, entry.first, block.using_relationships);
-					auto &edge = path.back();
-					auto &rel = model.relationships[edge.relationship];
-					auto parent = path.size() >= 2 ? path[path.size() - 2].target : block.home;
-					auto &parent_columns = edge.reversed ? rel.to_columns : rel.from_columns;
-					auto &keys = edge.reversed ? rel.from_columns : rel.to_columns;
+				for (auto &link : links) {
 					vector<unique_ptr<ParsedExpression>> values;
-					for (auto &column : parent_columns) {
-						values.push_back(scope.ColumnReference(parent, column));
+					for (auto &column : link.parent_columns) {
+						values.push_back(scope.ColumnReference(link.parent, column));
 					}
-					auto reaching = ExistsIn(entry.second, keys, std::move(values), false);
+					auto reaching = ExistsIn(link.changes, link.columns, std::move(values), false);
 					result = result ? make_uniq<ConjunctionExpression>(ExpressionType::CONJUNCTION_OR,
 					                                                   std::move(result), std::move(reaching))
 					                : std::move(reaching);

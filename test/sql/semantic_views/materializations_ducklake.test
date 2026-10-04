@@ -713,7 +713,7 @@ ALTER SEMANTIC VIEW shop REFRESH MATERIALIZATION totals;
 ----
 Materialization totals refreshed (FULL: its table shop__totals__0 is missing).
 
-# a definition the incremental refresh does not support explains why
+# nested aggregations over a child table are maintained incrementally (see materializations_nested.test)
 statement ok
 CREATE SEMANTIC VIEW child_view
   TABLES (o AS lake.orders PRIMARY KEY (id), c AS lake.customers PRIMARY KEY (id))
@@ -728,4 +728,4 @@ ALTER SEMANTIC VIEW child_view ADD MATERIALIZATION m AS DIMENSIONS c.segment MET
 query II
 SELECT incremental, not_incremental_reason FROM (SHOW SEMANTIC MATERIALIZATIONS IN child_view);
 ----
-false	a metric aggregates values that themselves aggregate other rows or use a subquery
+true	NULL
