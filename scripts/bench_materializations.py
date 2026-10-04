@@ -5,10 +5,10 @@ Usage:
     python3 scripts/bench_materializations.py --dir /path/to/workdir [--rows 100000000]
 
 Creates a DuckLake catalog in --dir holding a star schema (sales -> customers, sales -> products), a semantic view and
-two identical materializations (revenue, units, counts and averages by customer segment and product category): one
-refreshed FULL, one INCREMENTAL, one AUTO. For each change size (1 row, 1,000 rows, 100,000 rows, ~1% of the rows) and change
-kind (updates, inserts, deletes, a dimension-table update), it applies the change, times both refreshes and checks
-that both materializations hold exactly the same state. It also times a semantic query read from the materialization
+three identical materializations (revenue, units, counts and averages by customer segment and product category):
+one refreshed FULL, one INCREMENTAL, one AUTO. For each change size (1 row, 1,000 rows, 100,000 rows, ~1% of the
+rows) and change kind (updates, inserts, deletes, a dimension-table update), it applies the change, times the three
+refreshes and checks that the materializations hold exactly the same state. It also times a semantic query read from the materialization
 vs computed from the sources.
 
 Everything runs in one DuckDB CLI session (semantic views live in memory).

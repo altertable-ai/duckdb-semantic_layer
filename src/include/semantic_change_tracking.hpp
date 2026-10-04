@@ -5,9 +5,9 @@
 //
 // What changed in the sources of a materialization. Materializations only
 // ask: which version is each source at, did a table change between two
-// versions, and which rows changed. DuckLake tables answer through snapshots
-// and ducklake_table_changes(); other tables are untracked (full refresh only,
-// freshness unknown).
+// versions, and which rows changed. DuckLake tables answer through their
+// snapshot metadata and ducklake_table_insertions() / _deletions(); other
+// tables are untracked (full refresh only, freshness unknown).
 //
 //===----------------------------------------------------------------------===//
 

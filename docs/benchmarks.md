@@ -56,30 +56,30 @@ row count and average by customer segment and product category): one refreshed `
 `AUTO`. For each change size and kind it applies the change, times the three refreshes and checks that the three
 materializations hold exactly the same state.
 
-DuckDB v1.5.5 + DuckLake d8a1881e, release build, Apple M4 Pro (14 cores, 48 GB), one run, 2026-10-04 (the machine
-was running other heavy workloads, so expect noise).
+DuckDB v1.5.5 + DuckLake d8a1881e, release build, Apple M4 Pro (14 cores, 48 GB), one run, 2026-10-04.
 
 | Change | Full (s) | INCREMENTAL (s) | Speedup | AUTO (s) | Speedup | Same state |
 |---|---:|---:|---:|---:|---:|---|
-| update 1 row | 0.985 | 0.340 | 2.9x | 0.137 | 7.2x | yes |
-| insert 1 row | 0.950 | 0.033 | 28.8x | 0.034 | 27.9x | yes |
-| delete 1 row | 0.979 | 0.038 | 25.8x | 0.035 | 28.0x | yes |
-| update 1 customer's segment | 0.977 | 1.537 | 0.6x | 0.834 | 1.2x | yes |
-| update 1,000 rows | 0.746 | 0.601 | 1.2x | 0.371 | 2.0x | yes |
-| insert 1,000 rows | 0.778 | 0.038 | 20.5x | 0.037 | 21.0x | yes |
-| delete 1,000 rows | 0.835 | 0.163 | 5.1x | 0.137 | 6.1x | yes |
-| update 1,000 customers' segment | 0.855 | 1.389 | 0.6x | 0.906 | 0.9x | yes |
-| update 100,000 rows | 0.943 | 0.559 | 1.7x | 0.466 | 2.0x | yes |
-| insert 100,000 rows | 0.865 | 0.054 | 16.0x | 0.057 | 15.2x | yes |
-| delete 100,000 rows | 0.846 | 0.206 | 4.1x | 0.156 | 5.4x | yes |
-| update 100,000 customers' segment | 1.188 | 2.185 | 0.5x | 0.917 | 1.3x | yes |
-| update 1,000,000 rows (1%) | 1.124 | 1.091 | 1.0x | 0.895 | 1.3x | yes |
-| insert 1,000,000 rows (1%) | 1.056 | 0.176 | 6.0x | 0.169 | 6.2x | yes |
-| delete 1,000,000 rows (1%) | 0.926 | 0.416 | 2.2x | 0.285 | 3.2x | yes |
-| update 1,000,000 customers' segment (all) | 0.934 | 2.563 | 0.4x | 0.869 | 1.1x | yes |
+| update 1 row | 0.517 | 0.124 | 4.2x | 0.089 | 5.8x | yes |
+| insert 1 row | 0.535 | 0.014 | 38.2x | 0.012 | 44.6x | yes |
+| delete 1 row | 0.529 | 0.015 | 35.3x | 0.014 | 37.8x | yes |
+| update 1 customer's segment | 0.518 | 0.804 | 0.6x | 0.516 | 1.0x | yes |
+| update 1,000 rows | 0.534 | 0.433 | 1.2x | 0.298 | 1.8x | yes |
+| insert 1,000 rows | 0.583 | 0.018 | 32.4x | 0.018 | 32.4x | yes |
+| delete 1,000 rows | 0.558 | 0.129 | 4.3x | 0.111 | 5.0x | yes |
+| update 1,000 customers' segment | 0.548 | 0.880 | 0.6x | 0.519 | 1.1x | yes |
+| update 100,000 rows | 0.546 | 0.364 | 1.5x | 0.363 | 1.5x | yes |
+| insert 100,000 rows | 0.551 | 0.033 | 16.7x | 0.032 | 17.2x | yes |
+| delete 100,000 rows | 0.541 | 0.137 | 3.9x | 0.125 | 4.3x | yes |
+| update 100,000 customers' segment | 0.554 | 1.074 | 0.5x | 0.550 | 1.0x | yes |
+| update 1,000,000 rows (1%) | 0.560 | 0.547 | 1.0x | 0.485 | 1.2x | yes |
+| insert 1,000,000 rows (1%) | 0.585 | 0.090 | 6.5x | 0.086 | 6.8x | yes |
+| delete 1,000,000 rows (1%) | 0.562 | 0.303 | 1.9x | 0.204 | 2.8x | yes |
+| update 1,000,000 customers' segment (all) | 0.533 | 1.749 | 0.3x | 0.562 | 0.9x | yes |
 
-Reading the materialization instead of the sources: 0.003 s vs 0.42-0.56 s for a query by segment; a refresh with
-no source change takes 0.003 s.
+Reading the materialization instead of the sources: 0.006 s vs 0.29 s for a query by segment; a refresh with no
+source change takes 0.005 s. A refresh runs a handful of statements in one transaction (read the changes, compute
+the delta, `MERGE` it, record the new snapshots): about 12 ms when a single row changed.
 
 - Inserts are applied from `ducklake_table_insertions()` alone, which reads only the new rows: cost follows the
   number of changed rows.

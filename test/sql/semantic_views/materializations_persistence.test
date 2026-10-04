@@ -286,3 +286,31 @@ query I
 SELECT (SELECT count(*) FROM __semantic_materializations.__sv_materializations) + (SELECT count(*) FROM other_name.__semantic_materializations.__sv_materializations);
 ----
 0
+
+# CREATE OR REPLACE keeps the materializations the new definition can still serve, and drops the others
+statement ok
+CREATE SEMANTIC VIEW v TABLES (o AS other_name.orders PRIMARY KEY (id)) METRICS (o.revenue AS SUM(amount), o.order_count AS COUNT(*));
+
+statement ok
+ALTER SEMANTIC VIEW v ADD MATERIALIZATION kept AS METRICS o.revenue;
+
+statement ok
+ALTER SEMANTIC VIEW v ADD MATERIALIZATION gone AS METRICS o.order_count;
+
+statement ok
+CREATE OR REPLACE SEMANTIC VIEW v TABLES (o AS other_name.orders PRIMARY KEY (id)) METRICS (o.revenue AS SUM(amount));
+
+query III
+SELECT name, last_refresh_detail, usable FROM (SHOW SEMANTIC MATERIALIZATIONS IN v);
+----
+kept	initial build	true
+
+query I
+SELECT table_name FROM duckdb_tables() WHERE table_name LIKE 'v\_\_%' ESCAPE '\';
+----
+v__kept__0
+
+query I
+SELECT name FROM __semantic_materializations.__sv_materializations WHERE view_name = 'v';
+----
+kept

@@ -358,7 +358,7 @@ SELECT customers.segment, AGG(lines.revenue) FROM sales GROUP BY customers.segme
 
 ```sql
 ALTER SEMANTIC VIEW <view> ADD MATERIALIZATION [IF NOT EXISTS] <name>
-  [REFRESH_MODE = AUTO | FULL | INCREMENTAL]
+  [REFRESH_MODE = AUTO | FULL | INCREMENTAL] [IN <database>[.<schema>]]
   AS DIMENSIONS <dimension> [, ...] METRICS <metric> [, ...]
 ALTER SEMANTIC VIEW <view> REFRESH MATERIALIZATION <name> [AUTO | FULL | INCREMENTAL]
 ALTER SEMANTIC VIEW <view> DROP MATERIALIZATION [IF EXISTS] <name>
@@ -367,11 +367,12 @@ SHOW SEMANTIC MATERIALIZATIONS [LIKE '<pattern>'] [IN <view>]
 ```
 
 **What is stored.** One table per aggregation block (the metrics' aggregates over the same table), in the schema
-`__semantic_materializations` of the semantic view's database. Each row is a group of the materialization's
-dimensions and holds the *state* of every aggregate rather than its final value, so that coarser queries and
-incremental refreshes stay exact: `SUM` stores a sum and a count, `AVG` a sum and a count, `COUNT` a count, `MIN` /
-`MAX` the extreme value, plus the number of rows of the group. Other aggregates (`COUNT(DISTINCT ...)`, `median`,
-...) are stored as they are.
+`__semantic_materializations` of the semantic view's database, or of the database named by `IN` (any writable
+DuckDB database, file or in-memory, or DuckLake catalog; `IN lake.analytics` also picks the schema). Each row is a
+group of the materialization's dimensions and holds the *state* of every aggregate rather than its final value, so
+that coarser queries and incremental refreshes stay exact: `SUM` stores a sum and a count, `AVG` a sum and a count,
+`COUNT` a count, `MIN` / `MAX` the extreme value, plus the number of rows of the group. Other aggregates
+(`COUNT(DISTINCT ...)`, `median`, ...) are stored as they are.
 
 **When a query uses it.** A block of a query is read from a materialization when the materialization stores all of
 its aggregates, the query's dimensions and `WHERE` clause can be computed from the stored dimensions (for example
@@ -405,19 +406,33 @@ metadata, reads their inserted and deleted rows since the last refresh (`ducklak
 - changed rows of a table its dimensions come from (a customer changing segment) move the unchanged rows that
   reference them from their old group to their new one. Finding those rows scans the metric's table twice (as of
   before and as of now), so `AUTO` rebuilds such blocks instead, which scans it once;
+- changed rows of a table aggregated by a nested aggregation (`FACTS (customers.order_total AS
+  SUM(orders.amount))` aggregated again by `AVG(customers.order_total)`) recompute, as of before and as of now, the
+  rows whose nested aggregation reads them; here too `AUTO` rebuilds the block instead;
 - `SUM`, `COUNT` and `AVG` states are updated arithmetically; groups whose row count drops to zero disappear;
 - `MIN` / `MAX` merge new rows directly, and groups that lost rows are recomputed from the sources, like every
   affected group of an aggregate stored as is.
 
 A refresh falls back to a full rebuild (or fails in `INCREMENTAL` mode) when a source is not a DuckLake table, a
-dimension or metric aggregates other rows or uses a subquery, a join uses an `ASOF` or range relationship, the change
-history since the last refresh was expired, a source catalog's schema changed, or the materialization's table is
-missing. A failed refresh leaves the materialization as it was. Inserts cost about the number of new rows; deletes
+dimension aggregates other rows, a metric uses a subquery or a nested aggregation of anything but the columns of a
+table directly referencing a table of the materialization, a join uses an `ASOF` or range relationship, the change
+history since the last refresh was expired, the definition of a source table changed (altered, dropped or
+re-created: changes to other tables do not matter), or the materialization's table is missing. Without source
+changes, a refresh does nothing. A failed refresh leaves the materialization as it was. Inserts cost about the number of new rows; deletes
 and updates also read the deleted rows' old values from DuckLake's data files. See
 [docs/benchmarks.md](docs/benchmarks.md#materialization-refresh) for measurements on 100M rows.
 
-Materializations cannot include semi-additive metrics or dimensions reached through a many-to-many bridge. They are
-part of the semantic view's in-memory definition: re-create them with the view after a restart.
+**Persistence.** Next to its tables, each storage schema `__semantic_materializations` holds a table
+`__sv_materializations` recording every materialization stored in that database: its definition, tables, the
+snapshots it was built at and its last refresh, updated in the refresh's transaction. Semantic views live in memory,
+but their materializations survive restarts: re-creating the view (`CREATE`, `CREATE OR REPLACE`) brings back the
+materializations stored for it in every attached database, reattached to their tables. One whose aggregates changed
+with the new definition is rebuilt by its next refresh; one the new definition can no longer serve is dropped. Adding
+a materialization that is already stored with the same definition reattaches it too. `DROP SEMANTIC VIEW` and
+`DROP MATERIALIZATION` drop the tables and their records; renaming the view keeps them. A DuckLake catalog attached
+under another name is found again (materializations stored in in-memory databases are gone with them).
+
+Materializations cannot include semi-additive metrics or dimensions reached through a many-to-many bridge.
 
 ## Managing and inspecting semantic views
 
@@ -474,7 +489,7 @@ relationships are about 9x faster than a hand-written range join. See [docs/benc
 ## Limitations
 
 - **Definitions live in memory**, per database instance. They are not saved in the database file and must be
-  re-created after a restart. They are not transactional: a `CREATE` inside a rolled-back transaction stays.
+  re-created after a restart (their [materializations](#materializations) are saved, and come back with them). They are not transactional: a `CREATE` inside a rolled-back transaction stays.
 - The **catalog placeholder views**, however, are saved in database files like any view. After a restart a
   placeholder stays listed, and querying it fails with `Semantic view "x" is not defined in this session`.
   `CREATE SEMANTIC VIEW x` replaces it and `DROP SEMANTIC VIEW x` removes it. Without the extension loaded, querying it
@@ -549,10 +564,12 @@ SERVICE`, `AI_SQL_GENERATION`, `AI_QUESTION_CATEGORIZATION`, `AI_VERIFIED_QUERIE
 
 **Differences:**
 
-- `CREATE OR ALTER` behaves like `CREATE OR REPLACE` (materializations are dropped).
+- `CREATE OR ALTER` behaves like `CREATE OR REPLACE` (materializations the new definition can still serve are
+  kept).
 - `MAX_STALENESS` is a number of seconds. Materializations of DuckDB tables, whose changes cannot be tracked, are only
   read within it.
-- `REFRESH MATERIALIZATION` accepts an explicit `AUTO`, `FULL` or `INCREMENTAL` mode.
+- `REFRESH MATERIALIZATION` accepts an explicit `AUTO`, `FULL` or `INCREMENTAL` mode, and `ADD MATERIALIZATION` a
+  storage database (`IN`).
 - Expressions may reference physical columns of other logical tables directly (Snowflake requires a fact).
 
 ## License
