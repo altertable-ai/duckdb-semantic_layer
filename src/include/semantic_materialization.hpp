@@ -52,6 +52,12 @@ struct SemanticMaterializedAtom {
 	LogicalType type;
 	string prefix;
 
+	SemanticMaterializedAtom() = default;
+	SemanticMaterializedAtom(const SemanticMaterializedAtom &) = delete;
+	SemanticMaterializedAtom &operator=(const SemanticMaterializedAtom &) = delete;
+	SemanticMaterializedAtom(SemanticMaterializedAtom &&) noexcept = default;
+	SemanticMaterializedAtom &operator=(SemanticMaterializedAtom &&) noexcept = default;
+
 	//! The state columns, in table order
 	vector<string> StateColumns() const;
 };
@@ -68,6 +74,12 @@ struct SemanticMaterializedBlock {
 	set<idx_t> nested_tables;
 	vector<SemanticChildDependency> children;
 	bool dependencies_complete = true;
+
+	SemanticMaterializedBlock() = default;
+	SemanticMaterializedBlock(const SemanticMaterializedBlock &) = delete;
+	SemanticMaterializedBlock &operator=(const SemanticMaterializedBlock &) = delete;
+	SemanticMaterializedBlock(SemanticMaterializedBlock &&) noexcept = default;
+	SemanticMaterializedBlock &operator=(SemanticMaterializedBlock &&) noexcept = default;
 
 	//! Every logical table whose changes can change the block
 	set<idx_t> SourceTables() const {

@@ -13,6 +13,12 @@ struct SemanticMaterializationRecord {
 	timestamp_t verified_at;
 	string last_refresh;
 	string last_refresh_detail;
+
+	SemanticMaterializationRecord() = default;
+	SemanticMaterializationRecord(const SemanticMaterializationRecord &) = delete;
+	SemanticMaterializationRecord &operator=(const SemanticMaterializationRecord &) = delete;
+	SemanticMaterializationRecord(SemanticMaterializationRecord &&) noexcept = default;
+	SemanticMaterializationRecord &operator=(SemanticMaterializationRecord &&) noexcept = default;
 };
 
 bool HasMetadata(ClientContext &context, const string &catalog);

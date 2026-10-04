@@ -122,6 +122,12 @@ struct ParsedSemanticQueryItem {
 	string star_table;
 	string alias;
 
+	ParsedSemanticQueryItem() = default;
+	ParsedSemanticQueryItem(const ParsedSemanticQueryItem &) = delete;
+	ParsedSemanticQueryItem &operator=(const ParsedSemanticQueryItem &) = delete;
+	ParsedSemanticQueryItem(ParsedSemanticQueryItem &&) noexcept = default;
+	ParsedSemanticQueryItem &operator=(ParsedSemanticQueryItem &&) noexcept = default;
+
 	void Serialize(Serializer &serializer) const;
 	static ParsedSemanticQueryItem Deserialize(Deserializer &deserializer);
 };
@@ -148,6 +154,12 @@ struct ParsedSemanticMaterialization {
 	//! IN <database>[.<schema>]: where its tables are stored (empty: the semantic view's database)
 	string storage_catalog;
 	string storage_schema;
+
+	ParsedSemanticMaterialization() = default;
+	ParsedSemanticMaterialization(const ParsedSemanticMaterialization &) = delete;
+	ParsedSemanticMaterialization &operator=(const ParsedSemanticMaterialization &) = delete;
+	ParsedSemanticMaterialization(ParsedSemanticMaterialization &&) noexcept = default;
+	ParsedSemanticMaterialization &operator=(ParsedSemanticMaterialization &&) noexcept = default;
 
 	ParsedSemanticMaterialization Copy() const;
 	void Serialize(Serializer &serializer) const;

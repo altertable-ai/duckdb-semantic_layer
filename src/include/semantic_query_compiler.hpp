@@ -25,10 +25,19 @@ class SemanticExpressionCompiler;
 struct SemanticAliasGenerator;
 
 struct SemanticQueryItem {
-	SemanticMemberKind kind;
+	SemanticMemberKind kind = SemanticMemberKind::DIMENSION;
 	//! Resolved expression (marker references)
 	unique_ptr<ParsedExpression> resolved;
 	string output_name;
+
+	SemanticQueryItem() = default;
+	SemanticQueryItem(SemanticMemberKind kind, unique_ptr<ParsedExpression> resolved, string output_name)
+	    : kind(kind), resolved(std::move(resolved)), output_name(std::move(output_name)) {
+	}
+	SemanticQueryItem(const SemanticQueryItem &) = delete;
+	SemanticQueryItem &operator=(const SemanticQueryItem &) = delete;
+	SemanticQueryItem(SemanticQueryItem &&) noexcept = default;
+	SemanticQueryItem &operator=(SemanticQueryItem &&) noexcept = default;
 };
 
 struct SemanticQuerySpec {
@@ -50,6 +59,12 @@ struct SemanticBlockPlan {
 	//! Result type of every atom
 	vector<LogicalType> atom_types;
 	SemanticBlockDependencies dependencies;
+
+	SemanticBlockPlan() = default;
+	SemanticBlockPlan(const SemanticBlockPlan &) = delete;
+	SemanticBlockPlan &operator=(const SemanticBlockPlan &) = delete;
+	SemanticBlockPlan(SemanticBlockPlan &&) noexcept = default;
+	SemanticBlockPlan &operator=(SemanticBlockPlan &&) noexcept = default;
 };
 
 //! A block of a query read from a materialization: SELECT <dimensions>, <aggregates> FROM table WHERE where GROUP BY

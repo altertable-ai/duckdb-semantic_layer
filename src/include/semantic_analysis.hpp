@@ -29,12 +29,19 @@ struct SemanticMetricContext {
 	idx_t non_additive_member = DConstants::INVALID_INDEX;
 };
 
-//! An aggregate evaluated over the rows of `home`
+//! An aggregate evaluated over the rows of `home`.
+//! Move-only: MSVC instantiates `vector`'s copy constructor unless the copy is explicitly deleted.
 struct SemanticAtom {
 	idx_t home;
 	//! The aggregate expression (resolved; marker references)
 	unique_ptr<ParsedExpression> aggregate;
 	SemanticMetricContext context;
+
+	SemanticAtom() = default;
+	SemanticAtom(const SemanticAtom &) = delete;
+	SemanticAtom &operator=(const SemanticAtom &) = delete;
+	SemanticAtom(SemanticAtom &&) noexcept = default;
+	SemanticAtom &operator=(SemanticAtom &&) noexcept = default;
 };
 
 class SemanticAnalyzer {
