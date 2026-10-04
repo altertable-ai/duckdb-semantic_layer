@@ -123,12 +123,10 @@ shared_ptr<SemanticMaterialization> PlanSemanticMaterialization(ClientContext &c
 				}
 			}
 		}
-		for (auto table : block.SourceTables()) {
-			string reason;
-			if (!ClassifySemanticSource(context, model, table, reason).Tracked()) {
-				unsupported(reason);
-			}
-		}
+	}
+	SemanticMaterializationSources sources(context, model, *result);
+	if (!sources.untracked_reason.empty()) {
+		unsupported(sources.untracked_reason);
 	}
 	// storage: a writable DuckDB database or DuckLake catalog (default: the semantic view's database)
 	auto storage = parsed.storage_catalog.empty() ? model.Name().catalog : parsed.storage_catalog;
@@ -201,16 +199,11 @@ bool SameMaterializationStorage(const SemanticMaterialization &a, const Semantic
 //===--------------------------------------------------------------------===//
 // Freshness
 //===--------------------------------------------------------------------===//
-//! The tracked source tables of a materialization, per DuckLake catalog
-map<string, vector<SemanticSourceTable>> SemanticMaterializationSources(ClientContext &context,
-                                                                        const SemanticModel &model,
-                                                                        const SemanticMaterialization &materialization,
-                                                                        bool &all_tracked) {
-	map<string, vector<SemanticSourceTable>> result;
+SemanticMaterializationSources::SemanticMaterializationSources(ClientContext &context, const SemanticModel &model,
+                                                               const SemanticMaterialization &materialization) {
 	set<idx_t> tables;
-	all_tracked = true;
 	for (auto &block : materialization.blocks) {
-		all_tracked = all_tracked && block.dependencies_complete;
+		complete = complete && block.dependencies_complete;
 		auto sources = block.SourceTables();
 		tables.insert(sources.begin(), sources.end());
 	}
@@ -218,12 +211,27 @@ map<string, vector<SemanticSourceTable>> SemanticMaterializationSources(ClientCo
 		string reason;
 		auto source = ClassifySemanticSource(context, model, table, reason);
 		if (!source.Tracked()) {
-			all_tracked = false;
+			complete = false;
+			if (untracked_reason.empty()) {
+				untracked_reason = std::move(reason);
+			}
 			continue;
 		}
-		result[source.catalog].push_back(source);
+		by_table.emplace(table, source);
+		by_catalog[source.catalog].push_back(std::move(source));
 	}
-	return result;
+}
+
+bool SemanticMaterializationSources::Covers(const map<string, idx_t> &watermark) const {
+	if (!complete || watermark.empty() || by_catalog.size() != watermark.size()) {
+		return false;
+	}
+	for (auto &entry : by_catalog) {
+		if (!watermark.count(entry.first)) {
+			return false;
+		}
+	}
+	return true;
 }
 
 SemanticMaterializationStatus GetMaterializationStatus(ClientContext &context, const SemanticModel &model,
@@ -250,13 +258,8 @@ SemanticMaterializationStatus GetMaterializationStatus(ClientContext &context, c
 		}
 	}
 	string stale_reason;
-	bool all_tracked;
-	auto sources = SemanticMaterializationSources(context, model, materialization, all_tracked);
-	bool covered = all_tracked && sources.size() == watermark.size();
-	for (auto &source : sources) {
-		covered = covered && watermark.count(source.first);
-	}
-	if (!covered || watermark.empty()) {
+	SemanticMaterializationSources sources(context, model, materialization);
+	if (!sources.Covers(watermark)) {
 		stale_reason = "its sources are not change-tracked (only DuckLake tables are), so its freshness is unknown";
 	} else {
 		SemanticChangeTracker tracker(context);
@@ -271,7 +274,7 @@ SemanticMaterializationStatus GetMaterializationStatus(ClientContext &context, c
 				stale_reason = "the changes since its snapshot are no longer available";
 				break;
 			}
-			for (auto &source : sources[entry.first]) {
+			for (auto &source : sources.by_catalog.at(entry.first)) {
 				if (changes.SchemaChanged(source) || changes.RowChanges(source).Any()) {
 					stale_reason = "source " + source.catalog + "." + source.schema + "." + source.table +
 					               " changed since its last refresh";

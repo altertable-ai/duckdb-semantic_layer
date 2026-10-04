@@ -107,145 +107,116 @@ string Join(const vector<string> &values, const string &separator) {
 	return StringUtil::Join(values, separator);
 }
 
+struct RefreshSnapshots {
+	map<string, SemanticCatalogChanges> changes;
+	map<string, idx_t> current;
+};
+
 class MaterializationRefresh {
 public:
 	MaterializationRefresh(ClientContext &context, const SemanticModel &model,
-	                       const SemanticMaterialization &materialization,
-	                       optional_ptr<Connection> transaction = nullptr)
-	    : context(context), model(model), materialization(materialization), state(*materialization.state),
-	      tracker(context), connection(transaction ? *transaction : tracker.GetConnection()), compiler(model, context),
-	      owns_transaction(!transaction) {
-		for (auto &block : materialization.blocks) {
-			all_tracked = all_tracked && block.dependencies_complete;
-			for (auto table : block.SourceTables()) {
-				string reason;
-				auto source = ClassifySemanticSource(context, model, table, reason);
-				if (source.Tracked()) {
-					tracked[table] = source;
-				} else {
-					all_tracked = false;
-				}
-			}
-		}
+	                       const SemanticMaterialization &materialization, Connection &connection)
+	    : model(model), materialization(materialization), state(*materialization.state), tracker(context),
+	      connection(connection), compiler(model, context), inventory(context, model, materialization) {
 	}
 
-	string Run(SemanticRefreshMode mode, bool initial) {
-		lock_guard<mutex> refreshing(state.refresh_lock);
+	SemanticMaterializationRefreshResult Build() {
+		auto snapshots = ReadChanges({});
+		auto result = Result(snapshots.current, "FULL", "initial build");
+		FullBuild(snapshots.current);
+		WriteMetadata(connection, model, materialization, state, result.watermark, result.verified_at, result.outcome,
+		              result.detail);
+		return result;
+	}
+
+	SemanticMaterializationRefreshResult Refresh(SemanticRefreshMode mode) {
 		map<string, idx_t> watermark;
 		bool built;
+		string unbuilt_reason;
 		{
 			lock_guard<mutex> guard(state.lock);
-			if (state.retired) {
-				throw CatalogException("Materialization \"%s\" was removed by a concurrent statement",
-				                       materialization.name);
-			}
 			watermark = state.watermark;
 			built = state.built;
-			// e.g. restored with another definition than it was built with
-			unbuilt_reason = state.built ? string() : state.last_refresh_detail;
+			unbuilt_reason = built ? string() : state.last_refresh_detail;
 		}
-		// what happened in every source catalog since the last refresh (one metadata query each)
-		map<string, SemanticCatalogChanges> changes;
-		map<string, idx_t> current;
-		if (all_tracked) {
-			for (auto &entry : tracked) {
-				auto &catalog = entry.second.catalog;
-				if (changes.count(catalog)) {
-					continue;
-				}
-				optional_idx since;
-				auto previous = watermark.find(catalog);
-				if (built && previous != watermark.end()) {
-					since = previous->second;
-				}
-				changes[catalog] = tracker.CatalogChanges(catalog, since);
-				current[catalog] = changes[catalog].current;
+		auto snapshots = ReadChanges(watermark);
+		auto why_full = FullRefreshReason(mode, built, watermark, snapshots.changes, unbuilt_reason);
+		if (mode == SemanticRefreshMode::INCREMENTAL && !why_full.empty()) {
+			throw BinderException("Materialization \"%s\" cannot be refreshed incrementally: %s", materialization.name,
+			                      why_full);
+		}
+		auto result = Result(snapshots.current, "FULL", why_full);
+		if (!why_full.empty()) {
+			FullBuild(snapshots.current);
+		} else {
+			string rebuilt;
+			auto groups = IncrementalRefresh(mode, watermark, snapshots.current, snapshots.changes, rebuilt);
+			result.outcome = groups.IsValid() ? "INCREMENTAL" : "NONE";
+			result.detail = groups.IsValid() ? to_string(groups.GetIndex()) + " group(s) changed" : "no source changes";
+			if (!rebuilt.empty()) {
+				result.outcome = groups.IsValid() ? "INCREMENTAL" : "FULL";
+				result.detail = groups.IsValid() ? result.detail + "; " + rebuilt : rebuilt;
 			}
 		}
-		string outcome;
-		string detail;
-		auto now = Timestamp::GetCurrentTimestamp();
-		if (owns_transaction) {
-			connection.BeginTransaction();
+		// Metadata changes with the tables. A refresh without changes has nothing to persist.
+		if (!why_full.empty()) {
+			WriteMetadata(connection, model, materialization, state, result.watermark, result.verified_at,
+			              result.outcome, result.detail);
+		} else if (result.outcome != "NONE") {
+			UpdateMetadata(connection, materialization, state, result.watermark, result.verified_at, result.outcome,
+			               result.detail);
 		}
-		try {
-			auto why_full = initial ? string("initial build") : FullRefreshReason(mode, built, watermark, changes);
-			if (!initial && mode == SemanticRefreshMode::INCREMENTAL && !why_full.empty()) {
-				throw BinderException("Materialization \"%s\" cannot be refreshed incrementally: %s",
-				                      materialization.name, why_full);
-			}
-			if (!why_full.empty()) {
-				FullBuild(current);
-				outcome = "FULL";
-				detail = why_full;
-			} else {
-				string rebuilt;
-				auto groups = IncrementalRefresh(mode, watermark, current, changes, rebuilt);
-				outcome = groups.IsValid() ? "INCREMENTAL" : "NONE";
-				detail = groups.IsValid() ? to_string(groups.GetIndex()) + " group(s) changed" : "no source changes";
-				if (!rebuilt.empty()) {
-					outcome = groups.IsValid() ? "INCREMENTAL" : "FULL";
-					detail = groups.IsValid() ? detail + "; " + rebuilt : rebuilt;
-				}
-			}
-			// the metadata changes with the tables (a refresh without changes keeps the previous watermark: still
-			// correct, nothing to write)
-			auto watermark_after = all_tracked ? current : map<string, idx_t>();
-			if (!why_full.empty()) {
-				WriteMetadata(connection, model, materialization, state, watermark_after, now, outcome, detail);
-			} else if (outcome != "NONE") {
-				UpdateMetadata(connection, materialization, state, watermark_after, now, outcome, detail);
-			}
-			if (owns_transaction) {
-				connection.Commit();
-			}
-		} catch (std::exception &) {
-			if (owns_transaction && connection.HasActiveTransaction()) {
-				connection.Rollback();
-			}
-			throw;
-		}
-		{
-			lock_guard<mutex> guard(state.lock);
-			state.built = true;
-			state.watermark = all_tracked ? current : map<string, idx_t>();
-			state.verified_at = now;
-			state.last_refresh = outcome;
-			state.last_refresh_detail = detail;
-		}
-		if (outcome == "NONE") {
-			return "Materialization " + materialization.name + " is up to date.";
-		}
-		return "Materialization " + materialization.name + " refreshed (" + outcome + ": " + detail + ").";
+		return result;
 	}
 
 private:
+	SemanticMaterializationRefreshResult Result(const map<string, idx_t> &current, string outcome,
+	                                            string detail) const {
+		return {inventory.complete ? current : map<string, idx_t>(), Timestamp::GetCurrentTimestamp(),
+		        std::move(outcome), std::move(detail)};
+	}
+
+	//! One metadata query per source catalog, before row images are read at explicit snapshots.
+	RefreshSnapshots ReadChanges(const map<string, idx_t> &watermark) {
+		RefreshSnapshots result;
+		if (inventory.complete) {
+			for (auto &entry : inventory.by_catalog) {
+				optional_idx since;
+				auto previous = watermark.find(entry.first);
+				if (previous != watermark.end()) {
+					since = previous->second;
+				}
+				auto changes = tracker.CatalogChanges(entry.first, since);
+				result.current.emplace(entry.first, changes.current);
+				result.changes.emplace(entry.first, std::move(changes));
+			}
+		}
+		return result;
+	}
+
 	//! Why the refresh must rebuild everything; empty when it can be incremental (runs in the refresh's transaction)
 	string FullRefreshReason(SemanticRefreshMode mode, bool built, const map<string, idx_t> &watermark,
-	                         const map<string, SemanticCatalogChanges> &changes) {
+	                         const map<string, SemanticCatalogChanges> &changes, const string &unbuilt_reason) {
 		if (mode == SemanticRefreshMode::FULL) {
 			return "FULL refresh requested";
 		}
 		if (!built && !unbuilt_reason.empty()) {
 			return unbuilt_reason;
 		}
-		if (!all_tracked || !built || watermark.empty()) {
+		if (!built || !inventory.Covers(watermark)) {
 			return materialization.incremental ? "it was not built from tracked snapshots"
 			                                   : materialization.incremental_reason;
 		}
 		for (auto &entry : changes) {
-			auto previous = watermark.find(entry.first);
-			if (previous == watermark.end()) {
-				return "it was not built from tracked snapshots";
-			}
-			if (previous->second == entry.second.current) {
+			auto previous = watermark.at(entry.first);
+			if (previous == entry.second.current) {
 				continue;
 			}
 			if (!entry.second.available) {
-				return "the changes since snapshot " + to_string(previous->second) + " of " + entry.first +
+				return "the changes since snapshot " + to_string(previous) + " of " + entry.first +
 				       " are no longer available";
 			}
-			for (auto &source : tracked) {
+			for (auto &source : inventory.by_table) {
 				if (source.second.catalog == entry.first && entry.second.SchemaChanged(source.second)) {
 					return "the definition of " + source.second.catalog + "." + source.second.schema + "." +
 					       source.second.table + " changed since the last refresh";
@@ -261,7 +232,7 @@ private:
 		}
 		// a materialization that cannot follow changes is rebuilt once its sources changed
 		if (!materialization.incremental) {
-			for (auto &source : tracked) {
+			for (auto &source : inventory.by_table) {
 				auto &catalog = changes.at(source.second.catalog);
 				if (watermark.at(source.second.catalog) != catalog.current && catalog.RowChanges(source.second).Any()) {
 					return materialization.incremental_reason;
@@ -318,7 +289,7 @@ private:
 
 	void FullBuild(const map<string, idx_t> &snapshots) {
 		Execute("CREATE SCHEMA IF NOT EXISTS " + QuoteIdentifier(state.catalog) + "." + QuoteIdentifier(state.schema));
-		RefreshSources sources(model, tracked, snapshots);
+		RefreshSources sources(model, inventory.by_table, snapshots);
 		SemanticCompileOptions options;
 		options.sources = &sources;
 		for (idx_t b = 0; b < materialization.blocks.size(); b++) {
@@ -345,7 +316,7 @@ private:
 		for (idx_t b = 0; b < materialization.blocks.size(); b++) {
 			set<idx_t> changed;
 			for (auto table : materialization.blocks[b].SourceTables()) {
-				auto &source = tracked.at(table);
+				auto &source = inventory.by_table.at(table);
 				if (watermark.at(source.catalog) == current.at(source.catalog)) {
 					continue;
 				}
@@ -360,7 +331,7 @@ private:
 			}
 			auto home = materialization.blocks[b].home;
 			if (mode == SemanticRefreshMode::AUTO && (changed.size() > 1 || !changed.count(home))) {
-				RefreshSources sources(model, tracked, current);
+				RefreshSources sources(model, inventory.by_table, current);
 				SemanticCompileOptions options;
 				options.sources = &sources;
 				CreateTableAs(state.catalog, state.schema, state.tables[b], States(b, options), false);
@@ -382,7 +353,7 @@ private:
 	string Changes(idx_t table, const map<string, idx_t> &watermark, const map<string, idx_t> &current) {
 		auto name = "__sv_changes" + to_string(table);
 		if (loaded_changes.insert(table).second) {
-			auto &source = tracked.at(table);
+			auto &source = inventory.by_table.at(table);
 			Execute("CREATE OR REPLACE TEMP TABLE " + name + " AS " +
 			        SemanticChangeTracker::ChangesSQL(source, watermark.at(source.catalog), current.at(source.catalog),
 			                                          row_changes.at(table)));
@@ -408,10 +379,10 @@ private:
 		// 1. changed rows of the home table: + their new image (joined as of now), - their old image (as of before)
 		if (home_changed) {
 			home_changes = Changes(block.home, watermark, current);
-			RefreshSources new_rows(model, tracked, current);
+			RefreshSources new_rows(model, inventory.by_table, current);
 			new_rows.replacements[block.home] = ChangedRowImages(home_changes, true);
 			AddPart(b, new_rows, nullptr, 1, parts);
-			RefreshSources old_rows(model, tracked, watermark);
+			RefreshSources old_rows(model, inventory.by_table, watermark);
 			old_rows.replacements[block.home] = ChangedRowImages(home_changes, false);
 			AddPart(b, old_rows, nullptr, -1, parts);
 		}
@@ -467,9 +438,9 @@ private:
 				}
 				return result;
 			};
-			RefreshSources now(model, tracked, current);
+			RefreshSources now(model, inventory.by_table, current);
 			AddPart(b, now, filter, 1, parts);
-			RefreshSources before(model, tracked, watermark);
+			RefreshSources before(model, inventory.by_table, watermark);
 			AddPart(b, before, filter, -1, parts);
 		}
 		return MergeDelta(b, std::move(parts), current);
@@ -571,7 +542,7 @@ private:
 				} else {
 					Execute("DELETE FROM " + table);
 				}
-				RefreshSources now(model, tracked, current);
+				RefreshSources now(model, inventory.by_table, current);
 				SemanticCompileOptions options;
 				options.sources = &now;
 				if (grouped) {
@@ -591,18 +562,13 @@ private:
 		return changed_groups;
 	}
 
-	ClientContext &context;
 	const SemanticModel &model;
 	const SemanticMaterialization &materialization;
 	SemanticMaterializationState &state;
 	SemanticChangeTracker tracker;
 	Connection &connection;
 	SemanticQueryCompiler compiler;
-	bool owns_transaction;
-	map<idx_t, SemanticSourceTable> tracked;
-	bool all_tracked = true;
-	//! Why the materialization is not built, when known
-	string unbuilt_reason;
+	SemanticMaterializationSources inventory;
 	//! Per changed table: the kinds of changes, and whether its changed rows were loaded
 	map<idx_t, SemanticTableChanges> row_changes;
 	set<idx_t> loaded_changes;
@@ -618,8 +584,25 @@ string PhysicalName(const string &name) {
 
 } // namespace
 
-void BuildSemanticMaterialization(ClientContext &context, Connection &connection, const SemanticModel &model,
-                                  SemanticMaterialization &materialization) {
+void SemanticMaterializationRefreshResult::Publish(SemanticMaterializationState &state) const {
+	lock_guard<mutex> guard(state.lock);
+	state.built = true;
+	state.watermark = watermark;
+	state.verified_at = verified_at;
+	state.last_refresh = outcome;
+	state.last_refresh_detail = detail;
+}
+
+string SemanticMaterializationRefreshResult::Describe(const string &name) const {
+	if (outcome == "NONE") {
+		return "Materialization " + name + " is up to date.";
+	}
+	return "Materialization " + name + " refreshed (" + outcome + ": " + detail + ").";
+}
+
+SemanticMaterializationRefreshResult BuildSemanticMaterialization(ClientContext &context, Connection &connection,
+                                                                  const SemanticModel &model,
+                                                                  SemanticMaterialization &materialization) {
 	auto &state = *materialization.state;
 	if (Catalog::GetCatalog(context, materialization.storage_catalog).GetAttached().IsReadOnly()) {
 		throw BinderException("database \"%s\" is read-only", materialization.storage_catalog);
@@ -650,17 +633,31 @@ void BuildSemanticMaterialization(ClientContext &context, Connection &connection
 				                                     OnEntryNotFound::RETURN_NULL);
 			}
 			if (exists) {
-				return;
+				return {state.watermark, state.verified_at, state.last_refresh, state.last_refresh_detail};
 			}
 		}
 		break;
 	}
-	MaterializationRefresh(context, model, materialization, &connection).Run(SemanticRefreshMode::FULL, true);
+	return MaterializationRefresh(context, model, materialization, connection).Build();
 }
 
 string RefreshSemanticMaterialization(ClientContext &context, const SemanticModel &model,
                                       const SemanticMaterialization &materialization, SemanticRefreshMode mode) {
-	return MaterializationRefresh(context, model, materialization).Run(mode, false);
+	auto &state = *materialization.state;
+	lock_guard<mutex> refreshing(state.refresh_lock);
+	{
+		lock_guard<mutex> guard(state.lock);
+		if (state.retired) {
+			throw CatalogException("Materialization \"%s\" was removed by a concurrent statement",
+			                       materialization.name);
+		}
+	}
+	Connection connection(*context.db);
+	connection.BeginTransaction();
+	auto result = MaterializationRefresh(context, model, materialization, connection).Refresh(mode);
+	connection.Commit();
+	result.Publish(state);
+	return result.Describe(materialization.name);
 }
 
 } // namespace duckdb

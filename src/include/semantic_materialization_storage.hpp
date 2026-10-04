@@ -26,8 +26,20 @@ void WriteMetadata(Connection &connection, const SemanticModel &model, const Sem
 void UpdateMetadata(Connection &connection, const SemanticMaterialization &materialization,
                     const SemanticMaterializationState &state, const map<string, idx_t> &watermark,
                     timestamp_t verified_at, const string &outcome, const string &detail);
-void BuildSemanticMaterialization(ClientContext &context, Connection &connection, const SemanticModel &model,
-                                  SemanticMaterialization &materialization);
+//! The staged result of a refresh. Publish it only after its storage transaction commits.
+struct SemanticMaterializationRefreshResult {
+	map<string, idx_t> watermark;
+	timestamp_t verified_at;
+	string outcome;
+	string detail;
+
+	void Publish(SemanticMaterializationState &state) const;
+	string Describe(const string &name) const;
+};
+
+SemanticMaterializationRefreshResult BuildSemanticMaterialization(ClientContext &context, Connection &connection,
+                                                                  const SemanticModel &model,
+                                                                  SemanticMaterialization &materialization);
 void DropSemanticMaterializationTables(Connection &connection, const SemanticMaterialization &materialization);
 void DropStoredMaterialization(Connection &connection, const SemanticStoredMaterialization &stored);
 void RenameStoredMaterializations(Connection &connection, const SemanticModel &model,

@@ -122,9 +122,11 @@ void ApplySemanticMaterializationChange(ClientContext &context, const shared_ptr
 	for (auto &entry : obsolete) {
 		DropStoredMaterialization(change.Storage(entry.catalog), entry);
 	}
+	vector<pair<shared_ptr<SemanticMaterializationState>, SemanticMaterializationRefreshResult>> built;
 	for (auto &materialization : added) {
-		BuildSemanticMaterialization(context, change.Storage(materialization->storage_catalog), *after,
-		                             *materialization);
+		built.emplace_back(materialization->state,
+		                   BuildSemanticMaterialization(context, change.Storage(materialization->storage_catalog),
+		                                                *after, *materialization));
 	}
 	if (renamed) {
 		set<string> catalogs;
@@ -137,6 +139,9 @@ void ApplySemanticMaterializationChange(ClientContext &context, const shared_ptr
 	}
 	placeholder();
 	change.Commit();
+	for (auto &entry : built) {
+		entry.second.Publish(*entry.first);
+	}
 	if (renamed) {
 		for (auto &materialization : after->materializations) {
 			lock_guard<mutex> guard(materialization->state->lock);

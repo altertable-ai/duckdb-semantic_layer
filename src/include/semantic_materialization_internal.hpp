@@ -35,10 +35,18 @@ vector<unique_ptr<ParsedExpression>> SemanticStateExpressions(const SemanticMate
                                                               const FunctionExpression &compiled);
 //! The aggregate computing `atom` from its state columns in table `alias` (rolled up over the grouped rows)
 unique_ptr<ParsedExpression> SemanticRollupExpression(const SemanticMaterializedAtom &atom, const string &alias);
-//! The tracked source tables of a materialization, per DuckLake catalog; `all_tracked` tells whether every source is
-map<string, vector<SemanticSourceTable>> SemanticMaterializationSources(ClientContext &context,
-                                                                        const SemanticModel &model,
-                                                                        const SemanticMaterialization &materialization,
-                                                                        bool &all_tracked);
+//! One current classification of every logical source read by a materialization.
+struct SemanticMaterializationSources {
+	SemanticMaterializationSources(ClientContext &context, const SemanticModel &model,
+	                               const SemanticMaterialization &materialization);
+
+	//! Whether the watermark covers exactly the catalogs of all known, tracked sources.
+	bool Covers(const map<string, idx_t> &watermark) const;
+
+	map<idx_t, SemanticSourceTable> by_table;
+	map<string, vector<SemanticSourceTable>> by_catalog;
+	bool complete = true;
+	string untracked_reason;
+};
 
 } // namespace duckdb
