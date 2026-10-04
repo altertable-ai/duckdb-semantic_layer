@@ -396,14 +396,15 @@ otherwise queries read the sources. Prepared statements check freshness again at
 - `AUTO` (the default) refreshes incrementally when possible and rebuilds otherwise; `SHOW SEMANTIC MATERIALIZATIONS`
   reports what the last refresh did and why.
 
-Incremental refresh needs every source to be a DuckLake table. It reads `ducklake_table_changes()` between the last
-refresh's snapshot and the current one and works on the changed rows and the groups they touch:
+Incremental refresh needs every source to be a DuckLake table. It finds the changed tables in the snapshots'
+metadata, reads their inserted and deleted rows since the last refresh (`ducklake_table_insertions()` /
+`ducklake_table_deletions()`), and works on those rows and the groups they touch:
 
 - changed rows of a metric's table (inserts, deletes, updates, also of foreign keys) are removed with their old
   values and dimensions and added back with the new ones;
 - changed rows of a table its dimensions come from (a customer changing segment) move the unchanged rows that
-  reference them from their old group to their new one. Finding those rows scans the metric's table, so such changes
-  cost more than changes of the metric's table itself;
+  reference them from their old group to their new one. Finding those rows scans the metric's table twice (as of
+  before and as of now), so `AUTO` rebuilds such blocks instead, which scans it once;
 - `SUM`, `COUNT` and `AVG` states are updated arithmetically; groups whose row count drops to zero disappear;
 - `MIN` / `MAX` merge new rows directly, and groups that lost rows are recomputed from the sources, like every
   affected group of an aggregate stored as is.
@@ -411,7 +412,9 @@ refresh's snapshot and the current one and works on the changed rows and the gro
 A refresh falls back to a full rebuild (or fails in `INCREMENTAL` mode) when a source is not a DuckLake table, a
 dimension or metric aggregates other rows or uses a subquery, a join uses an `ASOF` or range relationship, the change
 history since the last refresh was expired, a source catalog's schema changed, or the materialization's table is
-missing. A failed refresh leaves the materialization as it was.
+missing. A failed refresh leaves the materialization as it was. Inserts cost about the number of new rows; deletes
+and updates also read the deleted rows' old values from DuckLake's data files. See
+[docs/benchmarks.md](docs/benchmarks.md#materialization-refresh) for measurements on 100M rows.
 
 Materializations cannot include semi-additive metrics or dimensions reached through a many-to-many bridge. They are
 part of the semantic view's in-memory definition: re-create them with the view after a restart.
