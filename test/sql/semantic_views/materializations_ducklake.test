@@ -51,6 +51,11 @@ ALTER SEMANTIC VIEW shop ADD MATERIALIZATION incr REFRESH_MODE = INCREMENTAL AS
   METRICS o.revenue, o.order_count, o.qty_count, o.avg_qty, o.max_amount, o.min_amount, o.distinct_customers;
 
 statement ok
+ALTER SEMANTIC VIEW shop ADD MATERIALIZATION auto_copy AS
+  DIMENSIONS c.segment, c.country
+  METRICS o.revenue, o.order_count, o.qty_count, o.avg_qty, o.max_amount, o.min_amount, o.distinct_customers;
+
+statement ok
 ALTER SEMANTIC VIEW shop ADD MATERIALIZATION totals AS METRICS o.revenue, o.order_count, o.max_amount;
 
 statement ok
@@ -59,6 +64,7 @@ ALTER SEMANTIC VIEW shop ADD MATERIALIZATION customers AS DIMENSIONS c.segment M
 query III
 SELECT name, incremental, usable FROM (SHOW SEMANTIC MATERIALIZATIONS IN shop) ORDER BY name;
 ----
+auto_copy	true	true
 customers	true	true
 full_copy	true	true
 incr	true	true
@@ -121,7 +127,11 @@ CREATE MACRO compare_copies() AS TABLE
   SELECT count(*) AS differences FROM (
     (SELECT * FROM __semantic_materializations.shop__incr__0 EXCEPT ALL SELECT * FROM __semantic_materializations.shop__full_copy__0)
     UNION ALL
-    (SELECT * FROM __semantic_materializations.shop__full_copy__0 EXCEPT ALL SELECT * FROM __semantic_materializations.shop__incr__0));
+    (SELECT * FROM __semantic_materializations.shop__full_copy__0 EXCEPT ALL SELECT * FROM __semantic_materializations.shop__incr__0)
+    UNION ALL
+    (SELECT * FROM __semantic_materializations.shop__auto_copy__0 EXCEPT ALL SELECT * FROM __semantic_materializations.shop__full_copy__0)
+    UNION ALL
+    (SELECT * FROM __semantic_materializations.shop__full_copy__0 EXCEPT ALL SELECT * FROM __semantic_materializations.shop__auto_copy__0));
 
 statement ok
 CREATE MACRO hand_written() AS TABLE
@@ -152,6 +162,9 @@ query I
 ALTER SEMANTIC VIEW shop REFRESH MATERIALIZATION incr;
 ----
 <REGEX>:Materialization incr (refreshed \(INCREMENTAL: \d+ group\(s\) changed\)|is up to date)\.
+
+statement ok
+ALTER SEMANTIC VIEW shop REFRESH MATERIALIZATION auto_copy;
 
 statement ok
 ALTER SEMANTIC VIEW shop REFRESH MATERIALIZATION totals INCREMENTAL;
@@ -187,6 +200,9 @@ ALTER SEMANTIC VIEW shop REFRESH MATERIALIZATION incr;
 <REGEX>:Materialization incr (refreshed \(INCREMENTAL: \d+ group\(s\) changed\)|is up to date)\.
 
 statement ok
+ALTER SEMANTIC VIEW shop REFRESH MATERIALIZATION auto_copy;
+
+statement ok
 ALTER SEMANTIC VIEW shop REFRESH MATERIALIZATION totals INCREMENTAL;
 
 query I
@@ -218,6 +234,9 @@ query I
 ALTER SEMANTIC VIEW shop REFRESH MATERIALIZATION incr;
 ----
 <REGEX>:Materialization incr (refreshed \(INCREMENTAL: \d+ group\(s\) changed\)|is up to date)\.
+
+statement ok
+ALTER SEMANTIC VIEW shop REFRESH MATERIALIZATION auto_copy;
 
 statement ok
 ALTER SEMANTIC VIEW shop REFRESH MATERIALIZATION totals INCREMENTAL;
@@ -253,6 +272,9 @@ ALTER SEMANTIC VIEW shop REFRESH MATERIALIZATION incr;
 <REGEX>:Materialization incr (refreshed \(INCREMENTAL: \d+ group\(s\) changed\)|is up to date)\.
 
 statement ok
+ALTER SEMANTIC VIEW shop REFRESH MATERIALIZATION auto_copy;
+
+statement ok
 ALTER SEMANTIC VIEW shop REFRESH MATERIALIZATION totals INCREMENTAL;
 
 query I
@@ -286,6 +308,9 @@ ALTER SEMANTIC VIEW shop REFRESH MATERIALIZATION incr;
 <REGEX>:Materialization incr (refreshed \(INCREMENTAL: \d+ group\(s\) changed\)|is up to date)\.
 
 statement ok
+ALTER SEMANTIC VIEW shop REFRESH MATERIALIZATION auto_copy;
+
+statement ok
 ALTER SEMANTIC VIEW shop REFRESH MATERIALIZATION totals INCREMENTAL;
 
 query I
@@ -317,6 +342,11 @@ query I
 ALTER SEMANTIC VIEW shop REFRESH MATERIALIZATION incr;
 ----
 <REGEX>:Materialization incr (refreshed \(INCREMENTAL: \d+ group\(s\) changed\)|is up to date)\.
+
+query I
+ALTER SEMANTIC VIEW shop REFRESH MATERIALIZATION auto_copy;
+----
+Materialization auto_copy refreshed (FULL: rebuilt because dimension table "c" changed).
 
 statement ok
 ALTER SEMANTIC VIEW shop REFRESH MATERIALIZATION totals INCREMENTAL;
@@ -352,6 +382,9 @@ ALTER SEMANTIC VIEW shop REFRESH MATERIALIZATION incr;
 <REGEX>:Materialization incr (refreshed \(INCREMENTAL: \d+ group\(s\) changed\)|is up to date)\.
 
 statement ok
+ALTER SEMANTIC VIEW shop REFRESH MATERIALIZATION auto_copy;
+
+statement ok
 ALTER SEMANTIC VIEW shop REFRESH MATERIALIZATION totals INCREMENTAL;
 
 query I
@@ -383,6 +416,9 @@ query I
 ALTER SEMANTIC VIEW shop REFRESH MATERIALIZATION incr;
 ----
 <REGEX>:Materialization incr (refreshed \(INCREMENTAL: \d+ group\(s\) changed\)|is up to date)\.
+
+statement ok
+ALTER SEMANTIC VIEW shop REFRESH MATERIALIZATION auto_copy;
 
 statement ok
 ALTER SEMANTIC VIEW shop REFRESH MATERIALIZATION totals INCREMENTAL;
@@ -418,6 +454,9 @@ ALTER SEMANTIC VIEW shop REFRESH MATERIALIZATION incr;
 <REGEX>:Materialization incr (refreshed \(INCREMENTAL: \d+ group\(s\) changed\)|is up to date)\.
 
 statement ok
+ALTER SEMANTIC VIEW shop REFRESH MATERIALIZATION auto_copy;
+
+statement ok
 ALTER SEMANTIC VIEW shop REFRESH MATERIALIZATION totals INCREMENTAL;
 
 query I
@@ -449,6 +488,9 @@ query I
 ALTER SEMANTIC VIEW shop REFRESH MATERIALIZATION incr;
 ----
 <REGEX>:Materialization incr (refreshed \(INCREMENTAL: \d+ group\(s\) changed\)|is up to date)\.
+
+statement ok
+ALTER SEMANTIC VIEW shop REFRESH MATERIALIZATION auto_copy;
 
 statement ok
 ALTER SEMANTIC VIEW shop REFRESH MATERIALIZATION totals INCREMENTAL;
@@ -484,6 +526,9 @@ ALTER SEMANTIC VIEW shop REFRESH MATERIALIZATION incr;
 <REGEX>:Materialization incr (refreshed \(INCREMENTAL: \d+ group\(s\) changed\)|is up to date)\.
 
 statement ok
+ALTER SEMANTIC VIEW shop REFRESH MATERIALIZATION auto_copy;
+
+statement ok
 ALTER SEMANTIC VIEW shop REFRESH MATERIALIZATION totals INCREMENTAL;
 
 query I
@@ -517,6 +562,9 @@ ALTER SEMANTIC VIEW shop REFRESH MATERIALIZATION incr;
 <REGEX>:Materialization incr (refreshed \(INCREMENTAL: \d+ group\(s\) changed\)|is up to date)\.
 
 statement ok
+ALTER SEMANTIC VIEW shop REFRESH MATERIALIZATION auto_copy;
+
+statement ok
 ALTER SEMANTIC VIEW shop REFRESH MATERIALIZATION totals INCREMENTAL;
 
 query I
@@ -548,6 +596,9 @@ query I
 ALTER SEMANTIC VIEW shop REFRESH MATERIALIZATION incr;
 ----
 <REGEX>:Materialization incr (refreshed \(INCREMENTAL: \d+ group\(s\) changed\)|is up to date)\.
+
+statement ok
+ALTER SEMANTIC VIEW shop REFRESH MATERIALIZATION auto_copy;
 
 statement ok
 ALTER SEMANTIC VIEW shop REFRESH MATERIALIZATION totals INCREMENTAL;

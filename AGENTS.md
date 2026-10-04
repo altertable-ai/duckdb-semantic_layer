@@ -21,6 +21,9 @@ Instructions for AI agents working in this repository.
 
 - **ALWAYS use `GEN=ninja make` to compile this project** (release build).
 - Debug builds are very slow; use them only when strictly necessary.
+- DuckLake (needed by the materialization tests, which are skipped without it) is only linked in vcpkg builds:
+  `VCPKG_TOOLCHAIN_PATH=<vcpkg>/scripts/buildsystems/vcpkg.cmake GEN=ninja make` (it needs `roaring`). Switching
+  between vcpkg and non-vcpkg builds requires a fresh `build/release`.
 
 ## Coding style
 

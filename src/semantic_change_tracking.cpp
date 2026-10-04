@@ -3,6 +3,7 @@
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/entry_lookup_info.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/common/to_string.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
@@ -74,23 +75,53 @@ bool SemanticChangeTracker::SchemaChanged(const SemanticSourceTable &table, idx_
 	return result->GetValue(0, 0).GetValue<int64_t>() != 1;
 }
 
-bool SemanticChangeTracker::RowsChanged(const SemanticSourceTable &table, idx_t from, idx_t to) {
-	auto result = Run("SELECT count(*) FROM (SELECT 1 FROM ducklake_table_changes(" + Literal(table.catalog) + ", " +
-	                  Literal(table.schema) + ", " + Literal(table.table) + ", " + to_string(from + 1) + ", " +
-	                  to_string(to) + ") LIMIT 1)");
-	return result->GetValue(0, 0).GetValue<int64_t>() > 0;
+SemanticTableChanges SemanticChangeTracker::RowChanges(const SemanticSourceTable &table, idx_t from, idx_t to) {
+	// every snapshot lists the ids of the tables it changed, per kind of change; tables of the same name in other
+	// schemas are counted too (conservative)
+	auto ids = "(SELECT list(table_id::VARCHAR) FROM ducklake_table_info(" + Literal(table.catalog) +
+	           ") WHERE table_name = " + Literal(table.table) + ")";
+	auto result = Run("SELECT kind, bool_or(len(list_intersect(ids, " + ids +
+	                  ")) > 0) FROM (SELECT unnest(map_keys(changes)) AS kind, unnest(map_values(changes)) AS ids FROM "
+	                  "ducklake_snapshots(" +
+	                  Literal(table.catalog) + ") WHERE snapshot_id > " + to_string(from) +
+	                  " AND snapshot_id <= " + to_string(to) + ") GROUP BY kind");
+	SemanticTableChanges changes;
+	for (idx_t row = 0; row < result->RowCount(); row++) {
+		auto kind = result->GetValue(0, row).ToString();
+		if (!result->GetValue(1, row).GetValue<bool>()) {
+			continue;
+		}
+		if (kind == "tables_inserted_into" || kind == "inlined_insert") {
+			changes.inserted = true;
+		} else if (kind == "tables_deleted_from" || kind == "inlined_delete") {
+			changes.deleted = true;
+		} else {
+			// any other change of the table: assume rows were both inserted and deleted
+			changes.inserted = true;
+			changes.deleted = true;
+		}
+	}
+	return changes;
 }
 
-unique_ptr<TableRef> SemanticChangeTracker::ChangesRef(const SemanticSourceTable &table, idx_t from, idx_t to) {
-	vector<unique_ptr<ParsedExpression>> arguments;
-	arguments.push_back(make_uniq<ConstantExpression>(Value(table.catalog)));
-	arguments.push_back(make_uniq<ConstantExpression>(Value(table.schema)));
-	arguments.push_back(make_uniq<ConstantExpression>(Value(table.table)));
-	arguments.push_back(make_uniq<ConstantExpression>(Value::UBIGINT(from + 1)));
-	arguments.push_back(make_uniq<ConstantExpression>(Value::UBIGINT(to)));
-	auto ref = make_uniq<TableFunctionRef>();
-	ref->function = make_uniq<FunctionExpression>("ducklake_table_changes", std::move(arguments));
-	return std::move(ref);
+string SemanticChangeTracker::ChangesSQL(const SemanticSourceTable &table, idx_t from, idx_t to,
+                                         const SemanticTableChanges &changes) {
+	auto arguments = Literal(table.catalog) + ", " + Literal(table.schema) + ", " + Literal(table.table) + ", " +
+	                 to_string(from + 1) + ", " + to_string(to);
+	vector<string> parts;
+	if (changes.inserted) {
+		parts.push_back("SELECT rowid, snapshot_id, 'insert' AS change_type, * FROM ducklake_table_insertions(" +
+		                arguments + ")");
+	}
+	if (changes.deleted) {
+		parts.push_back("SELECT rowid, snapshot_id, 'delete' AS change_type, * FROM ducklake_table_deletions(" +
+		                arguments + ")");
+	}
+	if (parts.empty()) {
+		parts.push_back("SELECT rowid, snapshot_id, 'insert' AS change_type, * FROM ducklake_table_insertions(" +
+		                arguments + ") LIMIT 0");
+	}
+	return StringUtil::Join(parts, " UNION ALL BY NAME ");
 }
 
 unique_ptr<TableRef> SemanticChangeTracker::AtSnapshot(const SemanticSourceTable &table, idx_t snapshot) {

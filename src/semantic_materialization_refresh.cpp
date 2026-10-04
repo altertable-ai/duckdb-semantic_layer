@@ -51,29 +51,17 @@ string Literal(const string &value) {
 	return KeywordHelper::WriteQuoted(value, '\'');
 }
 
-string ChangesSQL(const SemanticSourceTable &table, idx_t from, idx_t to) {
-	return "ducklake_table_changes(" + Literal(table.catalog) + ", " + Literal(table.schema) + ", " +
-	       Literal(table.table) + ", " + to_string(from + 1) + ", " + to_string(to) + ")";
-}
-
-//! The rows of `table` as of `to` (new images) or `from` (old images) among the rows that changed in (from, to]:
-//! DuckLake row ids are stable and never reused, so a row's old image is its first pre-image (unless it was inserted
-//! in the interval) and its new image its last post-image (unless it was deleted)
-unique_ptr<TableRef> ChangedRowImages(const SemanticSourceTable &table, idx_t from, idx_t to, bool new_images) {
-	string sql;
-	if (new_images) {
-		sql = "SELECT * EXCLUDE (snapshot_id, change_type, __sv_rn, __sv_gone) FROM (SELECT *, row_number() OVER "
-		      "(PARTITION BY rowid ORDER BY snapshot_id DESC, change_type IN ('insert', 'update_postimage') DESC) AS "
-		      "__sv_rn, bool_or(change_type = 'delete') OVER (PARTITION BY rowid) AS __sv_gone FROM " +
-		      ChangesSQL(table, from, to) +
-		      ") WHERE __sv_rn = 1 AND NOT __sv_gone AND change_type IN ('insert', 'update_postimage')";
-	} else {
-		sql = "SELECT * EXCLUDE (snapshot_id, change_type, __sv_rn, __sv_gone) FROM (SELECT *, row_number() OVER "
-		      "(PARTITION BY rowid ORDER BY snapshot_id, change_type IN ('delete', 'update_preimage') DESC) AS "
-		      "__sv_rn, bool_or(change_type = 'insert') OVER (PARTITION BY rowid) AS __sv_gone FROM " +
-		      ChangesSQL(table, from, to) +
-		      ") WHERE __sv_rn = 1 AND NOT __sv_gone AND change_type IN ('delete', 'update_preimage')";
-	}
+//! The rows among the changed rows `changes` (a temp table: rowid, snapshot_id, change_type, columns) as of after the
+//! changes (new images) or before them (old images). DuckLake row ids are stable and never reused, and an update is
+//! a deletion and an insertion of the same row id in one snapshot: a row's new image is its last insertion unless it
+//! was deleted afterwards, its old image its first deletion unless it was inserted before
+unique_ptr<TableRef> ChangedRowImages(const string &changes, bool new_images) {
+	auto order =
+	    new_images ? "snapshot_id DESC, change_type = 'insert' DESC" : "snapshot_id, change_type = 'delete' DESC";
+	auto kind = new_images ? "insert" : "delete";
+	auto sql = "SELECT * EXCLUDE (snapshot_id, change_type, __sv_rn) FROM (SELECT *, row_number() OVER (PARTITION BY "
+	           "rowid ORDER BY " +
+	           string(order) + ") AS __sv_rn FROM " + changes + ") WHERE __sv_rn = 1 AND change_type = '" + kind + "'";
 	Parser parser;
 	parser.ParseQuery(sql);
 	auto select = unique_ptr_cast<SQLStatement, SelectStatement>(std::move(parser.statements[0]));
@@ -160,9 +148,14 @@ public:
 				outcome = "FULL";
 				detail = why_full;
 			} else {
-				auto groups = IncrementalRefresh(watermark, current);
+				string rebuilt;
+				auto groups = IncrementalRefresh(mode, watermark, current, rebuilt);
 				outcome = groups.IsValid() ? "INCREMENTAL" : "NONE";
 				detail = groups.IsValid() ? to_string(groups.GetIndex()) + " group(s) changed" : "no source changes";
+				if (!rebuilt.empty()) {
+					outcome = groups.IsValid() ? "INCREMENTAL" : "FULL";
+					detail = groups.IsValid() ? detail + "; " + rebuilt : rebuilt;
+				}
 			}
 			connection.Commit();
 		} catch (std::exception &) {
@@ -293,8 +286,11 @@ private:
 	}
 
 	//! Applies the source changes in (watermark, current] to every block; the number of changed groups, or invalid
-	//! when no source changed
-	optional_idx IncrementalRefresh(const map<string, idx_t> &watermark, const map<string, idx_t> &current) {
+	//! when no block was maintained incrementally. In AUTO mode, a block whose dimension tables changed is rebuilt
+	//! instead: moving the rows that reach the changed rows scans its home table twice (as of before and as of now),
+	//! while rebuilding it scans it once. `rebuilt` describes those blocks.
+	optional_idx IncrementalRefresh(SemanticRefreshMode mode, const map<string, idx_t> &watermark,
+	                                const map<string, idx_t> &current, string &rebuilt) {
 		optional_idx changed_groups;
 		for (idx_t b = 0; b < materialization.blocks.size(); b++) {
 			set<idx_t> changed;
@@ -302,17 +298,48 @@ private:
 				auto &source = tracked.at(table);
 				auto from = watermark.at(source.catalog);
 				auto to = current.at(source.catalog);
-				if (from != to && tracker.RowsChanged(source, from, to)) {
+				if (from == to) {
+					continue;
+				}
+				if (!row_changes.count(table)) {
+					row_changes[table] = tracker.RowChanges(source, from, to);
+				}
+				if (row_changes[table].Any()) {
 					changed.insert(table);
 				}
 			}
 			if (changed.empty()) {
 				continue;
 			}
+			auto home = materialization.blocks[b].home;
+			if (mode == SemanticRefreshMode::AUTO && (changed.size() > 1 || !changed.count(home))) {
+				RefreshSources sources(model, tracked, current);
+				SemanticCompileOptions options;
+				options.sources = &sources;
+				CreateTableAs(state.catalog, state.schema, state.tables[b], States(b, options), false);
+				for (auto table : changed) {
+					if (table != home) {
+						rebuilt = "rebuilt because dimension table \"" + model.tables[table].name + "\" changed";
+					}
+				}
+				continue;
+			}
 			auto groups = RefreshBlock(b, changed, watermark, current);
 			changed_groups = (changed_groups.IsValid() ? changed_groups.GetIndex() : 0) + groups;
 		}
 		return changed_groups;
+	}
+
+	//! The temp table holding the changed rows of `table` (read once per refresh)
+	string Changes(idx_t table, const map<string, idx_t> &watermark, const map<string, idx_t> &current) {
+		auto name = "__sv_changes" + to_string(table);
+		if (loaded_changes.insert(table).second) {
+			auto &source = tracked.at(table);
+			Execute("CREATE OR REPLACE TEMP TABLE " + name + " AS " +
+			        SemanticChangeTracker::ChangesSQL(source, watermark.at(source.catalog), current.at(source.catalog),
+			                                          row_changes.at(table)));
+		}
+		return name;
 	}
 
 	//! Adds the state query of block `b` over `sources` (restricted by `filter`) as a delta part with `sign`
@@ -329,20 +356,17 @@ private:
 	idx_t RefreshBlock(idx_t b, const set<idx_t> &changed, const map<string, idx_t> &watermark,
 	                   const map<string, idx_t> &current) {
 		auto &block = materialization.blocks[b];
-		auto &home = tracked.at(block.home);
-		auto home_from = watermark.at(home.catalog);
-		auto home_to = current.at(home.catalog);
 		bool home_changed = changed.count(block.home) > 0;
 		vector<pair<string, int>> parts;
 		// 1. changed rows of the home table: + their new image (joined as of now), - their old image (as of before)
 		if (home_changed) {
-			Execute("CREATE OR REPLACE TEMP TABLE __sv_changed_rows AS SELECT DISTINCT rowid FROM " +
-			        ChangesSQL(home, home_from, home_to));
+			auto changes = Changes(block.home, watermark, current);
+			Execute("CREATE OR REPLACE TEMP TABLE __sv_changed_rows AS SELECT DISTINCT rowid FROM " + changes);
 			RefreshSources new_rows(model, tracked, current);
-			new_rows.replacements[block.home] = ChangedRowImages(home, home_from, home_to, true);
+			new_rows.replacements[block.home] = ChangedRowImages(changes, true);
 			AddPart(b, new_rows, nullptr, 1, parts);
 			RefreshSources old_rows(model, tracked, watermark);
-			old_rows.replacements[block.home] = ChangedRowImages(home, home_from, home_to, false);
+			old_rows.replacements[block.home] = ChangedRowImages(changes, false);
 			AddPart(b, old_rows, nullptr, -1, parts);
 		}
 		// 2. unchanged home rows that reach a changed row of another table: + as of now, - as of before
@@ -354,7 +378,6 @@ private:
 		}
 		if (!referenced.empty()) {
 			for (auto table : referenced) {
-				auto &source = tracked.at(table);
 				auto path = model.Path(block.home, table, block.using_relationships);
 				auto &edge = path.back();
 				auto &rel = model.relationships[edge.relationship];
@@ -364,8 +387,7 @@ private:
 					quoted.push_back(QuoteIdentifier(key));
 				}
 				Execute("CREATE OR REPLACE TEMP TABLE __sv_keys" + to_string(table) + " AS SELECT DISTINCT " +
-				        Join(quoted, ", ") + " FROM " +
-				        ChangesSQL(source, watermark.at(source.catalog), current.at(source.catalog)));
+				        Join(quoted, ", ") + " FROM " + Changes(table, watermark, current));
 			}
 			auto filter = [&](SemanticJoinScope &scope, const vector<unique_ptr<ParsedExpression>> &) {
 				vector<unique_ptr<ParsedExpression>> reaching;
@@ -541,6 +563,9 @@ private:
 	SemanticQueryCompiler compiler;
 	map<idx_t, SemanticSourceTable> tracked;
 	bool all_tracked = true;
+	//! Per changed table: the kinds of changes, and whether its changed rows were loaded
+	map<idx_t, SemanticTableChanges> row_changes;
+	set<idx_t> loaded_changes;
 };
 
 string PhysicalName(const string &name) {

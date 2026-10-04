@@ -31,6 +31,16 @@ struct SemanticSourceTable {
 	}
 };
 
+//! Which kinds of row changes a table had between two snapshots
+struct SemanticTableChanges {
+	bool inserted = false;
+	bool deleted = false;
+
+	bool Any() const {
+		return inserted || deleted;
+	}
+};
+
 //! How logical table `table` can be tracked; `reason` explains why it cannot
 SemanticSourceTable ClassifySemanticSource(ClientContext &context, const SemanticModel &model, idx_t table,
                                            string &reason);
@@ -50,11 +60,18 @@ public:
 	bool SnapshotAvailable(const string &catalog, idx_t snapshot);
 	//! Whether the definition of `table` changed (altered, dropped, recreated) in (from, to]
 	bool SchemaChanged(const SemanticSourceTable &table, idx_t from, idx_t to);
-	//! Whether rows of `table` changed in (from, to]
-	bool RowsChanged(const SemanticSourceTable &table, idx_t from, idx_t to);
+	//! Whether rows of `table` were inserted / deleted in (from, to], from the snapshots' metadata (no data is read);
+	//! an update is a deletion and an insertion of the same row id
+	SemanticTableChanges RowChanges(const SemanticSourceTable &table, idx_t from, idx_t to);
+	bool RowsChanged(const SemanticSourceTable &table, idx_t from, idx_t to) {
+		return RowChanges(table, from, to).Any();
+	}
 
-	//! ducklake_table_changes(...) over (from, to]: snapshot_id, rowid, change_type and the table's columns
-	static unique_ptr<TableRef> ChangesRef(const SemanticSourceTable &table, idx_t from, idx_t to);
+	//! The changed rows of `table` in (from, to] (rowid, snapshot_id, change_type 'insert' / 'delete', its columns),
+	//! reading only the kinds of changes in `changes` (deleted rows are expensive to read: their values are fetched
+	//! from the data files)
+	static string ChangesSQL(const SemanticSourceTable &table, idx_t from, idx_t to,
+	                         const SemanticTableChanges &changes);
 	//! The table at a snapshot: `catalog.schema.table AT (VERSION => snapshot)`
 	static unique_ptr<TableRef> AtSnapshot(const SemanticSourceTable &table, idx_t snapshot);
 
