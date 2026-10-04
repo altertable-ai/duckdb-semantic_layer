@@ -36,8 +36,8 @@ def run_cli(duckdb: str, db: str, script: str, env: dict | None = None) -> str:
     return result.stdout
 
 
-def parse_queries() -> list[tuple[str, str, str]]:
-    text = (BENCH_DIR / "queries.sql").read_text()
+def parse_queries(path: Path = BENCH_DIR / "queries.sql") -> list[tuple[str, str, str]]:
+    text = path.read_text()
     pairs = []
     for block in re.split(r"^-- name: ", text, flags=re.M)[1:]:
         name, rest = block.split("\n", 1)
