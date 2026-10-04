@@ -275,12 +275,24 @@ ALTER SEMANTIC VIEW store DROP MATERIALIZATION customers_by_segment;
 query I
 SELECT table_name FROM duckdb_tables() WHERE schema_name = '__semantic_materializations' ORDER BY 1;
 ----
+__sv_materializations
 shop__fine__0
+
+# the metadata records every materialization (definition, tables, watermark), under the view's current name
+query III
+SELECT view_name, name, tables FROM __semantic_materializations.__sv_materializations;
+----
+store	fine	[shop__fine__0]
 
 statement ok
 DROP SEMANTIC VIEW store;
 
 query I
-SELECT count(*) FROM duckdb_tables() WHERE schema_name = '__semantic_materializations';
+SELECT count(*) FROM duckdb_tables() WHERE schema_name = '__semantic_materializations' AND table_name <> '__sv_materializations';
+----
+0
+
+query I
+SELECT count(*) FROM __semantic_materializations.__sv_materializations;
 ----
 0

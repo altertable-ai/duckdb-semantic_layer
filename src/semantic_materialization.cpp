@@ -6,6 +6,7 @@
 #include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/to_string.hpp"
+#include "duckdb/common/types/hash.hpp"
 #include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/parser/expression/cast_expression.hpp"
@@ -201,8 +202,8 @@ static void CollectPathTables(const SemanticModel &model, SemanticAnalyzer &anal
 	}
 }
 
-static shared_ptr<SemanticMaterialization> PlanMaterialization(ClientContext &context, SemanticModel &model,
-                                                               const ParsedSemanticMaterialization &parsed) {
+shared_ptr<SemanticMaterialization> PlanSemanticMaterialization(ClientContext &context, SemanticModel &model,
+                                                                const ParsedSemanticMaterialization &parsed) {
 	auto what = "Invalid materialization \"" + parsed.name + "\"";
 	SemanticQueryCompiler compiler(model, context);
 	SemanticAnalyzer analyzer(model, context);
@@ -308,6 +309,39 @@ static shared_ptr<SemanticMaterialization> PlanMaterialization(ClientContext &co
 			}
 		}
 	}
+	// storage: a writable DuckDB database or DuckLake catalog (default: the semantic view's database)
+	auto storage = parsed.storage_catalog.empty() ? model.Name().catalog : parsed.storage_catalog;
+	auto catalog = Catalog::GetCatalogEntry(context, storage);
+	if (!catalog) {
+		throw BinderException("%s: database \"%s\" does not exist", what, storage);
+	}
+	if (catalog->IsSystemCatalog() || catalog->IsTemporaryCatalog()) {
+		throw BinderException("%s: materializations cannot be stored in the %s database", what, catalog->GetName());
+	}
+	auto type = catalog->GetCatalogType();
+	if (type != "duckdb" && type != "ducklake") {
+		throw BinderException("%s: materializations are stored in DuckDB databases or DuckLake catalogs, not in "
+		                      "\"%s\" (%s)",
+		                      what, catalog->GetName(), type);
+	}
+	if (catalog->GetAttached().IsReadOnly()) {
+		throw BinderException("%s: database \"%s\" is read-only", what, catalog->GetName());
+	}
+	result->storage_catalog = catalog->GetName();
+	result->storage_schema = parsed.storage_schema.empty() ? SEMANTIC_MATERIALIZATION_SCHEMA : parsed.storage_schema;
+	// the fingerprint: the queries that build the tables (same queries, same content at the same snapshots)
+	string queries;
+	for (idx_t b = 0; b < result->blocks.size(); b++) {
+		auto &block = result->blocks[b];
+		queries += compiler
+		               .CompileStates(result->spec, b,
+		                              [&](idx_t atom, const FunctionExpression &compiled) {
+			                              return SemanticStateExpressions(block.atoms[atom], compiled);
+		                              })
+		               ->ToString();
+		queries += ";";
+	}
+	result->fingerprint = StringUtil::Format("%016llx", static_cast<uint64_t>(Hash(queries.c_str(), queries.size())));
 	result->state = make_shared_ptr<SemanticMaterializationState>();
 	return result;
 }
@@ -319,7 +353,7 @@ void PlanSemanticMaterializations(ClientContext &context, SemanticModel &model) 
 			throw BinderException("Invalid semantic view \"%s\": duplicate materialization \"%s\"", model.Name().name,
 			                      parsed.name);
 		}
-		model.materializations.push_back(PlanMaterialization(context, model, parsed));
+		model.materializations.push_back(PlanSemanticMaterialization(context, model, parsed));
 	}
 }
 
@@ -327,13 +361,23 @@ void AdoptMaterializationStates(SemanticModel &model, const SemanticModel &previ
 	for (auto &materialization : model.materializations) {
 		for (auto &old : previous.materializations) {
 			if (StringUtil::CIEquals(materialization->name, old->name) &&
-			    materialization->dimension_names == old->dimension_names &&
-			    materialization->metric_names == old->metric_names &&
-			    materialization->blocks.size() == old->blocks.size()) {
+			    materialization->fingerprint == old->fingerprint &&
+			    StringUtil::CIEquals(materialization->storage_catalog, old->storage_catalog) &&
+			    StringUtil::CIEquals(materialization->storage_schema, old->storage_schema)) {
 				materialization->state = old->state;
 			}
 		}
 	}
+}
+
+bool SameMaterializationStorage(const SemanticMaterialization &a, const SemanticMaterialization &b) {
+	if (a.state == b.state) {
+		return true;
+	}
+	lock_guard<mutex> guard_a(a.state->lock);
+	lock_guard<mutex> guard_b(b.state->lock);
+	return !a.state->tables.empty() && StringUtil::CIEquals(a.state->catalog, b.state->catalog) &&
+	       StringUtil::CIEquals(a.state->schema, b.state->schema) && a.state->tables == b.state->tables;
 }
 
 //===--------------------------------------------------------------------===//
@@ -371,7 +415,7 @@ SemanticMaterializationStatus GetMaterializationStatus(ClientContext &context, c
 	{
 		lock_guard<mutex> guard(state.lock);
 		if (!state.built) {
-			status.reason = "not built";
+			status.reason = "it has not been built yet (refresh it)";
 			return status;
 		}
 		watermark = state.watermark;

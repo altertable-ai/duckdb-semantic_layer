@@ -238,6 +238,26 @@ void ParsedSemanticMaterialization::Serialize(Serializer &serializer) const {
 	serializer.WriteProperty(101, "items", items);
 	serializer.WriteProperty<uint8_t>(102, "refresh_mode", static_cast<uint8_t>(refresh_mode));
 	serializer.WriteProperty(103, "warehouse", warehouse);
+	serializer.WritePropertyWithDefault<string>(104, "storage_catalog", storage_catalog);
+	serializer.WritePropertyWithDefault<string>(105, "storage_schema", storage_schema);
+}
+
+ParsedSemanticMaterialization ParsedSemanticMaterialization::Copy() const {
+	ParsedSemanticMaterialization result;
+	result.name = name;
+	result.refresh_mode = refresh_mode;
+	result.warehouse = warehouse;
+	result.storage_catalog = storage_catalog;
+	result.storage_schema = storage_schema;
+	for (auto &item : items) {
+		ParsedSemanticQueryItem copy;
+		copy.kind = item.kind;
+		copy.expression = item.expression ? item.expression->Copy() : nullptr;
+		copy.star_table = item.star_table;
+		copy.alias = item.alias;
+		result.items.push_back(std::move(copy));
+	}
+	return result;
 }
 
 void ParsedSemanticMaterializationPayload::Serialize(Serializer &serializer) const {
@@ -257,6 +277,8 @@ ParsedSemanticMaterialization ParsedSemanticMaterialization::Deserialize(Deseria
 	result.items = deserializer.ReadProperty<vector<ParsedSemanticQueryItem>>(101, "items");
 	result.refresh_mode = static_cast<SemanticRefreshMode>(deserializer.ReadProperty<uint8_t>(102, "refresh_mode"));
 	result.warehouse = deserializer.ReadProperty<string>(103, "warehouse");
+	result.storage_catalog = deserializer.ReadPropertyWithDefault<string>(104, "storage_catalog");
+	result.storage_schema = deserializer.ReadPropertyWithDefault<string>(105, "storage_schema");
 	return result;
 }
 

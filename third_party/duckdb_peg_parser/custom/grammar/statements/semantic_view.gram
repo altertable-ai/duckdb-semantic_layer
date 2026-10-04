@@ -86,7 +86,8 @@ SemanticAlterUnsetMaxStaleness <- 'UNSET' 'MAX_STALENESS'
 
 # Materializations: the body is a flat SEMANTIC_VIEW(...) item list (DIMENSIONS ... METRICS ...)
 SemanticAlterAddMaterialization <- 'ADD' 'MATERIALIZATION' IfNotExists? ColId SemanticMaterializationOption* 'AS' SemanticQueryPiece*
-SemanticMaterializationOption <- SemanticMaterializationWarehouse / SemanticMaterializationRefreshMode
+SemanticMaterializationOption <- SemanticMaterializationWarehouse / SemanticMaterializationRefreshMode / SemanticMaterializationStorage
+SemanticMaterializationStorage <- 'IN' QualifiedName
 SemanticMaterializationWarehouse <- 'WAREHOUSE' '=' ColId
 SemanticMaterializationRefreshMode <- 'REFRESH_MODE' '=' SemanticRefreshModeName
 SemanticRefreshModeName <- 'AUTO' / 'FULL' / 'INCREMENTAL'

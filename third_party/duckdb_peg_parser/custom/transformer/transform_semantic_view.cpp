@@ -444,6 +444,15 @@ unique_ptr<SQLStatement> TransformAddMaterialization(PEGTransformer &transformer
 		if (option->name == "SemanticMaterializationWarehouse") {
 			// 'WAREHOUSE' '=' ColId
 			materialization.warehouse = transformer.Transform<string>(List(option), 2);
+		} else if (option->name == "SemanticMaterializationStorage") {
+			// 'IN' QualifiedName: <database> or <database>.<schema>
+			auto storage = transformer.Transform<QualifiedName>(List(option), 1);
+			if (!storage.catalog.empty() && storage.catalog != INVALID_CATALOG) {
+				throw ParserException("ADD MATERIALIZATION ... IN expects <database> or <database>.<schema>");
+			}
+			bool has_schema = !storage.schema.empty() && storage.schema != INVALID_SCHEMA;
+			materialization.storage_catalog = has_schema ? storage.schema : storage.name;
+			materialization.storage_schema = has_schema ? storage.name : string();
 		} else {
 			// 'REFRESH_MODE' '=' ('AUTO' / 'FULL' / 'INCREMENTAL')
 			materialization.refresh_mode = RefreshMode(Keyword(List(option).GetChild(2)));

@@ -145,7 +145,11 @@ struct ParsedSemanticMaterialization {
 	SemanticRefreshMode refresh_mode = SemanticRefreshMode::AUTO;
 	//! Accepted for compatibility, unused
 	string warehouse;
+	//! IN <database>[.<schema>]: where its tables are stored (empty: the semantic view's database)
+	string storage_catalog;
+	string storage_schema;
 
+	ParsedSemanticMaterialization Copy() const;
 	void Serialize(Serializer &serializer) const;
 	static ParsedSemanticMaterialization Deserialize(Deserializer &deserializer);
 };

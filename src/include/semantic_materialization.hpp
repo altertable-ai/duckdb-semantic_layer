@@ -98,6 +98,12 @@ public:
 	//! Whether the definition allows incremental refresh (the sources are checked when refreshing), and why not
 	bool incremental = false;
 	string incremental_reason;
+	//! Where its tables are stored: a DuckDB database or a DuckLake catalog, and a schema
+	string storage_catalog;
+	string storage_schema;
+	//! What its tables hold (a hash of the queries building them): stored tables with the same fingerprint, at a
+	//! known watermark, can be reattached as they are
+	string fingerprint;
 
 	shared_ptr<SemanticMaterializationState> state;
 
@@ -110,6 +116,26 @@ void PlanSemanticMaterializations(ClientContext &context, SemanticModel &model);
 
 //! Reuses the state of the materializations `previous` already had (same name and definition), so that ALTERs keep them
 void AdoptMaterializationStates(SemanticModel &model, const SemanticModel &previous);
+//! Whether two materializations are stored in the same tables
+bool SameMaterializationStorage(const SemanticMaterialization &a, const SemanticMaterialization &b);
+
+//! A materialization stored for a semantic view, as recorded in its database's metadata
+struct SemanticStoredMaterialization {
+	string catalog;
+	string schema;
+	vector<string> tables;
+	QualifiedName view;
+	string name;
+};
+//! Adds to `model` (being created) the materializations stored for its view in the attached databases that it does not
+//! define yet: reattached as they are when their definition did not change, else to be rebuilt by the next refresh.
+//! Returns those that no longer apply to the view (their tables are dropped once the view is created).
+vector<SemanticStoredMaterialization> RestoreSemanticMaterializations(ClientContext &context, SemanticModel &model);
+//! Drops the tables and the metadata of a stored materialization
+void DropStoredMaterialization(ClientContext &context, const SemanticStoredMaterialization &stored);
+//! Records that the materializations of `model` now belong to a view renamed from `previous_name`
+void RenameStoredMaterializations(ClientContext &context, const SemanticModel &model,
+                                  const QualifiedName &previous_name);
 
 //! Builds a materialization of a model that is about to be registered (ADD MATERIALIZATION)
 void BuildSemanticMaterialization(ClientContext &context, const SemanticModel &model,
@@ -118,7 +144,8 @@ void BuildSemanticMaterialization(ClientContext &context, const SemanticModel &m
 string RefreshSemanticMaterialization(ClientContext &context, const SemanticModel &model,
                                       const SemanticMaterialization &materialization, SemanticRefreshMode mode);
 //! Drops the physical tables of a materialization (they may not exist)
-void DropSemanticMaterializationTables(ClientContext &context, const SemanticMaterialization &materialization);
+void DropSemanticMaterializationTables(ClientContext &context, const SemanticModel &model,
+                                       const SemanticMaterialization &materialization);
 
 //! Whether a materialization can currently answer queries, and why not
 struct SemanticMaterializationStatus {

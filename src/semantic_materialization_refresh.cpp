@@ -15,13 +15,132 @@
 #include "duckdb/parser/statement/create_statement.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
 #include "semantic_ast_helpers.hpp"
+#include "semantic_lowering.hpp"
+#include "duckdb/main/attached_database.hpp"
+#include "duckdb/main/database_manager.hpp"
 #include "semantic_materialization_internal.hpp"
 
 namespace duckdb {
 
-static constexpr const char *MATERIALIZATION_SCHEMA = "__semantic_materializations";
-
 namespace {
+
+//===--------------------------------------------------------------------===//
+// Metadata: one row per materialization, in every database holding materialization tables
+//===--------------------------------------------------------------------===//
+string MetadataTable(const string &catalog) {
+	return QuoteIdentifier(catalog) + "." + QuoteIdentifier(SEMANTIC_MATERIALIZATION_SCHEMA) + "." +
+	       QuoteIdentifier(SEMANTIC_MATERIALIZATION_METADATA);
+}
+
+constexpr const char *METADATA_COLUMNS =
+    "view_catalog VARCHAR, view_schema VARCHAR, view_name VARCHAR, name VARCHAR, definition BLOB, fingerprint VARCHAR, "
+    "table_schema VARCHAR, tables VARCHAR[], watermark_catalogs VARCHAR[], watermark_snapshots UBIGINT[], "
+    "verified_at TIMESTAMP, last_refresh VARCHAR, last_refresh_detail VARCHAR";
+constexpr const char *METADATA_KEY =
+    "view_catalog = $1 AND view_schema = $2 AND lower(view_name) = lower($3) AND lower(name) = lower($4)";
+
+unique_ptr<MaterializedQueryResult> Run(Connection &connection, const string &sql) {
+	auto result = connection.Query(sql);
+	if (result->HasError()) {
+		result->ThrowError("semantic view materialization: ");
+	}
+	return result;
+}
+
+unique_ptr<QueryResult> RunPrepared(Connection &connection, const string &sql, vector<Value> values) {
+	auto prepared = connection.Prepare(sql);
+	if (prepared->HasError()) {
+		throw BinderException("semantic view materialization: %s", prepared->GetError());
+	}
+	auto result = prepared->Execute(values, false);
+	if (result->HasError()) {
+		result->ThrowError("semantic view materialization: ");
+	}
+	return result;
+}
+
+Value StringList(const vector<string> &values) {
+	vector<Value> list;
+	for (auto &value : values) {
+		list.emplace_back(value);
+	}
+	return Value::LIST(LogicalType::VARCHAR, std::move(list));
+}
+
+vector<Value> MetadataKey(const QualifiedName &view, const string &name) {
+	return {Value(view.catalog), Value(view.schema), Value(view.name), Value(name)};
+}
+
+//! Writes the whole metadata row of a materialization (in the transaction that built it)
+void WriteMetadata(Connection &connection, const SemanticModel &model, const SemanticMaterialization &materialization,
+                   const SemanticMaterializationState &state, const map<string, idx_t> &watermark,
+                   timestamp_t verified_at, const string &outcome, const string &detail) {
+	auto table = MetadataTable(state.catalog);
+	Run(connection, "CREATE SCHEMA IF NOT EXISTS " + QuoteIdentifier(state.catalog) + "." +
+	                    QuoteIdentifier(SEMANTIC_MATERIALIZATION_SCHEMA));
+	Run(connection, "CREATE TABLE IF NOT EXISTS " + table + " (" + METADATA_COLUMNS + ")");
+	RunPrepared(connection, "DELETE FROM " + table + " WHERE " + METADATA_KEY,
+	            MetadataKey(model.Name(), materialization.name));
+	ParsedSemanticMaterializationPayload payload;
+	for (auto &parsed : model.definition->materializations) {
+		if (StringUtil::CIEquals(parsed.name, materialization.name)) {
+			payload.materialization = parsed.Copy();
+		}
+	}
+	vector<Value> catalogs;
+	vector<Value> snapshots;
+	for (auto &entry : watermark) {
+		catalogs.emplace_back(entry.first);
+		snapshots.push_back(Value::UBIGINT(entry.second));
+	}
+	auto values = MetadataKey(model.Name(), materialization.name);
+	values.push_back(SemanticLowering::Encode(payload));
+	values.emplace_back(materialization.fingerprint);
+	values.emplace_back(state.schema);
+	values.push_back(StringList(state.tables));
+	values.push_back(Value::LIST(LogicalType::VARCHAR, std::move(catalogs)));
+	values.push_back(Value::LIST(LogicalType::UBIGINT, std::move(snapshots)));
+	values.push_back(Value::TIMESTAMP(verified_at));
+	values.emplace_back(outcome);
+	values.emplace_back(detail);
+	RunPrepared(connection, "INSERT INTO " + table + " VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+	            values);
+}
+
+//! Updates the watermark and refresh outcome of a materialization's metadata row (after an incremental refresh)
+void UpdateMetadata(Connection &connection, const SemanticModel &model, const SemanticMaterialization &materialization,
+                    const SemanticMaterializationState &state, const map<string, idx_t> &watermark,
+                    timestamp_t verified_at, const string &outcome, const string &detail) {
+	vector<Value> catalogs;
+	vector<Value> snapshots;
+	for (auto &entry : watermark) {
+		catalogs.emplace_back(entry.first);
+		snapshots.push_back(Value::UBIGINT(entry.second));
+	}
+	auto values = MetadataKey(model.Name(), materialization.name);
+	values.push_back(Value::LIST(LogicalType::VARCHAR, std::move(catalogs)));
+	values.push_back(Value::LIST(LogicalType::UBIGINT, std::move(snapshots)));
+	values.push_back(Value::TIMESTAMP(verified_at));
+	values.emplace_back(outcome);
+	values.emplace_back(detail);
+	RunPrepared(connection,
+	            "UPDATE " + MetadataTable(state.catalog) +
+	                " SET watermark_catalogs = $5, watermark_snapshots = $6, verified_at = $7, last_refresh = $8, "
+	                "last_refresh_detail = $9 WHERE " +
+	                METADATA_KEY,
+	            values);
+}
+
+bool HasMetadata(ClientContext &context, const string &catalog_name) {
+	auto catalog = Catalog::GetCatalogEntry(context, catalog_name);
+	if (!catalog || !catalog->GetSchema(context, SEMANTIC_MATERIALIZATION_SCHEMA, OnEntryNotFound::RETURN_NULL)) {
+		return false;
+	}
+	// the lookup keeps a reference to the name
+	const string table = SEMANTIC_MATERIALIZATION_METADATA;
+	EntryLookupInfo lookup(CatalogType::TABLE_ENTRY, table);
+	return catalog->GetEntry(context, SEMANTIC_MATERIALIZATION_SCHEMA, lookup, OnEntryNotFound::RETURN_NULL) != nullptr;
+}
 
 //! Logical tables of a refresh: tracked tables at a snapshot, replaced tables (changed-row images), else as defined
 class RefreshSources : public SemanticTableSources {
@@ -129,6 +248,8 @@ public:
 			lock_guard<mutex> guard(state.lock);
 			watermark = state.watermark;
 			built = state.built;
+			// e.g. restored with another definition than it was built with
+			unbuilt_reason = state.built ? string() : state.last_refresh_detail;
 		}
 		// what happened in every source catalog since the last refresh (one metadata query each)
 		map<string, SemanticCatalogChanges> changes;
@@ -150,6 +271,7 @@ public:
 		}
 		string outcome;
 		string detail;
+		auto now = Timestamp::GetCurrentTimestamp();
 		connection.BeginTransaction();
 		try {
 			auto why_full = initial ? string("initial build") : FullRefreshReason(mode, built, watermark, changes);
@@ -171,6 +293,14 @@ public:
 					detail = groups.IsValid() ? detail + "; " + rebuilt : rebuilt;
 				}
 			}
+			// the metadata changes with the tables (a refresh without changes keeps the previous watermark: still
+			// correct, nothing to write)
+			auto watermark_after = all_tracked ? current : map<string, idx_t>();
+			if (!why_full.empty()) {
+				WriteMetadata(connection, model, materialization, state, watermark_after, now, outcome, detail);
+			} else if (outcome != "NONE") {
+				UpdateMetadata(connection, model, materialization, state, watermark_after, now, outcome, detail);
+			}
 			connection.Commit();
 		} catch (std::exception &) {
 			if (connection.HasActiveTransaction()) {
@@ -182,7 +312,7 @@ public:
 			lock_guard<mutex> guard(state.lock);
 			state.built = true;
 			state.watermark = all_tracked ? current : map<string, idx_t>();
-			state.verified_at = Timestamp::GetCurrentTimestamp();
+			state.verified_at = now;
 			state.last_refresh = outcome;
 			state.last_refresh_detail = detail;
 		}
@@ -201,6 +331,9 @@ private:
 		}
 		if (!materialization.incremental) {
 			return materialization.incremental_reason;
+		}
+		if (!built && !unbuilt_reason.empty()) {
+			return unbuilt_reason;
 		}
 		if (!built || watermark.empty()) {
 			return "it was not built from tracked snapshots";
@@ -589,6 +722,8 @@ private:
 	SemanticQueryCompiler compiler;
 	map<idx_t, SemanticSourceTable> tracked;
 	bool all_tracked = true;
+	//! Why the materialization is not built, when known
+	string unbuilt_reason;
 	//! Per changed table: the kinds of changes, and whether its changed rows were loaded
 	map<idx_t, SemanticTableChanges> row_changes;
 	set<idx_t> loaded_changes;
@@ -606,15 +741,52 @@ string PhysicalName(const string &name) {
 
 void BuildSemanticMaterialization(ClientContext &context, const SemanticModel &model,
                                   const SemanticMaterialization &materialization) {
+	auto &state = *materialization.state;
 	{
-		auto &state = *materialization.state;
 		lock_guard<mutex> guard(state.lock);
-		state.catalog = model.Name().catalog;
-		state.schema = MATERIALIZATION_SCHEMA;
+		state.catalog = materialization.storage_catalog;
+		state.schema = materialization.storage_schema;
 		state.tables.clear();
 		for (idx_t b = 0; b < materialization.blocks.size(); b++) {
 			state.tables.push_back(PhysicalName(model.Name().name) + "__" + PhysicalName(materialization.name) + "__" +
 			                       to_string(b));
+		}
+	}
+	// stored tables with the same definition (e.g. after a restart) are reattached instead of rebuilt
+	if (HasMetadata(context, state.catalog)) {
+		Connection connection(*context.db);
+		auto stored = RunPrepared(connection,
+		                          "SELECT fingerprint, table_schema, tables, watermark_catalogs, watermark_snapshots, "
+		                          "verified_at, last_refresh, last_refresh_detail FROM " +
+		                              MetadataTable(state.catalog) + " WHERE " + METADATA_KEY,
+		                          MetadataKey(model.Name(), materialization.name));
+		auto rows = unique_ptr_cast<QueryResult, MaterializedQueryResult>(std::move(stored));
+		if (rows->RowCount() == 1 && rows->GetValue(0, 0).ToString() == materialization.fingerprint &&
+		    StringUtil::CIEquals(rows->GetValue(1, 0).ToString(), state.schema)) {
+			bool tables_exist = true;
+			vector<string> tables;
+			auto stored_tables = rows->GetValue(2, 0);
+			for (auto &table : ListValue::GetChildren(stored_tables)) {
+				tables.push_back(table.ToString());
+				EntryLookupInfo lookup(CatalogType::TABLE_ENTRY, tables.back());
+				tables_exist = tables_exist && Catalog::GetEntry(context, state.catalog, state.schema, lookup,
+				                                                 OnEntryNotFound::RETURN_NULL);
+			}
+			if (tables_exist && tables.size() == materialization.blocks.size()) {
+				lock_guard<mutex> guard(state.lock);
+				state.tables = tables;
+				state.watermark.clear();
+				auto catalogs = ListValue::GetChildren(rows->GetValue(3, 0));
+				auto snapshots = ListValue::GetChildren(rows->GetValue(4, 0));
+				for (idx_t i = 0; i < catalogs.size(); i++) {
+					state.watermark[catalogs[i].ToString()] = snapshots[i].GetValue<idx_t>();
+				}
+				state.verified_at = rows->GetValue(5, 0).GetValue<timestamp_t>();
+				state.last_refresh = rows->GetValue(6, 0).ToString();
+				state.last_refresh_detail = rows->GetValue(7, 0).ToString();
+				state.built = true;
+				return;
+			}
 		}
 	}
 	MaterializationRefresh(context, model, materialization).Run(SemanticRefreshMode::FULL, true);
@@ -625,26 +797,162 @@ string RefreshSemanticMaterialization(ClientContext &context, const SemanticMode
 	return MaterializationRefresh(context, model, materialization).Run(mode, false);
 }
 
-void DropSemanticMaterializationTables(ClientContext &context, const SemanticMaterialization &materialization) {
+//! Drops tables and deletes the metadata row of a materialization, in one transaction
+static void DropStored(ClientContext &context, const string &catalog, const vector<string> &tables,
+                       const QualifiedName &view, const string &name) {
+	Connection connection(*context.db);
+	connection.BeginTransaction();
+	try {
+		for (auto &table : tables) {
+			Run(connection, "DROP TABLE IF EXISTS " + table);
+		}
+		if (HasMetadata(context, catalog)) {
+			RunPrepared(connection, "DELETE FROM " + MetadataTable(catalog) + " WHERE " + METADATA_KEY,
+			            MetadataKey(view, name));
+		}
+		connection.Commit();
+	} catch (std::exception &) {
+		if (connection.HasActiveTransaction()) {
+			connection.Rollback();
+		}
+		throw;
+	}
+}
+
+void DropSemanticMaterializationTables(ClientContext &context, const SemanticModel &model,
+                                       const SemanticMaterialization &materialization) {
 	auto &state = *materialization.state;
 	vector<string> tables;
+	string catalog;
 	{
 		lock_guard<mutex> guard(state.lock);
-		if (!state.built) {
+		if (!state.built && state.tables.empty()) {
 			return;
 		}
 		for (idx_t b = 0; b < state.tables.size(); b++) {
 			tables.push_back(materialization.TableName(b));
 		}
+		catalog = state.catalog;
 		state.built = false;
 	}
+	DropStored(context, catalog, tables, model.Name(), materialization.name);
+}
+
+void DropStoredMaterialization(ClientContext &context, const SemanticStoredMaterialization &stored) {
+	vector<string> tables;
+	for (auto &table : stored.tables) {
+		tables.push_back(QuoteIdentifier(stored.catalog) + "." + QuoteIdentifier(stored.schema) + "." +
+		                 QuoteIdentifier(table));
+	}
+	DropStored(context, stored.catalog, tables, stored.view, stored.name);
+}
+
+void RenameStoredMaterializations(ClientContext &context, const SemanticModel &model,
+                                  const QualifiedName &previous_name) {
 	Connection connection(*context.db);
-	for (auto &table : tables) {
-		auto result = connection.Query("DROP TABLE IF EXISTS " + table);
-		if (result->HasError()) {
-			result->ThrowError("semantic view materialization: ");
+	for (auto &materialization : model.materializations) {
+		string catalog;
+		{
+			lock_guard<mutex> guard(materialization->state->lock);
+			if (!materialization->state->built) {
+				continue;
+			}
+			catalog = materialization->state->catalog;
+		}
+		if (!HasMetadata(context, catalog)) {
+			continue;
+		}
+		auto values = MetadataKey(previous_name, materialization->name);
+		values.emplace_back(model.Name().catalog);
+		values.emplace_back(model.Name().schema);
+		values.emplace_back(model.Name().name);
+		RunPrepared(connection,
+		            "UPDATE " + MetadataTable(catalog) +
+		                " SET view_catalog = $5, view_schema = $6, view_name = $7 WHERE " + METADATA_KEY,
+		            values);
+	}
+}
+
+vector<SemanticStoredMaterialization> RestoreSemanticMaterializations(ClientContext &context, SemanticModel &model) {
+	vector<SemanticStoredMaterialization> obsolete;
+	Connection connection(*context.db);
+	for (auto &database : DatabaseManager::Get(context).GetDatabases(context)) {
+		if (database->IsSystem() || database->IsTemporary()) {
+			continue;
+		}
+		auto &catalog = database->GetCatalog();
+		auto type = catalog.GetCatalogType();
+		if ((type != "duckdb" && type != "ducklake") || !HasMetadata(context, catalog.GetName())) {
+			continue;
+		}
+		auto stored = RunPrepared(connection,
+		                          "SELECT name, definition, fingerprint, table_schema, tables, watermark_catalogs, "
+		                          "watermark_snapshots, verified_at, last_refresh, last_refresh_detail FROM " +
+		                              MetadataTable(catalog.GetName()) +
+		                              " WHERE view_catalog = $1 AND view_schema = $2 AND lower(view_name) = lower($3)",
+		                          {Value(model.Name().catalog), Value(model.Name().schema), Value(model.Name().name)});
+		auto rows = unique_ptr_cast<QueryResult, MaterializedQueryResult>(std::move(stored));
+		for (idx_t row = 0; row < rows->RowCount(); row++) {
+			SemanticStoredMaterialization entry;
+			entry.catalog = catalog.GetName();
+			entry.schema = rows->GetValue(3, row).ToString();
+			auto stored_tables = rows->GetValue(4, row);
+			for (auto &table : ListValue::GetChildren(stored_tables)) {
+				entry.tables.push_back(table.ToString());
+			}
+			entry.view = model.Name();
+			entry.name = rows->GetValue(0, row).ToString();
+			bool defined = false;
+			for (auto &materialization : model.materializations) {
+				defined = defined || StringUtil::CIEquals(materialization->name, entry.name);
+			}
+			if (defined) {
+				continue;
+			}
+			auto payload = SemanticLowering::Decode<ParsedSemanticMaterializationPayload>(rows->GetValue(1, row));
+			// stored where its metadata is, whatever that database is called now (it may be attached under another
+			// name)
+			auto &parsed = payload->materialization;
+			if (!parsed.storage_catalog.empty() || !StringUtil::CIEquals(entry.catalog, model.Name().catalog)) {
+				parsed.storage_catalog = entry.catalog;
+			}
+			shared_ptr<SemanticMaterialization> materialization;
+			try {
+				materialization = PlanSemanticMaterialization(context, model, parsed);
+			} catch (std::exception &) {
+				// the view no longer has what it materializes
+				obsolete.push_back(std::move(entry));
+				continue;
+			}
+			if (!StringUtil::CIEquals(materialization->storage_catalog, entry.catalog) ||
+			    !StringUtil::CIEquals(materialization->storage_schema, entry.schema)) {
+				obsolete.push_back(std::move(entry));
+				continue;
+			}
+			auto &state = *materialization->state;
+			state.catalog = entry.catalog;
+			state.schema = entry.schema;
+			state.tables = entry.tables;
+			if (rows->GetValue(2, row).ToString() == materialization->fingerprint &&
+			    entry.tables.size() == materialization->blocks.size()) {
+				auto catalogs = ListValue::GetChildren(rows->GetValue(5, row));
+				auto snapshots = ListValue::GetChildren(rows->GetValue(6, row));
+				for (idx_t i = 0; i < catalogs.size(); i++) {
+					state.watermark[catalogs[i].ToString()] = snapshots[i].GetValue<idx_t>();
+				}
+				state.verified_at = rows->GetValue(7, row).GetValue<timestamp_t>();
+				state.last_refresh = rows->GetValue(8, row).ToString();
+				state.last_refresh_detail = rows->GetValue(9, row).ToString();
+				state.built = true;
+			} else {
+				// stored with another definition: the next refresh rebuilds it
+				state.last_refresh_detail = "its definition changed since it was built";
+			}
+			model.definition->materializations.push_back(parsed.Copy());
+			model.materializations.push_back(std::move(materialization));
 		}
 	}
+	return obsolete;
 }
 
 } // namespace duckdb

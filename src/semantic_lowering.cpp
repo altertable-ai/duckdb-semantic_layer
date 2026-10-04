@@ -60,17 +60,7 @@ unique_ptr<TableRef> SemanticLowering::AddMaterialization(const QualifiedName &n
                                                           const ParsedSemanticMaterialization &materialization,
                                                           bool if_not_exists) {
 	ParsedSemanticMaterializationPayload payload;
-	payload.materialization.name = materialization.name;
-	payload.materialization.refresh_mode = materialization.refresh_mode;
-	payload.materialization.warehouse = materialization.warehouse;
-	for (auto &item : materialization.items) {
-		ParsedSemanticQueryItem copy;
-		copy.kind = item.kind;
-		copy.expression = item.expression ? item.expression->Copy() : nullptr;
-		copy.star_table = item.star_table;
-		copy.alias = item.alias;
-		payload.materialization.items.push_back(std::move(copy));
-	}
+	payload.materialization = materialization.Copy();
 	return Call(SEMANTIC_VIEW_ADD_MATERIALIZATION_FUNCTION,
 	            NameValues(name, {Value::BOOLEAN(if_exists), Encode(payload), Value::BOOLEAN(if_not_exists)}));
 }
