@@ -54,7 +54,7 @@ bool SemanticReadsColumn(const SemanticModel &model, const ParsedExpression &exp
 	return false;
 }
 
-void CheckSemanticOffsetReads(const SemanticModel &model, SemanticAnalyzer &analyzer, const SemanticQuerySpec &spec) {
+void CheckSemanticTimeReads(const SemanticModel &model, SemanticAnalyzer &analyzer, const SemanticQuerySpec &spec) {
 	struct Read {
 		string what;
 		vector<SemanticRef> columns;
@@ -77,6 +77,21 @@ void CheckSemanticOffsetReads(const SemanticModel &model, SemanticAnalyzer &anal
 		vector<SemanticAtom> atoms;
 		analyzer.Decompose(*item.resolved, SemanticMetricContext(), atoms, SemanticItemWhat(item));
 		for (auto &atom : atoms) {
+			if (atom.context.cumulative != DConstants::INVALID_INDEX) {
+				auto &cumulative = model.cumulatives[atom.context.cumulative];
+				for (auto &read : reads) {
+					for (auto &column : read.columns) {
+						if (column.index == cumulative.table && cumulative.table != atom.home &&
+						    !StringUtil::CIEquals(column.column, cumulative.column)) {
+							throw SemanticDefinitionException(
+							    "%s: column \"%s.%s\" would not move with the CUMULATIVE anchor date of metric \"%s\" "
+							    "(only \"%s\" and expressions computed from it do)",
+							    read.what, model.tables[cumulative.table].name, column.column, item.output_name,
+							    model.MemberDisplayName(cumulative.dimension));
+						}
+					}
+				}
+			}
 			for (auto o : atom.context.offsets) {
 				auto &offset = model.offsets[o];
 				bool shifted = false;

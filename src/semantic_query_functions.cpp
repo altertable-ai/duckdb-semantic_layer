@@ -30,7 +30,7 @@ static unique_ptr<TableRef> CompileSemanticQuery(ClientContext &context, Semanti
 	SemanticCompileOptions options;
 	options.materializations = &materializations;
 	auto compiled = compiler.Compile(spec, options);
-	CheckSemanticOffsetReads(*model, compiler.Analyzer(), spec);
+	CheckSemanticTimeReads(*model, compiler.Analyzer(), spec);
 	if (materializations.UsedMaterialization() && binder) {
 		// a prepared statement reading a materialization is planned again (freshness checked) at every execution
 		binder->SetAlwaysRequireRebind();

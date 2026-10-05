@@ -10,6 +10,7 @@
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/star_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
+#include "duckdb/parser/expression/operator_expression.hpp"
 #include "duckdb/parser/expression/window_expression.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/query_node/set_operation_node.hpp"
@@ -23,6 +24,7 @@
 #include "semantic_ast_helpers.hpp"
 #include "semantic_expression_compiler.hpp"
 #include "semantic_bridge.hpp"
+#include "semantic_cumulative.hpp"
 #include "semantic_join_scope.hpp"
 
 namespace duckdb {
@@ -401,29 +403,7 @@ private:
 		if (dependencies) {
 			dependencies->in_dimension = false;
 		}
-		idx_t argument_count = 0;
-		auto extract = [&](unique_ptr<ParsedExpression> &argument) {
-			auto name = "__sv_x" + to_string(argument_count++);
-			argument->alias = name;
-			rows.select_list.push_back(std::move(argument));
-			argument = ColumnRef(name);
-		};
-		for (auto a : block.atoms) {
-			auto expr = compiler.Aggregate(atoms[a], scope, "Invalid metric");
-			auto &function = expr->Cast<FunctionExpression>();
-			for (auto &child : function.children) {
-				extract(child);
-			}
-			if (function.filter) {
-				extract(function.filter);
-			}
-			if (function.order_bys) {
-				for (auto &order : function.order_bys->orders) {
-					extract(order.expression);
-				}
-			}
-			result.aggregates.push_back(std::move(expr));
-		}
+		result.aggregates = ExtractAggregates(block, scope, rows);
 		vector<unique_ptr<ParsedExpression>> conditions;
 		if (spec.where) {
 			vector<const ParsedExpression *> conjuncts;
@@ -453,6 +433,37 @@ private:
 		return result;
 	}
 
+	//! The aggregate of every atom of `block`, compiled over `scope`; their arguments, FILTERs and ORDER BYs are
+	//! added to `rows` as `__sv_x<n>` and the aggregates read them
+	vector<unique_ptr<ParsedExpression>> ExtractAggregates(const Block &block, SemanticJoinScope &scope,
+	                                                       SelectNode &rows) {
+		vector<unique_ptr<ParsedExpression>> result;
+		idx_t argument_count = 0;
+		auto extract = [&](unique_ptr<ParsedExpression> &argument) {
+			auto name = "__sv_x" + to_string(argument_count++);
+			argument->alias = name;
+			rows.select_list.push_back(std::move(argument));
+			argument = ColumnRef(name);
+		};
+		for (auto a : block.atoms) {
+			auto expr = compiler.Aggregate(atoms[a], scope, "Invalid metric");
+			auto &function = expr->Cast<FunctionExpression>();
+			for (auto &child : function.children) {
+				extract(child);
+			}
+			if (function.filter) {
+				extract(function.filter);
+			}
+			if (function.order_bys) {
+				for (auto &order : function.order_bys->orders) {
+					extract(order.expression);
+				}
+			}
+			result.push_back(std::move(expr));
+		}
+		return result;
+	}
+
 	//! Completes the rows once every expression is compiled (the scope's joins are then known)
 	static void FinishRows(SelectNode &rows, SemanticJoinScope &scope, BlockBridges &bridges) {
 		if (rows.select_list.empty()) {
@@ -466,6 +477,9 @@ private:
 	//! (optionally restricted to the last snapshot); the outer select aggregates them by dimension. With `tag`,
 	//! every atom of the query gets a column (NULL when not owned) plus the block tag, for the UNION ALL merge.
 	unique_ptr<SelectNode> BuildBlock(const Block &block, optional_idx tag) {
+		if (block.key.cumulative != DConstants::INVALID_INDEX) {
+			return BuildCumulativeBlock(block, tag);
+		}
 		if (options.materializations) {
 			vector<const ParsedExpression *> dimension_exprs;
 			for (auto *dimension : dimensions) {
@@ -542,6 +556,97 @@ private:
 		AddTag(*node, tag);
 		GroupByAll(*node);
 		return node;
+	}
+
+	//! A block of CUMULATIVE aggregates (semantic_cumulative.hpp): its rows read the stored date, the query's
+	//! dimensions and WHERE conditions on the date read the anchor
+	unique_ptr<SelectNode> BuildCumulativeBlock(const Block &block, optional_idx tag) {
+		auto &cumulative = model.cumulatives[block.key.cumulative];
+		SemanticJoinScope scope(model, aliases, block.key.home, block.key.using_relationships, string(),
+		                        options.sources);
+		BlockBridges bridges(model, analyzer, compiler, aliases, block.key, options.sources);
+		SemanticAnchorMap anchor_map(model, cumulative, block.key.offsets);
+		SemanticCumulativeParts parts;
+		parts.rows = make_uniq<SelectNode>();
+		auto &rows = *parts.rows;
+		auto date = scope.ColumnReference(cumulative.table, cumulative.column);
+		date->alias = CUMULATIVE_DATE_COLUMN;
+		rows.select_list.push_back(std::move(date));
+		for (idx_t d = 0; d < dimensions.size(); d++) {
+			auto &resolved = *dimensions[d]->resolved;
+			auto what = SemanticItemWhat(*dimensions[d]);
+			auto bridged = bridges.Dimension(resolved, DimensionColumn(d), what);
+			parts.dimensions.push_back(bridged ? anchor_map.Leaf(std::move(bridged))
+			                                   : compiler.MappedRow(resolved, scope, what, anchor_map));
+			auto ref = SemanticMarkers::Classify(resolved);
+			parts.dimension_is_anchor = parts.dimension_is_anchor ||
+			                            (ref.Is(SemanticRefKind::MEMBER) && ref.index == cumulative.dimension) ||
+			                            (ref.Is(SemanticRefKind::COLUMN) && ref.index == cumulative.table &&
+			                             StringUtil::CIEquals(ref.column, cumulative.column));
+		}
+		parts.aggregates = ExtractAggregates(block, scope, rows);
+		vector<unique_ptr<ParsedExpression>> conditions;
+		vector<unique_ptr<ParsedExpression>> anchor_conditions;
+		if (spec.where) {
+			vector<const ParsedExpression *> conjuncts;
+			SplitConjuncts(*spec.where, conjuncts);
+			for (auto *conjunct : conjuncts) {
+				if (SemanticReadsColumn(model, *conjunct, cumulative.table, cumulative.column)) {
+					anchor_conditions.push_back(
+					    compiler.MappedRow(*conjunct, scope, "Invalid WHERE clause", anchor_map));
+				} else if (!bridges.Condition(*conjunct)) {
+					conditions.push_back(
+					    compiler.ShiftedRow(*conjunct, scope, "Invalid WHERE clause", block.key.offsets));
+				}
+			}
+		}
+		rows.where_clause = AndAll(std::move(conditions));
+		parts.anchor_where = AndAll(std::move(anchor_conditions));
+		for (auto &leaf : anchor_map.TakeLeaves()) {
+			parts.leaves.push_back(leaf->alias);
+			rows.select_list.push_back(std::move(leaf));
+		}
+		FinishRows(rows, scope, bridges);
+		parts.anchors = Anchors(cumulative);
+		vector<string> atom_columns;
+		for (auto a : block.atoms) {
+			atom_columns.push_back(AtomColumn(a));
+		}
+		auto result = BuildSemanticCumulativeBlock(cumulative, std::move(parts), atom_columns);
+		if (!tag.IsValid()) {
+			return result;
+		}
+		// merged with other blocks: a column per atom of the query (NULL when not owned) and the block tag
+		auto node = make_uniq<SelectNode>();
+		for (idx_t d = 0; d < dimensions.size(); d++) {
+			node->select_list.push_back(ColumnRef(DimensionColumn(d)));
+		}
+		for (idx_t a = 0; a < atoms.size(); a++) {
+			unique_ptr<ParsedExpression> expr;
+			if (block.Owns(a)) {
+				expr = ColumnRef(AtomColumn(a));
+			} else {
+				expr = make_uniq<ConstantExpression>(Value());
+			}
+			expr->alias = AtomColumn(a);
+			node->select_list.push_back(std::move(expr));
+		}
+		AddTag(*node, tag);
+		node->from_table = MakeSubqueryRef(std::move(result), "__sv_cumulative");
+		return node;
+	}
+
+	//! The anchor dates: SELECT DISTINCT c AS __sv_t FROM <c's table> WHERE c IS NOT NULL
+	unique_ptr<QueryNode> Anchors(const SemanticCumulative &cumulative) {
+		SemanticJoinScope scope(model, aliases, cumulative.table, {}, aliases.NestedPrefix(), options.sources);
+		auto node = make_uniq<SelectNode>();
+		auto anchor = scope.ColumnReference(cumulative.table, cumulative.column);
+		node->where_clause = make_uniq<OperatorExpression>(ExpressionType::OPERATOR_IS_NOT_NULL, anchor->Copy());
+		anchor->alias = CUMULATIVE_ANCHOR_COLUMN;
+		node->select_list.push_back(std::move(anchor));
+		node->modifiers.push_back(make_uniq<DistinctModifier>());
+		node->from_table = scope.BuildFrom();
+		return std::move(node);
 	}
 
 	static void AddTag(SelectNode &node, optional_idx tag) {
