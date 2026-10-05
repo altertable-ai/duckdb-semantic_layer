@@ -142,6 +142,8 @@ void ParsedSemanticMember::Serialize(Serializer &serializer) const {
 	serializer.WriteProperty(113, "cortex_search_service", cortex_search_service);
 	serializer.WriteProperty(114, "cortex_search_column", cortex_search_column);
 	serializer.WritePropertyWithDefault(115, "filter", filter);
+	serializer.WritePropertyWithDefault(116, "offset_dimension", offset_dimension);
+	serializer.WritePropertyWithDefault(117, "offset_interval", offset_interval);
 }
 
 ParsedSemanticMember ParsedSemanticMember::Deserialize(Deserializer &deserializer) {
@@ -162,6 +164,8 @@ ParsedSemanticMember ParsedSemanticMember::Deserialize(Deserializer &deserialize
 	result.cortex_search_service = deserializer.ReadProperty<string>(113, "cortex_search_service");
 	result.cortex_search_column = deserializer.ReadProperty<string>(114, "cortex_search_column");
 	result.filter = deserializer.ReadPropertyWithDefault<unique_ptr<ParsedExpression>>(115, "filter");
+	result.offset_dimension = deserializer.ReadPropertyWithDefault<vector<string>>(116, "offset_dimension");
+	result.offset_interval = deserializer.ReadPropertyWithDefault<unique_ptr<ParsedExpression>>(117, "offset_interval");
 	return result;
 }
 

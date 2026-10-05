@@ -127,16 +127,19 @@ void MapWindowDimensions(const SemanticModel &model, unique_ptr<ParsedExpression
 //===--------------------------------------------------------------------===//
 // Metric queries
 //===--------------------------------------------------------------------===//
-//! Atoms aggregated together: same home table, USING relationships and NON ADDITIVE BY metric
+//! Atoms aggregated together: same home table, USING relationships, NON ADDITIVE BY metric and OFFSET shifts
 struct Block {
 	idx_t home;
 	vector<idx_t> using_relationships;
 	idx_t non_additive_member;
+	vector<idx_t> offsets;
+	//! SemanticOffsetKey of `offsets`
+	string offset_key;
 	vector<idx_t> atoms;
 
-	bool Accepts(const SemanticAtom &atom) const {
+	bool Accepts(const SemanticAtom &atom, const string &atom_offset_key) const {
 		return home == atom.home && using_relationships == atom.context.using_relationships &&
-		       non_additive_member == atom.context.non_additive_member;
+		       non_additive_member == atom.context.non_additive_member && offset_key == atom_offset_key;
 	}
 	bool Owns(idx_t atom) const {
 		return std::find(atoms.begin(), atoms.end(), atom) != atoms.end();
@@ -293,11 +296,16 @@ public:
 			posts.push_back(analyzer.Decompose(*item->resolved, SemanticMetricContext(), atoms, ItemWhat(*item)));
 		}
 		for (idx_t a = 0; a < atoms.size(); a++) {
-			auto block =
-			    std::find_if(blocks.begin(), blocks.end(), [&](const Block &b) { return b.Accepts(atoms[a]); });
+			auto offset_key = SemanticOffsetKey(model, atoms[a].context.offsets);
+			auto block = std::find_if(blocks.begin(), blocks.end(),
+			                          [&](const Block &b) { return b.Accepts(atoms[a], offset_key); });
 			if (block == blocks.end()) {
-				blocks.push_back(Block {
-				    atoms[a].home, atoms[a].context.using_relationships, atoms[a].context.non_additive_member, {}});
+				blocks.push_back(Block {atoms[a].home,
+				                        atoms[a].context.using_relationships,
+				                        atoms[a].context.non_additive_member,
+				                        atoms[a].context.offsets,
+				                        offset_key,
+				                        {}});
 				block = blocks.end() - 1;
 			}
 			block->atoms.push_back(a);
@@ -339,6 +347,7 @@ public:
 		result.home = block.home;
 		result.using_relationships = block.using_relationships;
 		result.non_additive_member = block.non_additive_member;
+		result.offsets = block.offsets;
 		for (auto a : block.atoms) {
 			result.atoms.push_back(CopyAtom(atoms[a]));
 		}
@@ -407,7 +416,7 @@ private:
 				throw SemanticDefinitionException("%s: many-to-many bridges cannot be materialized", what);
 			}
 			if (!expr) {
-				expr = compiler.Row(*dimensions[d]->resolved, scope, DConstants::INVALID_INDEX, what);
+				expr = compiler.Row(*dimensions[d]->resolved, scope, DConstants::INVALID_INDEX, what, block.offsets);
 			}
 			result.groups.push_back(expr->Copy());
 			expr->alias = DimensionColumn(d);
@@ -451,7 +460,7 @@ private:
 			}
 			if (!local_conjuncts.empty()) {
 				conditions.push_back(compiler.Row(*AndAll(std::move(local_conjuncts)), scope, DConstants::INVALID_INDEX,
-				                                  "Invalid WHERE clause"));
+				                                  "Invalid WHERE clause", block.offsets));
 			}
 		}
 		if (options.row_filter) {
@@ -477,7 +486,8 @@ private:
 	//! (optionally restricted to the last snapshot); the outer select aggregates them by dimension. With `tag`,
 	//! every atom of the query gets a column (NULL when not owned) plus the block tag, for the UNION ALL merge.
 	unique_ptr<SelectNode> BuildBlock(const Block &block, optional_idx tag) {
-		if (options.materializations) {
+		// blocks with OFFSET shifts always read the sources
+		if (options.materializations && block.offsets.empty()) {
 			vector<const ParsedExpression *> dimension_exprs;
 			for (auto *dimension : dimensions) {
 				dimension_exprs.push_back(dimension->resolved.get());

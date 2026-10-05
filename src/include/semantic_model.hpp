@@ -89,6 +89,22 @@ struct SemanticNonAdditive {
 	OrderByNullType null_order;
 };
 
+//! OFFSET (<dimension> BY <interval>) of a metric: in the metric's aggregation blocks, the dimension's column reads
+//! shifted by the interval in the query's dimensions and WHERE (semantic_query_compiler.cpp)
+struct SemanticOffset {
+	//! The offset dimension: a dimension defined as a column of its logical table
+	idx_t dimension;
+	idx_t table;
+	string column;
+	//! The column's type: shifted values are cast back to it
+	LogicalType type;
+	//! Constant interval expression, as written
+	unique_ptr<ParsedExpression> interval;
+};
+
+//! `CAST(<column> + <interval> AS <type>)`: `column` read shifted by a metric OFFSET
+unique_ptr<ParsedExpression> SemanticShiftColumn(unique_ptr<ParsedExpression> column, const SemanticOffset &offset);
+
 struct SemanticMember {
 	//! Definition entry, owned by SemanticModel::definition
 	const ParsedSemanticMember *parsed;
@@ -104,6 +120,8 @@ struct SemanticMember {
 	vector<SemanticNonAdditive> non_additive;
 	//! Resolved FILTER condition (metrics only), or null
 	unique_ptr<ParsedExpression> filter;
+	//! OFFSET (metrics only), or null
+	unique_ptr<SemanticOffset> offset;
 
 	SemanticMemberKind Kind() const {
 		return parsed->kind;

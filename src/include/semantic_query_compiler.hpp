@@ -55,6 +55,8 @@ struct SemanticBlockPlan {
 	idx_t home;
 	vector<idx_t> using_relationships;
 	idx_t non_additive_member;
+	//! OFFSET metrics shifting the block's dimensions and WHERE (application order)
+	vector<idx_t> offsets;
 	vector<SemanticAtom> atoms;
 	//! Result type of every atom
 	vector<LogicalType> atom_types;

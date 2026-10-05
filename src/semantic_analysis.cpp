@@ -177,10 +177,23 @@ SemanticMetricContext SemanticAnalyzer::MetricContext(idx_t metric, const Semant
 	if (member.filter) {
 		result.filters.push_back(metric);
 	}
+	if (member.offset) {
+		result.offsets.push_back(metric);
+	}
+	result.offsets.insert(result.offsets.end(), outer.offsets.begin(), outer.offsets.end());
 	return result;
 }
 
 void SemanticAnalyzer::ApplyMetricContext(SemanticAtom &atom, const string &what) {
+	for (auto metric : atom.context.offsets) {
+		auto &offset = *model.members[metric].offset;
+		if (!model.Reaches(atom.home, offset.table)) {
+			throw SemanticDefinitionException(
+			    "%s: OFFSET dimension \"%s\" of metric \"%s\" is not reachable from logical table \"%s\"", what,
+			    model.MemberDisplayName(offset.dimension), model.MemberDisplayName(metric),
+			    model.tables[atom.home].name);
+		}
+	}
 	if (atom.context.filters.empty()) {
 		return;
 	}
@@ -298,6 +311,15 @@ unique_ptr<ParsedExpression> SemanticAnalyzer::Decompose(const ParsedExpression 
 	};
 	rewrite(result);
 	return result;
+}
+
+string SemanticOffsetKey(const SemanticModel &model, const vector<idx_t> &offsets) {
+	string key;
+	for (auto metric : offsets) {
+		auto &offset = *model.members[metric].offset;
+		key += to_string(offset.table) + "." + offset.column + "+" + offset.interval->ToString() + ";";
+	}
+	return key;
 }
 
 } // namespace duckdb

@@ -11,8 +11,9 @@ public:
 	SemanticExpressionCompiler(const SemanticModel &model, SemanticAnalyzer &analyzer)
 	    : model(model), analyzer(analyzer) {
 	}
+	//! `offsets`: OFFSET metrics whose shifts apply to the columns read (block dimensions and WHERE only)
 	unique_ptr<ParsedExpression> Row(const ParsedExpression &expr, SemanticJoinScope &scope, idx_t context_table,
-	                                 const string &what);
+	                                 const string &what, const vector<idx_t> &offsets = vector<idx_t>());
 	unique_ptr<ParsedExpression> Aggregate(const SemanticAtom &atom, SemanticJoinScope &scope, const string &what);
 
 	template <class FUNC>

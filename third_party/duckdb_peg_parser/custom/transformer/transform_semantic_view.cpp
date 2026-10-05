@@ -265,7 +265,7 @@ vector<ParsedSemanticMember> TransformSemanticMemberClause(PEGTransformer &trans
 		if (member.is_private && kind == SemanticMemberKind::DIMENSION) {
 			throw ParserException("semantic view: dimensions cannot be PRIVATE");
 		}
-		if (kind != SemanticMemberKind::METRIC && member.filter) {
+		if (kind != SemanticMemberKind::METRIC && (member.filter || !member.offset_dimension.empty())) {
 			throw ParserException("semantic view: FILTER and OFFSET are only allowed on metrics ('%s')",
 			                      member.FullName());
 		}
@@ -277,8 +277,8 @@ vector<ParsedSemanticMember> TransformSemanticMemberClause(PEGTransformer &trans
 	return members;
 }
 
-// SemanticVisibility? SemanticMemberName SemanticLabels? SemanticUsing? SemanticNonAdditive? SemanticMetricFilter? 'AS'
-// Expression SemanticMemberOption*
+// SemanticVisibility? SemanticMemberName SemanticLabels? SemanticUsing? SemanticNonAdditive? SemanticMetricFilter?
+// SemanticMetricOffset? 'AS' Expression SemanticMemberOption*
 ParsedSemanticMember TransformSemanticMember(PEGTransformer &transformer, optional_ptr<ParseResult> parse_result) {
 	auto &list = List(parse_result);
 	ParsedSemanticMember member;
@@ -307,8 +307,15 @@ ParsedSemanticMember TransformSemanticMember(PEGTransformer &transformer, option
 		auto body = PEGTransformerFactory::ExtractResultFromParens(List(Optional(list, 5)).GetChild(1));
 		member.filter = transformer.Transform<unique_ptr<ParsedExpression>>(List(body), 1);
 	}
-	member.expression = transformer.Transform<unique_ptr<ParsedExpression>>(list, 7);
-	for (auto &option_node : Repeated(list.GetChild(8))) {
+	if (Present(list, 6)) {
+		// 'OFFSET' Parens(SemanticDottedName 'BY' Expression)
+		auto body = PEGTransformerFactory::ExtractResultFromParens(List(Optional(list, 6)).GetChild(1));
+		auto &body_list = List(body);
+		member.offset_dimension = transformer.Transform<vector<string>>(body_list, 0);
+		member.offset_interval = transformer.Transform<unique_ptr<ParsedExpression>>(body_list, 2);
+	}
+	member.expression = transformer.Transform<unique_ptr<ParsedExpression>>(list, 8);
+	for (auto &option_node : Repeated(list.GetChild(9))) {
 		auto option = Choice(option_node);
 		auto &option_list = List(option);
 		if (option->name == "SemanticWithSynonyms") {

@@ -79,6 +79,10 @@ shared_ptr<SemanticMaterialization> PlanSemanticMaterialization(ClientContext &c
 			    "%s: semi-additive metric \"%s\" (NON ADDITIVE BY) cannot be materialized", what,
 			    model.MemberDisplayName(plan.non_additive_member));
 		}
+		if (!plan.offsets.empty()) {
+			throw SemanticDefinitionException("%s: metric \"%s\" uses OFFSET and cannot be materialized", what,
+			                                  model.MemberDisplayName(plan.offsets[0]));
+		}
 		SemanticMaterializedBlock block;
 		block.home = plan.home;
 		block.using_relationships = plan.using_relationships;

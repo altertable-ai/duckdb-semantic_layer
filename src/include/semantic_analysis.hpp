@@ -29,6 +29,8 @@ struct SemanticMetricContext {
 	idx_t non_additive_member = DConstants::INVALID_INDEX;
 	//! Metrics whose FILTER applies to the aggregates (outer metrics first)
 	vector<idx_t> filters;
+	//! Metrics whose OFFSET applies, in the order the shifts are applied (innermost metric first)
+	vector<idx_t> offsets;
 };
 
 //! An aggregate evaluated over the rows of `home`.
@@ -77,8 +79,9 @@ public:
 	unique_ptr<ParsedExpression> DecomposeMetric(idx_t metric, vector<SemanticAtom> &atoms, const string &what);
 	//! Dimensions referenced by the window clauses of a (metric-level) expression, following metric references
 	void WindowDimensions(const ParsedExpression &expr, set<idx_t> &dimensions) const;
-	//! Applies the metric context of a new atom: AND-s the FILTER of every metric of `atom.context.filters` into the
-	//! atom's aggregate, checking the filters' tables are reachable from the atom's home table
+	//! Applies the metric context of a new atom: checks the tables of its OFFSET dimensions are reachable from its home
+	//! table, and AND-s the FILTER of every metric of `atom.context.filters` into its aggregate (checking the filters'
+	//! tables are reachable too)
 	void ApplyMetricContext(SemanticAtom &atom, const string &what);
 
 private:
@@ -88,5 +91,8 @@ private:
 	ClientContext &context;
 	case_insensitive_map_t<bool> aggregate_cache;
 };
+
+//! Identifies the column shifts of OFFSET metrics `offsets` (in application order): equal keys shift equally
+string SemanticOffsetKey(const SemanticModel &model, const vector<idx_t> &offsets);
 
 } // namespace duckdb

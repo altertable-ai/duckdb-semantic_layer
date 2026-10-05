@@ -8,11 +8,15 @@
 #include "duckdb/common/to_string.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/common/error_data.hpp"
+#include "duckdb/parser/expression/cast_expression.hpp"
+#include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/star_expression.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
+#include "duckdb/parser/tableref/emptytableref.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "semantic_analysis.hpp"
@@ -72,6 +76,7 @@ public:
 		BuildGraph();
 		BuildMembers();
 		ResolveMembers();
+		ResolveOffsets();
 		CheckMemberCycles();
 		CheckMemberKinds();
 		ProbeSemanticModelTypes(context, *model);
@@ -361,6 +366,9 @@ private:
 			if (parsed.filter && member.Kind() != SemanticMemberKind::METRIC) {
 				Fail("FILTER is only allowed on metrics (\"%s\")", parsed.FullName());
 			}
+			if (!parsed.offset_dimension.empty() && member.Kind() != SemanticMemberKind::METRIC) {
+				Fail("OFFSET is only allowed on metrics (\"%s\")", parsed.FullName());
+			}
 			model->members.push_back(std::move(member));
 		}
 	}
@@ -409,6 +417,76 @@ private:
 		}
 	}
 
+	static bool ContainsColumnOrSubquery(const ParsedExpression &expr) {
+		if (expr.GetExpressionClass() == ExpressionClass::COLUMN_REF ||
+		    expr.GetExpressionClass() == ExpressionClass::SUBQUERY) {
+			return true;
+		}
+		bool found = false;
+		ParsedExpressionIterator::EnumerateChildren(
+		    expr, [&](const ParsedExpression &child) { found = found || ContainsColumnOrSubquery(child); });
+		return found;
+	}
+
+	//! OFFSET dimensions resolve to a dimension defined as a column; the interval must be constant and shift the
+	//! column's type
+	void ResolveOffsets() {
+		for (idx_t m = 0; m < model->members.size(); m++) {
+			auto &member = model->members[m];
+			auto &parsed = *member.parsed;
+			if (parsed.offset_dimension.empty()) {
+				continue;
+			}
+			auto what = What(m) + " OFFSET";
+			auto name = StringUtil::Join(parsed.offset_dimension, ".");
+			SemanticResolveContext resolve_context;
+			resolve_context.owner_table = member.table;
+			resolve_context.what = what;
+			string error;
+			auto ref = model->Lookup(parsed.offset_dimension, resolve_context, error);
+			if (ref.Is(SemanticRefKind::NONE)) {
+				Fail("%s: %s", what, error.empty() ? "unknown dimension \"" + name + "\"" : error);
+			}
+			if (!ref.Is(SemanticRefKind::MEMBER) || model->members[ref.index].Kind() != SemanticMemberKind::DIMENSION) {
+				Fail("%s: \"%s\" is not a dimension", what, name);
+			}
+			auto column = SemanticMarkers::Classify(*model->members[ref.index].resolved);
+			if (!column.Is(SemanticRefKind::COLUMN)) {
+				Fail("%s: dimension \"%s\" must be defined as a column of its logical table", what, name);
+			}
+			if (ContainsColumnOrSubquery(*parsed.offset_interval)) {
+				Fail("%s: the interval must be a constant expression", what);
+			}
+			auto &table = model->tables[column.index];
+			auto offset = make_uniq<SemanticOffset>();
+			offset->dimension = ref.index;
+			offset->table = column.index;
+			offset->column = column.column;
+			offset->type = table.column_types[table.columns.at(column.column)];
+			offset->interval = parsed.offset_interval->Copy();
+			CheckOffsetType(*offset, what);
+			member.offset = std::move(offset);
+		}
+	}
+
+	//! Binds SELECT CAST(CAST(NULL AS <type>) + <interval> AS <type>)
+	void CheckOffsetType(const SemanticOffset &offset, const string &what) {
+		auto node = make_uniq<SelectNode>();
+		node->select_list.push_back(SemanticShiftColumn(
+		    make_uniq<CastExpression>(offset.type, make_uniq<ConstantExpression>(Value())), offset));
+		node->from_table = make_uniq<EmptyTableRef>();
+		auto statement = make_uniq<SelectStatement>();
+		statement->node = std::move(node);
+		try {
+			auto binder = Binder::CreateBinder(context);
+			binder->Bind(statement->Cast<SQLStatement>());
+		} catch (std::exception &ex) {
+			ErrorData error(ex);
+			Fail("%s: cannot shift column \"%s.%s\" (%s) by %s: %s", what, model->tables[offset.table].name,
+			     offset.column, offset.type.ToString(), offset.interval->ToString(), error.RawMessage());
+		}
+	}
+
 	static void CollectMemberRefs(const ParsedExpression &expr, vector<idx_t> &out) {
 		auto ref = SemanticMarkers::Classify(expr);
 		if (ref.Is(SemanticRefKind::MEMBER)) {
@@ -454,6 +532,10 @@ private:
 				vector<SemanticAtom> atoms;
 				analyzer.DecomposeMetric(member, atoms, what);
 				for (auto &atom : atoms) {
+					if (!atom.context.offsets.empty()) {
+						Fail("%s cannot reference metric \"%s\", which uses OFFSET", what,
+						     model->MemberDisplayName(member));
+					}
 					if (atom.home == table || !model->Reaches(atom.home, table) || model->Reaches(table, atom.home)) {
 						Fail("%s cannot reference metric \"%s\": its logical table must have a higher granularity "
 						     "than \"%s\"",
