@@ -661,6 +661,10 @@ private:
 						Fail("%s cannot reference metric \"%s\", which uses OFFSET", what,
 						     model->MemberDisplayName(member));
 					}
+					if (atom.context.cumulative != DConstants::INVALID_INDEX) {
+						Fail("%s cannot reference metric \"%s\", which uses CUMULATIVE", what,
+						     model->MemberDisplayName(member));
+					}
 					if (atom.home == table || !model->Reaches(atom.home, table) || model->Reaches(table, atom.home)) {
 						Fail("%s cannot reference metric \"%s\": its logical table must have a higher granularity "
 						     "than \"%s\"",
@@ -716,6 +720,9 @@ private:
 
 	void CheckMetric(SemanticAnalyzer &analyzer, idx_t m, const string &what) {
 		auto &member = model->members[m];
+		if (member.cumulative.IsValid() && SemanticAnalyzer::ContainsWindow(*member.resolved)) {
+			Fail("%s: CUMULATIVE metrics cannot use window functions", what);
+		}
 		if (member.filter &&
 		    (analyzer.ContainsAggregateOrMetric(*member.filter) || SemanticAnalyzer::ContainsWindow(*member.filter))) {
 			Fail("%s: FILTER must be a row-level condition (dimensions, facts and columns only)", what);
@@ -745,6 +752,13 @@ private:
 		}
 		vector<SemanticAtom> atoms;
 		analyzer.DecomposeMetric(m, atoms, what);
+		if (member.cumulative.IsValid() &&
+		    model->cumulatives[member.cumulative.GetIndex()].period == SemanticCumulativePeriod::AVERAGE &&
+		    atoms.size() != 1) {
+			Fail("%s: CUMULATIVE ... AVERAGE requires a metric computed from a single aggregate (averaging each "
+			     "aggregate of an expression would not average its value)",
+			     what);
+		}
 		if (member.IsDerived()) {
 			return;
 		}

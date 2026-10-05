@@ -85,6 +85,12 @@ shared_ptr<SemanticMaterialization> PlanSemanticMaterialization(ClientContext &c
 			                                  what, model.MemberDisplayName(offset.dimension),
 			                                  offset.interval->ToString());
 		}
+		if (plan.key.cumulative != DConstants::INVALID_INDEX) {
+			auto &cumulative = model.cumulatives[plan.key.cumulative];
+			throw SemanticDefinitionException(
+			    "%s: a metric uses CUMULATIVE and cannot be materialized (CUMULATIVE (%s))", what,
+			    model.MemberDisplayName(cumulative.dimension));
+		}
 		SemanticMaterializedBlock block;
 		block.home = plan.key.home;
 		block.using_relationships = plan.key.using_relationships;
@@ -370,7 +376,8 @@ bool SemanticMaterializationMatcher::IsUsable(const SemanticMaterialization &mat
 unique_ptr<SemanticMaterializedRead> SemanticMaterializationMatcher::Find(
     const SemanticBlockKey &block, const vector<idx_t> &atoms, const vector<SemanticAtom> &all_atoms,
     const vector<const ParsedExpression *> &dimensions, optional_ptr<const ParsedExpression> where) {
-	if (!enabled || block.non_additive_member != DConstants::INVALID_INDEX) {
+	if (!enabled || block.non_additive_member != DConstants::INVALID_INDEX ||
+	    block.cumulative != DConstants::INVALID_INDEX) {
 		return nullptr;
 	}
 	// the coarsest usable materialization first: it has the fewest groups to aggregate

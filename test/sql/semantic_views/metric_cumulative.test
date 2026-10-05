@@ -192,3 +192,74 @@ CREATE SEMANTIC VIEW bad TABLES (dates PRIMARY KEY (day), events PRIMARY KEY (ev
   DIMENSIONS (dates.y AS year) METRICS (events.x CUMULATIVE (dates.y TO MONTH) AS SUM(amount));
 ----
 cannot truncate column "dates.year" (INTEGER) to month
+
+# CREATE-time rules of the analysis
+statement error
+CREATE SEMANTIC VIEW bad TABLES (users PRIMARY KEY (user_id), dates PRIMARY KEY (day), costs PRIMARY KEY (cost_id))
+  RELATIONSHIPS (costs (cost_date) REFERENCES dates) DIMENSIONS (users.country AS country)
+  METRICS (costs.x CUMULATIVE (users.country) AS SUM(cost));
+----
+is not reachable from logical table "costs"
+
+statement error
+CREATE SEMANTIC VIEW bad TABLES (dates PRIMARY KEY (day), events PRIMARY KEY (event_id)) RELATIONSHIPS (events (event_date) REFERENCES dates)
+  DIMENSIONS (dates.day AS day) METRICS (events.x CUMULATIVE (dates.day AVERAGE) AS SUM(amount) / COUNT(*));
+----
+AVERAGE requires a metric computed from a single aggregate
+
+statement error
+CREATE SEMANTIC VIEW bad TABLES (dates PRIMARY KEY (day), events PRIMARY KEY (event_id)) RELATIONSHIPS (events (event_date) REFERENCES dates)
+  DIMENSIONS (dates.day AS day)
+  METRICS (events.revenue_lm OFFSET (dates.day BY INTERVAL 1 MONTH) AS SUM(amount), events.x CUMULATIVE (dates.day) AS revenue_lm);
+----
+which uses OFFSET
+
+statement error
+CREATE SEMANTIC VIEW bad TABLES (dates PRIMARY KEY (day), events PRIMARY KEY (event_id)) RELATIONSHIPS (events (event_date) REFERENCES dates)
+  DIMENSIONS (dates.day AS day)
+  METRICS (events.total CUMULATIVE (dates.day) AS SUM(amount), events.x CUMULATIVE (dates.day TO MONTH) AS total);
+----
+which uses CUMULATIVE
+
+statement error
+CREATE SEMANTIC VIEW bad TABLES (dates PRIMARY KEY (day), events PRIMARY KEY (event_id)) RELATIONSHIPS (events (event_date) REFERENCES dates)
+  DIMENSIONS (dates.day AS day)
+  METRICS (events.x NON ADDITIVE BY (dates.day) CUMULATIVE (dates.day) AS SUM(amount));
+----
+cannot combine CUMULATIVE and NON ADDITIVE BY
+
+statement error
+CREATE SEMANTIC VIEW bad TABLES (dates PRIMARY KEY (day), events PRIMARY KEY (event_id)) RELATIONSHIPS (events (event_date) REFERENCES dates)
+  DIMENSIONS (dates.day AS day)
+  METRICS (events.last_day NON ADDITIVE BY (dates.day) AS SUM(amount), events.x CUMULATIVE (dates.day) AS last_day);
+----
+which uses NON ADDITIVE BY
+
+statement error
+CREATE SEMANTIC VIEW bad TABLES (dates PRIMARY KEY (day), events PRIMARY KEY (event_id)) RELATIONSHIPS (events (event_date) REFERENCES dates)
+  DIMENSIONS (dates.day AS day)
+  METRICS (events.total CUMULATIVE (dates.day) AS SUM(amount), events.x NON ADDITIVE BY (dates.day) AS total);
+----
+which uses CUMULATIVE
+
+statement error
+CREATE SEMANTIC VIEW bad TABLES (users PRIMARY KEY (user_id), dates PRIMARY KEY (day), events PRIMARY KEY (event_id))
+  RELATIONSHIPS (events (user_id) REFERENCES users, events (event_date) REFERENCES dates)
+  FACTS (users.lifetime AS events.total)
+  DIMENSIONS (dates.day AS day)
+  METRICS (events.total CUMULATIVE (dates.day) AS SUM(amount));
+----
+which uses CUMULATIVE
+
+statement error
+CREATE SEMANTIC VIEW bad TABLES (dates PRIMARY KEY (day), events PRIMARY KEY (event_id)) RELATIONSHIPS (events (event_date) REFERENCES dates)
+  DIMENSIONS (dates.day AS day)
+  METRICS (events.x CUMULATIVE (dates.day) AS SUM(amount) OVER (ORDER BY dates.day));
+----
+CUMULATIVE metrics cannot use window functions
+
+# cumulative metrics cannot be materialized
+statement error
+ALTER SEMANTIC VIEW activity ADD MATERIALIZATION bad AS DIMENSIONS dates.month METRICS events.revenue_total;
+----
+uses CUMULATIVE and cannot be materialized

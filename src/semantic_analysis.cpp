@@ -165,7 +165,8 @@ void SemanticAnalyzer::WindowDimensions(const ParsedExpression &expr, set<idx_t>
 	    expr, [&](const ParsedExpression &child) { WindowDimensions(child, dimensions); });
 }
 
-SemanticMetricContext SemanticAnalyzer::MetricContext(idx_t metric, const SemanticMetricContext &outer) const {
+SemanticMetricContext SemanticAnalyzer::MetricContext(idx_t metric, const SemanticMetricContext &outer,
+                                                      const string &what) const {
 	auto &member = model.members[metric];
 	SemanticMetricContext result;
 	result.table = member.table;
@@ -181,6 +182,33 @@ SemanticMetricContext SemanticAnalyzer::MetricContext(idx_t metric, const Semant
 		result.offsets.push_back(member.offset.GetIndex());
 	}
 	result.offsets.insert(result.offsets.end(), outer.offsets.begin(), outer.offsets.end());
+	if (member.cumulative.IsValid() && !member.non_additive.empty()) {
+		throw SemanticDefinitionException("%s: metric \"%s\" cannot combine CUMULATIVE and NON ADDITIVE BY", what,
+		                                  model.MemberDisplayName(metric));
+	}
+	if (outer.cumulative_member != DConstants::INVALID_INDEX) {
+		// CUMULATIVE metrics only build on plain metrics
+		string clause = member.offset.IsValid()        ? "OFFSET"
+		                : member.cumulative.IsValid()  ? "CUMULATIVE"
+		                : !member.non_additive.empty() ? "NON ADDITIVE BY"
+		                                               : "";
+		if (!clause.empty()) {
+			throw SemanticDefinitionException(
+			    "%s: metric \"%s\" uses CUMULATIVE and cannot reference metric \"%s\", which uses %s", what,
+			    model.MemberDisplayName(outer.cumulative_member), model.MemberDisplayName(metric), clause);
+		}
+	}
+	if (outer.non_additive_member != DConstants::INVALID_INDEX && member.cumulative.IsValid()) {
+		throw SemanticDefinitionException(
+		    "%s: semi-additive metric \"%s\" cannot reference metric \"%s\", which uses CUMULATIVE", what,
+		    model.MemberDisplayName(outer.non_additive_member), model.MemberDisplayName(metric));
+	}
+	result.cumulative = outer.cumulative;
+	result.cumulative_member = outer.cumulative_member;
+	if (member.cumulative.IsValid()) {
+		result.cumulative = member.cumulative.GetIndex();
+		result.cumulative_member = metric;
+	}
 	return result;
 }
 
@@ -191,6 +219,14 @@ void SemanticAnalyzer::ApplyMetricContext(SemanticAtom &atom, const string &what
 			throw SemanticDefinitionException("%s: OFFSET dimension \"%s\" is not reachable from logical table \"%s\"",
 			                                  what, model.MemberDisplayName(offset.dimension),
 			                                  model.tables[atom.home].name);
+		}
+	}
+	if (atom.context.cumulative != DConstants::INVALID_INDEX) {
+		auto &cumulative = model.cumulatives[atom.context.cumulative];
+		if (!model.Reaches(atom.home, cumulative.table)) {
+			throw SemanticDefinitionException(
+			    "%s: CUMULATIVE dimension \"%s\" is not reachable from logical table \"%s\"", what,
+			    model.MemberDisplayName(cumulative.dimension), model.tables[atom.home].name);
 		}
 	}
 	auto &aggregate = atom.aggregate->Cast<FunctionExpression>();
@@ -225,7 +261,8 @@ void SemanticAnalyzer::ApplyMetricContext(SemanticAtom &atom, const string &what
 
 unique_ptr<ParsedExpression> SemanticAnalyzer::DecomposeMetric(idx_t metric, vector<SemanticAtom> &atoms,
                                                                const string &what) {
-	return Decompose(*model.members[metric].resolved, MetricContext(metric, SemanticMetricContext()), atoms, what);
+	return Decompose(*model.members[metric].resolved, MetricContext(metric, SemanticMetricContext(), what), atoms,
+	                 what);
 }
 
 unique_ptr<ParsedExpression> SemanticAnalyzer::Decompose(const ParsedExpression &expr,
@@ -253,7 +290,7 @@ unique_ptr<ParsedExpression> SemanticAnalyzer::Decompose(const ParsedExpression 
 				throw SemanticDefinitionException("%s cannot reference \"%s\" outside of an aggregate", what,
 				                                  model.MemberDisplayName(ref.index));
 			}
-			node = Decompose(*model.members[ref.index].resolved, MetricContext(ref.index, context), atoms, what);
+			node = Decompose(*model.members[ref.index].resolved, MetricContext(ref.index, context, what), atoms, what);
 			node->alias = alias;
 			return;
 		case SemanticRefKind::COLUMN:
