@@ -8,18 +8,19 @@ statement ok
 PRAGMA enable_verification
 
 statement ok
-CREATE TABLE accounts (account_id INTEGER, workspace_id VARCHAR, customer_segment VARCHAR, country VARCHAR);
+CREATE TABLE accounts (account_id INTEGER, workspace_id VARCHAR, customer_segment VARCHAR, country VARCHAR, created_at DATE);
 
 statement ok
-INSERT INTO accounts VALUES (100, 'ws_001', 'enterprise', 'FR'), (101, 'ws_002', 'startup', 'US'), (102, 'ws_003', 'enterprise', 'DE');
+INSERT INTO accounts VALUES (100, 'ws_001', 'enterprise', 'FR', '2024-01-10'), (101, 'ws_002', 'startup', 'US', '2024-03-01'), (102, 'ws_003', 'enterprise', 'DE', '2024-06-15');
 
 statement ok
-CREATE TABLE invoices (invoice_id INTEGER, account_id INTEGER, invoiced_at DATE, amount DECIMAL(18, 2), refund_amount DECIMAL(18, 2));
+CREATE TABLE invoices (invoice_id INTEGER, account_id INTEGER, invoiced_at DATE, amount DECIMAL(18, 2), refund_amount DECIMAL(18, 2), customer_segment VARCHAR);
 
 statement ok
 INSERT INTO invoices VALUES
-  (10, 100, '2025-09-03', 800, 0), (11, 101, '2025-09-03', 400, 0), (12, 102, '2025-09-20', 600, 60),
-  (1, 100, '2026-09-01', 1000, 0), (2, 101, '2026-09-01', 500, 50), (3, 100, '2026-09-15', 1200, 100), (4, 102, '2026-09-10', 900, 0);
+  (10, 100, '2025-09-03', 800, 0, 'enterprise'), (11, 101, '2025-09-03', 400, 0, 'startup'), (12, 102, '2025-09-20', 600, 60, 'enterprise'),
+  (1, 100, '2026-09-01', 1000, 0, 'enterprise'), (2, 101, '2026-09-01', 500, 50, 'startup'), (3, 100, '2026-09-15', 1200, 100, 'enterprise'),
+  (4, 102, '2026-09-10', 900, 0, 'enterprise');
 
 statement ok
 CREATE TABLE infrastructure_costs (cost_id INTEGER, account_id INTEGER, incurred_at DATE, cost DECIMAL(18, 2));
@@ -66,8 +67,15 @@ CREATE SEMANTIC VIEW finance
     subscriptions (account_id, workspace_id, occurred_at) REFERENCES trials (account_id, workspace_id, ASOF occurred_at)
   )
   DIMENSIONS (
+    account.workspace_id AS workspace_id,
     account.customer_segment AS customer_segment,
     account.country AS country,
+    account.created_at AS created_at,
+    invoices.invoiced_at AS invoiced_at,
+    infra_costs.incurred_at AS incurred_at,
+    events.workspace_id AS workspace_id,
+    events.event_name AS event_name,
+    events.occurred_at AS occurred_at,
     metric_time.day AS date_day,
     metric_time.month AS DATE_TRUNC('month', date_day)::DATE,
     metric_time.year AS DATE_TRUNC('year', date_day)::DATE
@@ -85,8 +93,8 @@ CREATE SEMANTIC VIEW finance
       AS (enterprise_gross_margin - enterprise_gross_margin_ly) / NULLIF(enterprise_gross_margin_ly, 0)
       COMMENT = 'Year-over-year percentage change in gross margin for Enterprise customers. '
                 'Both periods are restricted to Enterprise accounts.',
-    events.trials_started AS COUNT(*) FILTER (WHERE event_name = 'trial_started'),
-    events.subscriptions_started AS COUNT(*) FILTER (WHERE event_name = 'subscription_started'),
+    events.trial_started AS COUNT(*) FILTER (WHERE event_name = 'trial_started'),
+    events.subscription_started AS COUNT(*) FILTER (WHERE event_name = 'subscription_started'),
     PRIVATE trials.trials AS COUNT(*),
     PRIVATE subscriptions.converted_trials
       AS COUNT(DISTINCT trials.event_id) FILTER (WHERE subscriptions.occurred_at <= trials.occurred_at + INTERVAL 14 DAY),
@@ -107,7 +115,7 @@ ORDER BY month, country;
 2026-09-01	US	NULL	NULL	NULL
 
 query IIII
-SELECT * FROM SEMANTIC_VIEW(finance DIMENSIONS metric_time.month METRICS events.trials_started, events.subscriptions_started, enterprise_trial_to_paid_14d)
+SELECT * FROM SEMANTIC_VIEW(finance DIMENSIONS metric_time.month METRICS events.trial_started, events.subscription_started, enterprise_trial_to_paid_14d)
 ORDER BY month;
 ----
 2026-09-01	3	2	0.5
