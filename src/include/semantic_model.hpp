@@ -102,6 +102,8 @@ struct SemanticMember {
 	vector<idx_t> using_relationships;
 	//! NON ADDITIVE BY (...) (metrics only)
 	vector<SemanticNonAdditive> non_additive;
+	//! Resolved FILTER condition (metrics only), or null
+	unique_ptr<ParsedExpression> filter;
 
 	SemanticMemberKind Kind() const {
 		return parsed->kind;

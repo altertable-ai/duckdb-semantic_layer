@@ -27,6 +27,8 @@ struct SemanticMetricContext {
 	vector<idx_t> using_relationships;
 	//! Metric whose NON ADDITIVE BY applies, or INVALID_INDEX
 	idx_t non_additive_member = DConstants::INVALID_INDEX;
+	//! Metrics whose FILTER applies to the aggregates (outer metrics first)
+	vector<idx_t> filters;
 };
 
 //! An aggregate evaluated over the rows of `home`.
@@ -75,6 +77,9 @@ public:
 	unique_ptr<ParsedExpression> DecomposeMetric(idx_t metric, vector<SemanticAtom> &atoms, const string &what);
 	//! Dimensions referenced by the window clauses of a (metric-level) expression, following metric references
 	void WindowDimensions(const ParsedExpression &expr, set<idx_t> &dimensions) const;
+	//! Applies the metric context of a new atom: AND-s the FILTER of every metric of `atom.context.filters` into the
+	//! atom's aggregate, checking the filters' tables are reachable from the atom's home table
+	void ApplyMetricContext(SemanticAtom &atom, const string &what);
 
 private:
 	SemanticMetricContext MetricContext(idx_t metric, const SemanticMetricContext &outer) const;

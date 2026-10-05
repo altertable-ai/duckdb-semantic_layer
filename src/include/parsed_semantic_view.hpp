@@ -87,6 +87,8 @@ struct ParsedSemanticMember {
 	vector<string> labels;
 	vector<string> using_relationships;
 	vector<OrderByNode> non_additive_by;
+	//! FILTER (WHERE <condition>) (metrics only); null when absent
+	unique_ptr<ParsedExpression> filter;
 	unique_ptr<ParsedExpression> expression;
 	vector<string> synonyms;
 	string comment;

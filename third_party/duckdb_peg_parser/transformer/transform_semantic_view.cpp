@@ -265,6 +265,10 @@ vector<ParsedSemanticMember> TransformSemanticMemberClause(PEGTransformer &trans
 		if (member.is_private && kind == SemanticMemberKind::DIMENSION) {
 			throw ParserException("semantic view: dimensions cannot be PRIVATE");
 		}
+		if (kind != SemanticMemberKind::METRIC && member.filter) {
+			throw ParserException("semantic view: FILTER and OFFSET are only allowed on metrics ('%s')",
+			                      member.FullName());
+		}
 		if (member.table.empty() && kind != SemanticMemberKind::METRIC) {
 			throw ParserException("semantic view: %s '%s' must be qualified with its logical table (table.name)",
 			                      StringUtil::Lower(SemanticMemberKindToString(kind)), member.name);
@@ -273,8 +277,8 @@ vector<ParsedSemanticMember> TransformSemanticMemberClause(PEGTransformer &trans
 	return members;
 }
 
-// SemanticVisibility? SemanticMemberName SemanticLabels? SemanticUsing? SemanticNonAdditive? 'AS' Expression
-// SemanticMemberOption*
+// SemanticVisibility? SemanticMemberName SemanticLabels? SemanticUsing? SemanticNonAdditive? SemanticMetricFilter? 'AS'
+// Expression SemanticMemberOption*
 ParsedSemanticMember TransformSemanticMember(PEGTransformer &transformer, optional_ptr<ParseResult> parse_result) {
 	auto &list = List(parse_result);
 	ParsedSemanticMember member;
@@ -298,8 +302,13 @@ ParsedSemanticMember TransformSemanticMember(PEGTransformer &transformer, option
 		member.non_additive_by =
 		    TransformAll<OrderByNode>(transformer, ParenthesizedList(List(Optional(list, 4)).GetChild(3)));
 	}
-	member.expression = transformer.Transform<unique_ptr<ParsedExpression>>(list, 6);
-	for (auto &option_node : Repeated(list.GetChild(7))) {
+	if (Present(list, 5)) {
+		// 'FILTER' Parens('WHERE' Expression)
+		auto body = PEGTransformerFactory::ExtractResultFromParens(List(Optional(list, 5)).GetChild(1));
+		member.filter = transformer.Transform<unique_ptr<ParsedExpression>>(List(body), 1);
+	}
+	member.expression = transformer.Transform<unique_ptr<ParsedExpression>>(list, 7);
+	for (auto &option_node : Repeated(list.GetChild(8))) {
 		auto option = Choice(option_node);
 		auto &option_list = List(option);
 		if (option->name == "SemanticWithSynonyms") {

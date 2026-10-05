@@ -257,6 +257,9 @@ static unique_ptr<FunctionData> DescribeBind(ClientContext &context, TableFuncti
 			add(kind, object, parent, "TABLE", model->tables[member.table].name);
 		}
 		add(kind, object, parent, "EXPRESSION", member.Expression().ToString());
+		if (parsed.filter) {
+			add(kind, object, parent, "FILTER", parsed.filter->ToString());
+		}
 		if (member.type.id() != LogicalTypeId::UNKNOWN) {
 			add(kind, object, parent, "DATA_TYPE", member.type.ToString());
 		}

@@ -41,13 +41,15 @@ SemanticAsof <- 'ASOF'
 SemanticFactsClause <- 'FACTS' Parens(List(SemanticMember))
 SemanticDimensionsClause <- 'DIMENSIONS' Parens(List(SemanticMember))
 SemanticMetricsClause <- 'METRICS' Parens(List(SemanticMember))
-SemanticMember <- SemanticVisibility? SemanticMemberName SemanticLabels? SemanticUsing? SemanticNonAdditive? 'AS' Expression SemanticMemberOption*
+SemanticMember <- SemanticVisibility? SemanticMemberName SemanticLabels? SemanticUsing? SemanticNonAdditive? SemanticMetricFilter? 'AS' Expression SemanticMemberOption*
 SemanticVisibility <- 'PRIVATE' / 'PUBLIC'
 SemanticMemberName <- SemanticQualifiedMemberName / ColId
 SemanticQualifiedMemberName <- ColId '.' ColLabel
 SemanticLabels <- 'LABELS' '=' Parens(List(ColId))
 SemanticUsing <- 'USING' Parens(List(ColId))
 SemanticNonAdditive <- 'NON' 'ADDITIVE' 'BY' Parens(List(OrderByExpression))
+SemanticMetricFilter <- 'FILTER' Parens(SemanticMetricFilterBody)
+SemanticMetricFilterBody <- 'WHERE' Expression
 SemanticMemberOption <- SemanticWithSynonyms / SemanticComment / SemanticTag / SemanticSampleValues / SemanticIsEnum / SemanticCortexSearch
 SemanticWithSynonyms <- 'WITH'? 'SYNONYMS' '='? Parens(List(SemanticString))
 SemanticComment <- 'COMMENT' '=' SemanticString

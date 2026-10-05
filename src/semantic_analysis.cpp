@@ -1,5 +1,6 @@
 #include "semantic_definition_exception.hpp"
 #include "semantic_analysis.hpp"
+#include "semantic_ast_helpers.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/entry_lookup_info.hpp"
@@ -172,7 +173,39 @@ SemanticMetricContext SemanticAnalyzer::MetricContext(idx_t metric, const Semant
 	    member.using_relationships.empty() ? outer.using_relationships : member.using_relationships;
 	std::sort(result.using_relationships.begin(), result.using_relationships.end());
 	result.non_additive_member = member.non_additive.empty() ? outer.non_additive_member : metric;
+	result.filters = outer.filters;
+	if (member.filter) {
+		result.filters.push_back(metric);
+	}
 	return result;
+}
+
+void SemanticAnalyzer::ApplyMetricContext(SemanticAtom &atom, const string &what) {
+	if (atom.context.filters.empty()) {
+		return;
+	}
+	auto &aggregate = atom.aggregate->Cast<FunctionExpression>();
+	auto description = aggregate.ToString();
+	vector<unique_ptr<ParsedExpression>> conditions;
+	if (aggregate.filter) {
+		conditions.push_back(std::move(aggregate.filter));
+	}
+	for (auto metric : atom.context.filters) {
+		auto &filter = *model.members[metric].filter;
+		set<idx_t> tables;
+		RowTables(filter, DConstants::INVALID_INDEX, tables, what);
+		for (auto table : tables) {
+			if (!model.Reaches(atom.home, table)) {
+				throw SemanticDefinitionException(
+				    "%s: FILTER of metric \"%s\" references logical table \"%s\", which is not reachable from \"%s\" "
+				    "(aggregated by %s)",
+				    what, model.MemberDisplayName(metric), model.tables[table].name, model.tables[atom.home].name,
+				    description);
+			}
+		}
+		conditions.push_back(filter.Copy());
+	}
+	aggregate.filter = AndAll(std::move(conditions));
 }
 
 unique_ptr<ParsedExpression> SemanticAnalyzer::DecomposeMetric(idx_t metric, vector<SemanticAtom> &atoms,
@@ -192,6 +225,7 @@ unique_ptr<ParsedExpression> SemanticAnalyzer::Decompose(const ParsedExpression 
 			atom.home = AggregateHome(node->Cast<FunctionExpression>(), context.table, what);
 			atom.aggregate = node->Copy();
 			atom.context = context;
+			ApplyMetricContext(atom, what);
 			atoms.push_back(std::move(atom));
 			node = SemanticMarkers::Atom(atoms.size() - 1);
 			node->alias = alias;

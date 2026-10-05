@@ -358,6 +358,9 @@ private:
 			if (!parsed.non_additive_by.empty() && member.Kind() != SemanticMemberKind::METRIC) {
 				Fail("NON ADDITIVE BY is only allowed on metrics (\"%s\")", parsed.FullName());
 			}
+			if (parsed.filter && member.Kind() != SemanticMemberKind::METRIC) {
+				Fail("FILTER is only allowed on metrics (\"%s\")", parsed.FullName());
+			}
 			model->members.push_back(std::move(member));
 		}
 	}
@@ -397,6 +400,11 @@ private:
 					    entry.type == OrderType::ASCENDING ? OrderByNullType::NULLS_LAST : OrderByNullType::NULLS_FIRST;
 				}
 				member.non_additive.push_back(std::move(entry));
+			}
+			if (member.parsed->filter) {
+				resolve_context.self_member = DConstants::INVALID_INDEX;
+				resolve_context.what = What(m) + " FILTER";
+				member.filter = model->Resolve(*member.parsed->filter, resolve_context);
 			}
 		}
 	}
@@ -501,6 +509,10 @@ private:
 
 	void CheckMetric(SemanticAnalyzer &analyzer, idx_t m, const string &what) {
 		auto &member = model->members[m];
+		if (member.filter &&
+		    (analyzer.ContainsAggregateOrMetric(*member.filter) || SemanticAnalyzer::ContainsWindow(*member.filter))) {
+			Fail("%s: FILTER must be a row-level condition (dimensions, facts and columns only)", what);
+		}
 		if (SemanticAnalyzer::ContainsWindow(*member.resolved)) {
 			set<idx_t> dimensions;
 			analyzer.WindowDimensions(*member.resolved, dimensions);
