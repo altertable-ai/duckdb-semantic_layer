@@ -11,9 +11,26 @@
 
 #pragma once
 
+#include "semantic_expression_compiler.hpp"
 #include "semantic_query_compiler.hpp"
 
 namespace duckdb {
+
+//! Reads the columns of `offsets` (SemanticModel::offsets) shifted, in order
+class SemanticOffsetMap : public SemanticColumnMap {
+public:
+	SemanticOffsetMap(const SemanticModel &model, const vector<idx_t> &offsets) : model(model), offsets(offsets) {
+	}
+	unique_ptr<ParsedExpression> Column(idx_t table, const string &column,
+	                                    unique_ptr<ParsedExpression> compiled) override;
+
+private:
+	const SemanticModel &model;
+	const vector<idx_t> &offsets;
+};
+
+//! Whether row-level expression `expr` reads column `column` of logical table `table` (following row-level members)
+bool SemanticReadsColumn(const SemanticModel &model, const ParsedExpression &expr, idx_t table, const string &column);
 
 //! `CAST(<column> + <interval> AS <type>)`: `column` read shifted by `offset`
 unique_ptr<ParsedExpression> SemanticShiftColumn(unique_ptr<ParsedExpression> column, const SemanticOffset &offset);

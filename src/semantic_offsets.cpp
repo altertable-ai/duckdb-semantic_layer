@@ -15,6 +15,17 @@ unique_ptr<ParsedExpression> SemanticShiftColumn(unique_ptr<ParsedExpression> co
 	return make_uniq<CastExpression>(offset.type, std::move(sum));
 }
 
+unique_ptr<ParsedExpression> SemanticOffsetMap::Column(idx_t table, const string &column,
+                                                       unique_ptr<ParsedExpression> compiled) {
+	for (auto o : offsets) {
+		auto &offset = model.offsets[o];
+		if (offset.table == table && StringUtil::CIEquals(offset.column, column)) {
+			compiled = SemanticShiftColumn(std::move(compiled), offset);
+		}
+	}
+	return compiled;
+}
+
 //! Columns read by a row-level expression, following row-level members
 static void CollectColumns(const SemanticModel &model, const ParsedExpression &expr, vector<SemanticRef> &columns) {
 	auto ref = SemanticMarkers::Classify(expr);
@@ -30,6 +41,17 @@ static void CollectColumns(const SemanticModel &model, const ParsedExpression &e
 	}
 	ParsedExpressionIterator::EnumerateChildren(
 	    expr, [&](const ParsedExpression &child) { CollectColumns(model, child, columns); });
+}
+
+bool SemanticReadsColumn(const SemanticModel &model, const ParsedExpression &expr, idx_t table, const string &column) {
+	vector<SemanticRef> columns;
+	CollectColumns(model, expr, columns);
+	for (auto &read : columns) {
+		if (read.index == table && StringUtil::CIEquals(read.column, column)) {
+			return true;
+		}
+	}
+	return false;
 }
 
 void CheckSemanticOffsetReads(const SemanticModel &model, SemanticAnalyzer &analyzer, const SemanticQuerySpec &spec) {

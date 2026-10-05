@@ -12,18 +12,26 @@ namespace duckdb {
 
 unique_ptr<ParsedExpression> SemanticExpressionCompiler::Row(const ParsedExpression &expr, SemanticJoinScope &scope,
                                                              idx_t context_table, const string &what) {
-	return CompileRow(expr, scope, context_table, what, vector<idx_t>());
+	SemanticColumnMap identity;
+	return CompileRow(expr, scope, context_table, what, identity);
+}
+
+unique_ptr<ParsedExpression> SemanticExpressionCompiler::MappedRow(const ParsedExpression &expr,
+                                                                   SemanticJoinScope &scope, const string &what,
+                                                                   SemanticColumnMap &map) {
+	return CompileRow(expr, scope, DConstants::INVALID_INDEX, what, map);
 }
 
 unique_ptr<ParsedExpression> SemanticExpressionCompiler::ShiftedRow(const ParsedExpression &expr,
                                                                     SemanticJoinScope &scope, const string &what,
                                                                     const vector<idx_t> &offsets) {
-	return CompileRow(expr, scope, DConstants::INVALID_INDEX, what, offsets);
+	SemanticOffsetMap map(model, offsets);
+	return MappedRow(expr, scope, what, map);
 }
 
 unique_ptr<ParsedExpression> SemanticExpressionCompiler::CompileRow(const ParsedExpression &expr,
                                                                     SemanticJoinScope &scope, idx_t context_table,
-                                                                    const string &what, const vector<idx_t> &offsets) {
+                                                                    const string &what, SemanticColumnMap &map) {
 	auto dependencies = scope.Dependencies();
 	if (dependencies && expr.GetExpressionClass() == ExpressionClass::SUBQUERY) {
 		dependencies->complete = false;
@@ -50,33 +58,27 @@ unique_ptr<ParsedExpression> SemanticExpressionCompiler::CompileRow(const Parsed
 	auto ref = SemanticMarkers::Classify(expr);
 	unique_ptr<ParsedExpression> result;
 	if (ref.Is(SemanticRefKind::COLUMN)) {
-		result = scope.ColumnReference(ref.index, ref.column);
-		for (auto o : offsets) {
-			auto &offset = model.offsets[o];
-			if (offset.table == ref.index && StringUtil::CIEquals(offset.column, ref.column)) {
-				result = SemanticShiftColumn(std::move(result), offset);
-			}
-		}
+		result = map.Column(ref.index, ref.column, scope.ColumnReference(ref.index, ref.column));
 	} else if (ref.Is(SemanticRefKind::MEMBER) && model.members[ref.index].IsRowLevel()) {
 		auto &member = model.members[ref.index];
-		result = CompileRow(*member.resolved, scope, member.table, what, offsets);
+		result = CompileRow(*member.resolved, scope, member.table, what, map);
 	} else if (ref.Is(SemanticRefKind::MEMBER)) {
 		// a metric in a row-level expression: aggregate the finer rows belonging to the current row
 		vector<SemanticAtom> atoms;
 		auto post = analyzer.DecomposeMetric(ref.index, atoms, what);
-		result =
-		    ReplaceAtoms(*post, [&](idx_t atom) { return ChildAggregate(atoms[atom], context_table, scope, what); });
+		result = map.ChildAggregation(
+		    ReplaceAtoms(*post, [&](idx_t atom) { return ChildAggregate(atoms[atom], context_table, scope, what); }));
 	} else if (analyzer.IsAggregate(expr)) {
 		SemanticAtom atom;
 		atom.home = analyzer.AggregateHome(expr.Cast<FunctionExpression>(), context_table, what);
 		atom.aggregate = expr.Copy();
 		atom.context.table = context_table;
 		atom.context.using_relationships = scope.UsingRelationships();
-		result = ChildAggregate(atom, context_table, scope, what);
+		result = map.ChildAggregation(ChildAggregate(atom, context_table, scope, what));
 	} else {
 		result = expr.Copy();
 		ParsedExpressionIterator::EnumerateChildren(*result, [&](unique_ptr<ParsedExpression> &child) {
-			child = CompileRow(*child, scope, context_table, what, offsets);
+			child = CompileRow(*child, scope, context_table, what, map);
 		});
 		return result;
 	}

@@ -6,6 +6,21 @@
 
 namespace duckdb {
 
+//! Rewrites what a row-level expression reads, while SemanticExpressionCompiler compiles it (identity by default)
+class SemanticColumnMap {
+public:
+	virtual ~SemanticColumnMap() = default;
+	//! `compiled`: the reference to column `column` of logical table `table`
+	virtual unique_ptr<ParsedExpression> Column(idx_t table, const string &column,
+	                                            unique_ptr<ParsedExpression> compiled) {
+		return compiled;
+	}
+	//! `compiled`: a child aggregation (correlated scalar subquery, or an expression over several)
+	virtual unique_ptr<ParsedExpression> ChildAggregation(unique_ptr<ParsedExpression> compiled) {
+		return compiled;
+	}
+};
+
 class SemanticExpressionCompiler {
 public:
 	SemanticExpressionCompiler(const SemanticModel &model, SemanticAnalyzer &analyzer)
@@ -14,6 +29,9 @@ public:
 	//! A row-level expression, evaluated per row of `scope`'s base in the row context of `context_table`
 	unique_ptr<ParsedExpression> Row(const ParsedExpression &expr, SemanticJoinScope &scope, idx_t context_table,
 	                                 const string &what);
+	//! A query dimension or WHERE condition (view level) whose column reads and child aggregations go through `map`
+	unique_ptr<ParsedExpression> MappedRow(const ParsedExpression &expr, SemanticJoinScope &scope, const string &what,
+	                                       SemanticColumnMap &map);
 	//! A query dimension or WHERE condition in an aggregation block: Row() with the column reads shifted by the block's
 	//! `offsets` (SemanticModel::offsets). The block's aggregates, FILTERs and NON ADDITIVE BY are not shifted.
 	unique_ptr<ParsedExpression> ShiftedRow(const ParsedExpression &expr, SemanticJoinScope &scope, const string &what,
@@ -36,7 +54,7 @@ public:
 
 private:
 	unique_ptr<ParsedExpression> CompileRow(const ParsedExpression &expr, SemanticJoinScope &scope, idx_t context_table,
-	                                        const string &what, const vector<idx_t> &offsets);
+	                                        const string &what, SemanticColumnMap &map);
 	unique_ptr<ParsedExpression> ChildAggregate(const SemanticAtom &atom, idx_t context, SemanticJoinScope &outer,
 	                                            const string &what);
 	const SemanticModel &model;
