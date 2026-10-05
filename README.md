@@ -198,6 +198,8 @@ table's primary key, or to its only unique key. Unnamed relationships get a gene
 [ PRIVATE | PUBLIC ] [ <table>. ]<metric>
   [ USING ( <relationship> [, ...] ) ]
   [ NON ADDITIVE BY ( <dimension> [ ASC | DESC ] [ NULLS { FIRST | LAST } ] [, ...] ) ]
+  [ FILTER ( WHERE <condition> ) ]
+  [ OFFSET ( <dimension> BY <interval> ) ]
   AS <expression> [ WITH SYNONYMS ( ... ) ] [ COMMENT = '<text>' ]
 ```
 
@@ -316,6 +318,38 @@ METRICS (accounts.balance NON ADDITIVE BY (dates.day) AS SUM(balance))
 
 Balances and inventory levels must not be summed over time. Within every group, a semi-additive metric only
 aggregates the rows of the last snapshot in the given order.
+
+### Metric filters (`FILTER`)
+
+```sql
+METRICS (
+  invoices.revenue AS SUM(amount),
+  costs.cost       AS SUM(cost),
+  margin AS (invoices.revenue - costs.cost) / invoices.revenue,
+  enterprise_margin FILTER (WHERE accounts.segment = 'enterprise') AS margin
+)
+```
+
+A metric filter restricts the rows of every aggregate the metric is computed from, including the aggregates of the
+metrics it references (here both the revenue and the cost). Filters of nested metrics combine with `AND`. The condition
+is row-level (dimensions, facts and columns), and every table it reads must be reachable from the table of each
+aggregate it applies to. A filtered metric is an ordinary aggregate with a `FILTER` clause, so it can be materialized.
+
+### Time offsets (`OFFSET`)
+
+```sql
+METRICS (
+  margin_ly OFFSET (dates.day BY INTERVAL 1 YEAR) AS margin,
+  margin_growth AS (margin - margin_ly) / NULLIF(margin_ly, 0)
+)
+```
+
+For a group dated *t*, an offset metric is computed from the rows dated *t − interval* (a negative interval looks
+forward). The dimension must be defined as a column of its table (typically the day of a date table that every fact
+table references); every dimension computed from that column moves with it, so the offset works at any grain
+(`dates.month`, `dates.year`, ...), and a `WHERE` on time selects the previous period's rows. The metric's own definition
+(its aggregates and filters) reads the stored values. Offsets of nested metrics add up. Offset metrics cannot be
+materialized (the other metrics of a query still read materializations) or referenced by facts and dimensions.
 
 ### Time-dependent and range relationships
 
@@ -441,7 +475,8 @@ requires writable storage. DDL stages its storage changes before publishing the 
 build or storage update leaves the registered view intact. Tables and metadata change together in each storage
 database. Changes spanning multiple databases prepare all operations before committing each database separately.
 
-Materializations cannot include semi-additive metrics or dimensions reached through a many-to-many bridge.
+Materializations cannot include semi-additive metrics, offset metrics (`OFFSET`) or dimensions reached through a
+many-to-many bridge.
 
 ## Managing and inspecting semantic views
 
@@ -580,6 +615,8 @@ SERVICE`, `AI_SQL_GENERATION`, `AI_QUESTION_CATEGORIZATION`, `AI_VERIFIED_QUERIE
 - `REFRESH MATERIALIZATION` accepts an explicit `AUTO`, `FULL` or `INCREMENTAL` mode, and `ADD MATERIALIZATION` a
   storage database (`IN`).
 - Expressions may reference physical columns of other logical tables directly (Snowflake requires a fact).
+- Metric `FILTER (WHERE ...)` and `OFFSET (<dimension> BY <interval>)` clauses are extensions; adjacent string literals
+  in DDL are concatenated.
 
 ## License
 
