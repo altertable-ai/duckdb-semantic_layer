@@ -751,10 +751,11 @@ private:
 			}
 		}
 		vector<SemanticAtom> atoms;
-		analyzer.DecomposeMetric(m, atoms, what);
+		auto post = analyzer.DecomposeMetric(m, atoms, what);
+		// AVERAGE averages each aggregate: only a metric that is a single aggregate has its value averaged
 		if (member.cumulative.IsValid() &&
 		    model->cumulatives[member.cumulative.GetIndex()].period == SemanticCumulativePeriod::AVERAGE &&
-		    atoms.size() != 1) {
+		    (atoms.size() != 1 || !SemanticMarkers::Classify(*post).Is(SemanticRefKind::ATOM))) {
 			Fail("%s: CUMULATIVE ... AVERAGE requires a metric computed from a single aggregate (averaging each "
 			     "aggregate of an expression would not average its value)",
 			     what);

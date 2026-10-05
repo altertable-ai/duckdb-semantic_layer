@@ -387,6 +387,9 @@ anchors whose windows still read 2023), and other columns of a date table cannot
   materializations).
 - Decomposable aggregates (`SUM`, `COUNT`, `AVG`, `MIN`, `MAX`) and `DISTINCT` aggregates are pre-aggregated by date
   before the windows are joined; other aggregates (`MEDIAN`, ...) read every row once per anchor in its window.
+  Anchors are the distinct values of the column: over a fine-grained column (a timestamp of a large fact table), a
+  running total or to-date window joins each value to every later one, which grows quadratically. Use the day of a
+  date table, or a day-grain dimension, for those windows.
 
 ### Time-dependent and range relationships
 

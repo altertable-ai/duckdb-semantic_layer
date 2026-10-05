@@ -26,21 +26,46 @@ unique_ptr<ParsedExpression> SemanticOffsetMap::Column(idx_t table, const string
 	return compiled;
 }
 
-//! Columns read by a row-level expression, following row-level members
-static void CollectColumns(const SemanticModel &model, const ParsedExpression &expr, vector<SemanticRef> &columns) {
+//! Columns read by a row-level expression, following row-level members. With `analyzer`, a member aggregating the
+//! rows that belong to its row also reads that row: a column without name of the member's table.
+static void CollectColumns(const SemanticModel &model, const ParsedExpression &expr, vector<SemanticRef> &columns,
+                           optional_ptr<SemanticAnalyzer> analyzer = nullptr) {
 	auto ref = SemanticMarkers::Classify(expr);
 	if (ref.Is(SemanticRefKind::COLUMN)) {
 		columns.push_back(ref);
 		return;
 	}
 	if (ref.Is(SemanticRefKind::MEMBER)) {
-		if (model.members[ref.index].IsRowLevel()) {
-			CollectColumns(model, *model.members[ref.index].resolved, columns);
+		auto &member = model.members[ref.index];
+		if (member.IsRowLevel()) {
+			if (analyzer && analyzer->ContainsAggregateOrMetric(*member.resolved)) {
+				SemanticRef row;
+				row.kind = SemanticRefKind::COLUMN;
+				row.index = member.table;
+				columns.push_back(row);
+			}
+			CollectColumns(model, *member.resolved, columns, analyzer);
 		}
 		return;
 	}
 	ParsedExpressionIterator::EnumerateChildren(
-	    expr, [&](const ParsedExpression &child) { CollectColumns(model, child, columns); });
+	    expr, [&](const ParsedExpression &child) { CollectColumns(model, child, columns, analyzer); });
+}
+
+//! Whether `read` moves with column `column` of table `table` in a block over `home`: it is that column, or it reads
+//! neither that table (other than through the column) nor a table reached through it
+static bool MovesWith(const SemanticModel &model, const SemanticRef &read, idx_t table, const string &column,
+                      idx_t home) {
+	if (read.index == table) {
+		return table == home || (!read.column.empty() && StringUtil::CIEquals(read.column, column));
+	}
+	return read.index == home || !model.Reaches(table, read.index);
+}
+
+//! "dates.d_year", or the table of an aggregation
+static string ReadName(const SemanticModel &model, const SemanticRef &read) {
+	auto &table = model.tables[read.index].name;
+	return read.column.empty() ? "an aggregation on \"" + table + "\"" : "column \"" + table + "." + read.column + "\"";
 }
 
 bool SemanticReadsColumn(const SemanticModel &model, const ParsedExpression &expr, idx_t table, const string &column) {
@@ -63,12 +88,12 @@ void CheckSemanticTimeReads(const SemanticModel &model, SemanticAnalyzer &analyz
 	for (auto &item : spec.items) {
 		if (item.kind == SemanticMemberKind::DIMENSION) {
 			reads.push_back(Read {SemanticItemWhat(item), {}});
-			CollectColumns(model, *item.resolved, reads.back().columns);
+			CollectColumns(model, *item.resolved, reads.back().columns, analyzer);
 		}
 	}
 	if (spec.where) {
 		reads.push_back(Read {"Invalid WHERE clause", {}});
-		CollectColumns(model, *spec.where, reads.back().columns);
+		CollectColumns(model, *spec.where, reads.back().columns, analyzer);
 	}
 	for (auto &item : spec.items) {
 		if (item.kind != SemanticMemberKind::METRIC) {
@@ -81,12 +106,11 @@ void CheckSemanticTimeReads(const SemanticModel &model, SemanticAnalyzer &analyz
 				auto &cumulative = model.cumulatives[atom.context.cumulative];
 				for (auto &read : reads) {
 					for (auto &column : read.columns) {
-						if (column.index == cumulative.table && cumulative.table != atom.home &&
-						    !StringUtil::CIEquals(column.column, cumulative.column)) {
+						if (!MovesWith(model, column, cumulative.table, cumulative.column, atom.home)) {
 							throw SemanticDefinitionException(
-							    "%s: column \"%s.%s\" would not move with the CUMULATIVE anchor date of metric \"%s\" "
-							    "(only \"%s\" and expressions computed from it do)",
-							    read.what, model.tables[cumulative.table].name, column.column, item.output_name,
+							    "%s: %s would not move with the CUMULATIVE anchor date of metric \"%s\" (only \"%s\" "
+							    "and expressions computed from it do)",
+							    read.what, ReadName(model, column), item.output_name,
 							    model.MemberDisplayName(cumulative.dimension));
 						}
 					}
@@ -97,16 +121,13 @@ void CheckSemanticTimeReads(const SemanticModel &model, SemanticAnalyzer &analyz
 				bool shifted = false;
 				for (auto &read : reads) {
 					for (auto &column : read.columns) {
-						if (column.index != offset.table) {
-							continue;
-						}
-						if (StringUtil::CIEquals(column.column, offset.column)) {
+						if (column.index == offset.table && StringUtil::CIEquals(column.column, offset.column)) {
 							shifted = true;
-						} else if (offset.table != atom.home) {
+						} else if (!MovesWith(model, column, offset.table, offset.column, atom.home)) {
 							throw SemanticDefinitionException(
-							    "%s: column \"%s.%s\" would not be shifted by the OFFSET of metric \"%s\" (only "
-							    "\"%s\" and expressions computed from it are)",
-							    read.what, model.tables[offset.table].name, column.column, item.output_name,
+							    "%s: %s would not be shifted by the OFFSET of metric \"%s\" (only \"%s\" and "
+							    "expressions computed from it are)",
+							    read.what, ReadName(model, column), item.output_name,
 							    model.MemberDisplayName(offset.dimension));
 						}
 					}

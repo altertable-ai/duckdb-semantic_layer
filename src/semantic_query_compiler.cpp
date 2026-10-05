@@ -578,11 +578,13 @@ private:
 			auto bridged = bridges.Dimension(resolved, DimensionColumn(d), what);
 			parts.dimensions.push_back(bridged ? anchor_map.Leaf(std::move(bridged))
 			                                   : compiler.MappedRow(resolved, scope, what, anchor_map));
+			// one anchor per dimension tuple, unless an OFFSET maps several anchors to one date (month ends)
 			auto ref = SemanticMarkers::Classify(resolved);
-			parts.dimension_is_anchor = parts.dimension_is_anchor ||
-			                            (ref.Is(SemanticRefKind::MEMBER) && ref.index == cumulative.dimension) ||
-			                            (ref.Is(SemanticRefKind::COLUMN) && ref.index == cumulative.table &&
-			                             StringUtil::CIEquals(ref.column, cumulative.column));
+			parts.dimension_is_anchor =
+			    parts.dimension_is_anchor ||
+			    (block.key.offsets.empty() && ((ref.Is(SemanticRefKind::MEMBER) && ref.index == cumulative.dimension) ||
+			                                   (ref.Is(SemanticRefKind::COLUMN) && ref.index == cumulative.table &&
+			                                    StringUtil::CIEquals(ref.column, cumulative.column))));
 		}
 		parts.aggregates = ExtractAggregates(block, scope, rows);
 		vector<unique_ptr<ParsedExpression>> conditions;

@@ -582,3 +582,73 @@ WITH s AS (
 SELECT count(*) FROM ((SELECT * FROM s EXCEPT ALL SELECT * FROM r) UNION ALL (SELECT * FROM r EXCEPT ALL SELECT * FROM s));
 ----
 0
+
+# OFFSET by a month maps several anchors to one date (Jan 29, 30 and 31 + 1 month = Feb 28): LAST still picks one
+statement ok
+CREATE TABLE clamp_dates AS SELECT range::DATE AS day FROM range(DATE '2026-01-01', DATE '2026-04-01', INTERVAL 1 DAY);
+
+statement ok
+CREATE TABLE clamp_events (event_id INTEGER, event_date DATE, amount INTEGER);
+
+statement ok
+INSERT INTO clamp_events VALUES (1, '2026-01-29', 1), (2, '2026-01-30', 2), (3, '2026-01-31', 4), (4, '2026-03-31', 8);
+
+statement ok
+CREATE SEMANTIC VIEW clamp TABLES (dates AS clamp_dates PRIMARY KEY (day), events AS clamp_events PRIMARY KEY (event_id))
+  RELATIONSHIPS (events (event_date) REFERENCES dates) DIMENSIONS (dates.day AS day)
+  METRICS (
+    events.revenue AS SUM(amount),
+    events.rev_1d CUMULATIVE (dates.day OVER INTERVAL 1 DAY) AS SUM(amount),
+    events.rev_1d_lm OFFSET (dates.day BY INTERVAL 1 MONTH) AS rev_1d
+  );
+
+query II
+SELECT * FROM SEMANTIC_VIEW(clamp DIMENSIONS dates.day METRICS events.rev_1d_lm WHERE dates.day = DATE '2026-02-28');
+----
+2026-02-28	4
+
+query III
+SELECT * FROM SEMANTIC_VIEW(clamp DIMENSIONS dates.day METRICS events.rev_1d_lm, events.revenue WHERE dates.day = DATE '2026-02-28');
+----
+2026-02-28	4	NULL
+
+# tables reached through the date table, and aggregations on it, do not move with the anchor either
+statement ok
+CREATE TABLE cal_months (month_start DATE, label VARCHAR);
+
+statement ok
+INSERT INTO cal_months VALUES ('2026-01-01', 'Jan'), ('2026-02-01', 'Feb'), ('2026-03-01', 'Mar');
+
+statement ok
+CREATE TABLE cal_days AS SELECT range::DATE AS day, date_trunc('month', range)::DATE AS month_start FROM range(DATE '2026-01-01', DATE '2026-04-01', INTERVAL 1 DAY);
+
+statement ok
+CREATE SEMANTIC VIEW calendar
+  TABLES (months AS cal_months PRIMARY KEY (month_start), dates AS cal_days PRIMARY KEY (day), events PRIMARY KEY (event_id))
+  RELATIONSHIPS (events (event_date) REFERENCES dates, dates (month_start) REFERENCES months)
+  DIMENSIONS (dates.day AS day, dates.month AS date_trunc('month', day), dates.event_count AS COUNT(events.event_id), months.label AS label)
+  METRICS (events.revenue_total CUMULATIVE (dates.day) AS SUM(amount));
+
+query II
+SELECT * FROM SEMANTIC_VIEW(calendar DIMENSIONS dates.month METRICS events.revenue_total) ORDER BY month;
+----
+2026-01-01 00:00:00	210
+2026-02-01 00:00:00	360
+2026-03-01 00:00:00	450
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(calendar DIMENSIONS months.label METRICS events.revenue_total);
+----
+would not move with the CUMULATIVE anchor date of metric "revenue_total"
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(calendar DIMENSIONS dates.event_count METRICS events.revenue_total);
+----
+would not move with the CUMULATIVE anchor date of metric "revenue_total"
+
+# AVERAGE averages the metric's value: only a bare aggregate qualifies
+statement error
+CREATE SEMANTIC VIEW bad TABLES (dates PRIMARY KEY (day), events PRIMARY KEY (event_id)) RELATIONSHIPS (events (event_date) REFERENCES dates)
+  DIMENSIONS (dates.day AS day) METRICS (events.x CUMULATIVE (dates.day AVERAGE) AS SQRT(SUM(amount)));
+----
+AVERAGE requires a metric computed from a single aggregate
