@@ -199,14 +199,9 @@ void SemanticAnalyzer::ApplyMetricContext(SemanticAtom &atom, const string &what
 	}
 	auto &aggregate = atom.aggregate->Cast<FunctionExpression>();
 	auto description = aggregate.ToString();
-	vector<unique_ptr<ParsedExpression>> conditions;
-	if (aggregate.filter) {
-		conditions.push_back(std::move(aggregate.filter));
-	}
 	for (auto metric : atom.context.filters) {
-		auto &filter = *model.members[metric].filter;
 		set<idx_t> tables;
-		RowTables(filter, DConstants::INVALID_INDEX, tables, what);
+		RowTables(*model.members[metric].filter, DConstants::INVALID_INDEX, tables, what);
 		for (auto table : tables) {
 			if (!model.Reaches(atom.home, table)) {
 				throw SemanticDefinitionException(
@@ -216,9 +211,21 @@ void SemanticAnalyzer::ApplyMetricContext(SemanticAtom &atom, const string &what
 				    description);
 			}
 		}
-		conditions.push_back(filter.Copy());
+	}
+	if (atom.context.non_additive_member != DConstants::INVALID_INDEX) {
+		// the last snapshot is picked among the filtered rows: the filters stay in the context and filter the block's
+		// rows (semantic_query_compiler.cpp)
+		return;
+	}
+	vector<unique_ptr<ParsedExpression>> conditions;
+	if (aggregate.filter) {
+		conditions.push_back(std::move(aggregate.filter));
+	}
+	for (auto metric : atom.context.filters) {
+		conditions.push_back(model.members[metric].filter->Copy());
 	}
 	aggregate.filter = AndAll(std::move(conditions));
+	atom.context.filters.clear();
 }
 
 unique_ptr<ParsedExpression> SemanticAnalyzer::DecomposeMetric(idx_t metric, vector<SemanticAtom> &atoms,

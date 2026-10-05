@@ -106,6 +106,9 @@ struct SemanticCompileOptions {
 	SemanticMaterializationProvider *materializations = nullptr;
 	//! State queries only: an extra row filter
 	SemanticRowFilter row_filter;
+	//! Type probes and materialization planning: OFFSET metrics may be compiled without a dimension or WHERE
+	//! condition computed from their offset column
+	bool allow_unshifted_offsets = false;
 };
 
 class SemanticQueryCompiler {

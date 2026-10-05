@@ -193,3 +193,40 @@ CREATE SEMANTIC VIEW bad TABLES (invoices PRIMARY KEY (invoice_id))
   DIMENSIONS (invoices.year FILTER (WHERE amount > 1) AS year(invoiced_at));
 ----
 FILTER and OFFSET are only allowed on metrics
+
+# a cycle through a metric filter is reported, like any circular reference
+statement error
+CREATE SEMANTIC VIEW bad TABLES (account AS accounts PRIMARY KEY (account_id), invoices PRIMARY KEY (invoice_id))
+  RELATIONSHIPS (invoices (account_id) REFERENCES account)
+  FACTS (account.ltv AS invoices.big_revenue)
+  DIMENSIONS (account.big AS ltv > 1000)
+  METRICS (invoices.big_revenue FILTER (WHERE account.big) AS SUM(amount));
+----
+Circular reference
+
+# semi-additive metrics: the filter applies before the last snapshot is picked, like a query WHERE
+statement ok
+CREATE TABLE snapshots (id INTEGER, account_id INTEGER, snapshot_date DATE, balance INTEGER);
+
+statement ok
+INSERT INTO snapshots VALUES (1, 1, '2025-01-10', 100), (2, 1, '2025-01-20', 150), (3, 2, '2025-01-31', 50);
+
+statement ok
+CREATE SEMANTIC VIEW balances
+  TABLES (account AS accounts PRIMARY KEY (account_id), s AS snapshots PRIMARY KEY (id))
+  RELATIONSHIPS (s (account_id) REFERENCES account)
+  DIMENSIONS (s.day AS snapshot_date, s.month AS DATE_TRUNC('month', snapshot_date)::DATE, account.segment AS segment)
+  METRICS (
+    s.balance NON ADDITIVE BY (s.day) AS SUM(balance),
+    s.enterprise_balance FILTER (WHERE account.segment = 'enterprise') AS balance
+  );
+
+query III
+SELECT * FROM SEMANTIC_VIEW(balances DIMENSIONS s.month METRICS s.balance, s.enterprise_balance);
+----
+2025-01-01	50	150
+
+query II
+SELECT * FROM SEMANTIC_VIEW(balances DIMENSIONS s.month METRICS s.balance WHERE account.segment = 'enterprise');
+----
+2025-01-01	150

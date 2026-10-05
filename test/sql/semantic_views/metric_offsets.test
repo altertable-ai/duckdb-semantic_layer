@@ -116,11 +116,89 @@ SELECT * FROM SEMANTIC_VIEW(ledger METRICS invoices.revenue, invoices.revenue_ly
 ----
 3850	2100
 
-# without a time dimension or filter, nothing is shifted out
-query II
+# an offset metric needs a dimension or WHERE condition computed from its offset column
+statement error
 SELECT * FROM SEMANTIC_VIEW(ledger METRICS invoices.revenue, invoices.revenue_ly);
 ----
-5950	5950
+must be queried with a dimension or WHERE condition computed from "t.day"
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS invoices.invoice_month METRICS invoices.revenue_ly);
+----
+must be queried with a dimension or WHERE condition computed from "t.day"
+
+# other columns of the offset dimension's table (a stored year) would not be shifted
+statement ok
+CREATE TABLE date_dim AS SELECT day AS d_date, year(day) AS d_year FROM spine;
+
+statement ok
+CREATE SEMANTIC VIEW stored_year
+  TABLES (d AS date_dim PRIMARY KEY (d_date), invoices PRIMARY KEY (invoice_id))
+  RELATIONSHIPS (invoices (invoiced_at) REFERENCES d)
+  DIMENSIONS (d.date AS d_date, d.year AS d_year, d.computed_year AS year(d_date))
+  METRICS (invoices.revenue AS SUM(amount), invoices.revenue_ly OFFSET (d.date BY INTERVAL 1 YEAR) AS revenue);
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(stored_year DIMENSIONS d.year METRICS invoices.revenue_ly);
+----
+would not be shifted
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(stored_year DIMENSIONS d.computed_year METRICS invoices.revenue_ly WHERE d.year = 2026);
+----
+would not be shifted
+
+query II
+SELECT * FROM SEMANTIC_VIEW(stored_year DIMENSIONS d.computed_year METRICS invoices.revenue_ly) ORDER BY computed_year;
+----
+2026	2100
+2027	3850
+
+# conditions and dimensions reached through a many-to-many bridge are shifted too
+statement ok
+CREATE TABLE orders (order_id INTEGER, order_date DATE);
+
+statement ok
+INSERT INTO orders VALUES (1, '2025-03-01'), (2, '2026-03-01'), (3, '2026-04-01');
+
+statement ok
+CREATE TABLE order_lines (order_id INTEGER, line_no INTEGER, amount INTEGER);
+
+statement ok
+INSERT INTO order_lines VALUES (1, 1, 10), (1, 2, 20), (2, 1, 100), (3, 1, 1000);
+
+statement ok
+CREATE TABLE promos (promo_id INTEGER, code VARCHAR);
+
+statement ok
+INSERT INTO promos VALUES (1, 'X'), (2, 'Y');
+
+statement ok
+CREATE TABLE order_promos (order_id INTEGER, promo_id INTEGER);
+
+statement ok
+INSERT INTO order_promos VALUES (1, 1), (2, 2), (3, 2);
+
+statement ok
+CREATE SEMANTIC VIEW promo_sales
+  TABLES (orders PRIMARY KEY (order_id), lines AS order_lines PRIMARY KEY (order_id, line_no), promos PRIMARY KEY (promo_id),
+    op AS order_promos PRIMARY KEY (order_id, promo_id))
+  RELATIONSHIPS (lines (order_id) REFERENCES orders, op (order_id) REFERENCES orders, op (promo_id) REFERENCES promos)
+  DIMENSIONS (orders.d AS order_date, orders.y AS year(order_date), promos.code AS code)
+  METRICS (lines.rev AS SUM(amount), lines.rev_ly OFFSET (orders.d BY INTERVAL 1 YEAR) AS rev);
+
+query II
+SELECT * FROM SEMANTIC_VIEW(promo_sales METRICS lines.rev, lines.rev_ly WHERE promos.code = 'X' OR orders.y = 2026);
+----
+1130	30
+
+query III
+SELECT * FROM SEMANTIC_VIEW(promo_sales DIMENSIONS promos.code || '-' || CAST(orders.y AS VARCHAR) AS k METRICS lines.rev, lines.rev_ly) ORDER BY k;
+----
+X-2025	30	NULL
+X-2026	NULL	30
+Y-2026	1100	NULL
+Y-2027	NULL	1100
 
 # output types are those of the unshifted dimensions
 query II
@@ -275,6 +353,14 @@ CREATE SEMANTIC VIEW bad TABLES (t AS spine PRIMARY KEY (day), invoices PRIMARY 
   RELATIONSHIPS (invoices (invoiced_at) REFERENCES t)
   DIMENSIONS (t.day AS day)
   METRICS (invoices.revenue AS SUM(amount), invoices.bad OFFSET (t.day BY to_days(amount)) AS revenue);
+----
+the interval must be a constant expression
+
+statement error
+CREATE SEMANTIC VIEW bad TABLES (t AS spine PRIMARY KEY (day), invoices PRIMARY KEY (invoice_id))
+  RELATIONSHIPS (invoices (invoiced_at) REFERENCES t)
+  DIMENSIONS (t.day AS day)
+  METRICS (invoices.revenue AS SUM(amount), invoices.bad OFFSET (t.day BY to_days(CAST(count(*) AS INTEGER))) AS revenue);
 ----
 the interval must be a constant expression
 

@@ -334,6 +334,7 @@ A metric filter restricts the rows of every aggregate the metric is computed fro
 metrics it references (here both the revenue and the cost). Filters of nested metrics combine with `AND`. The condition
 is row-level (dimensions, facts and columns), and every table it reads must be reachable from the table of each
 aggregate it applies to. A filtered metric is an ordinary aggregate with a `FILTER` clause, so it can be materialized.
+For semi-additive metrics, the filter applies before the last snapshot is picked, like a query's `WHERE`.
 
 ### Time offsets (`OFFSET`)
 
@@ -347,9 +348,12 @@ METRICS (
 For a group dated *t*, an offset metric is computed from the rows dated *t − interval* (a negative interval looks
 forward). The dimension must be defined as a column of its table (typically the day of a date table that every fact
 table references); every dimension computed from that column moves with it, so the offset works at any grain
-(`dates.month`, `dates.year`, ...), and a `WHERE` on time selects the previous period's rows. The metric's own definition
-(its aggregates and filters) reads the stored values. Offsets of nested metrics add up. Offset metrics cannot be
-materialized (the other metrics of a query still read materializations) or referenced by facts and dimensions.
+(`dates.month`, `dates.year`, ...), and a `WHERE` on time selects the previous period's rows. Only that column is
+shifted, so a query with an offset metric must have a dimension or `WHERE` condition computed from it, and cannot read
+other columns of a date table (a stored `d_year` would not move with the date: define `dates.year AS year(day)`
+instead). The metric's own definition (its aggregates and filters) reads the stored values. Offsets of nested metrics
+add up. Offset metrics cannot be materialized (the other metrics of a query still read materializations) or referenced
+by facts and dimensions.
 
 ### Time-dependent and range relationships
 

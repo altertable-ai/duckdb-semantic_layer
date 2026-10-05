@@ -454,7 +454,10 @@ private:
 			if (!column.Is(SemanticRefKind::COLUMN)) {
 				Fail("%s: dimension \"%s\" must be defined as a column of its logical table", what, name);
 			}
-			if (ContainsColumnOrSubquery(*parsed.offset_interval)) {
+			SemanticAnalyzer analyzer(*model, context);
+			if (ContainsColumnOrSubquery(*parsed.offset_interval) ||
+			    analyzer.ContainsAggregateOrMetric(*parsed.offset_interval) ||
+			    SemanticAnalyzer::ContainsWindow(*parsed.offset_interval)) {
 				Fail("%s: the interval must be a constant expression", what);
 			}
 			auto &table = model->tables[column.index];
@@ -502,6 +505,9 @@ private:
 		vector<vector<idx_t>> deps(count);
 		for (idx_t m = 0; m < count; m++) {
 			CollectMemberRefs(*model->members[m].resolved, deps[m]);
+			if (model->members[m].filter) {
+				CollectMemberRefs(*model->members[m].filter, deps[m]);
+			}
 		}
 		auto cycle = FindCycle(deps);
 		if (!cycle.empty()) {

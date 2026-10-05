@@ -132,6 +132,8 @@ struct Block {
 	idx_t home;
 	vector<idx_t> using_relationships;
 	idx_t non_additive_member;
+	//! Metrics whose FILTER filters the block's rows (semi-additive blocks only)
+	vector<idx_t> filters;
 	vector<idx_t> offsets;
 	//! SemanticOffsetKey of `offsets`
 	string offset_key;
@@ -139,7 +141,8 @@ struct Block {
 
 	bool Accepts(const SemanticAtom &atom, const string &atom_offset_key) const {
 		return home == atom.home && using_relationships == atom.context.using_relationships &&
-		       non_additive_member == atom.context.non_additive_member && offset_key == atom_offset_key;
+		       non_additive_member == atom.context.non_additive_member && filters == atom.context.filters &&
+		       offset_key == atom_offset_key;
 	}
 	bool Owns(idx_t atom) const {
 		return std::find(atoms.begin(), atoms.end(), atom) != atoms.end();
@@ -155,9 +158,9 @@ class BlockBridges {
 public:
 	BlockBridges(const SemanticModel &model, SemanticAnalyzer &analyzer, SemanticExpressionCompiler &compiler,
 	             SemanticAliasGenerator &aliases, idx_t home, const vector<idx_t> &using_relationships,
-	             optional_ptr<const SemanticTableSources> sources)
+	             const vector<idx_t> &offsets, optional_ptr<const SemanticTableSources> sources)
 	    : model(model), analyzer(analyzer), compiler(compiler), aliases(aliases), resolver(model), home(home),
-	      using_relationships(using_relationships), sources(sources) {
+	      using_relationships(using_relationships), offsets(offsets), sources(sources) {
 	}
 
 	//! The reference, in the block's rows, to dimension `expr` (output column `column`) when it is reached through a
@@ -259,13 +262,13 @@ private:
 			node->select_list.push_back(std::move(key));
 		}
 		for (auto &dimension : group.dimensions) {
-			auto expr = compiler.Row(*dimension.expr, scope, DConstants::INVALID_INDEX, dimension.what);
+			auto expr = compiler.Row(*dimension.expr, scope, DConstants::INVALID_INDEX, dimension.what, offsets);
 			expr->alias = dimension.column;
 			node->select_list.push_back(std::move(expr));
 		}
 		vector<unique_ptr<ParsedExpression>> conditions;
 		for (auto *condition : group.conditions) {
-			conditions.push_back(compiler.Row(*condition, scope, DConstants::INVALID_INDEX, WHERE_WHAT));
+			conditions.push_back(compiler.Row(*condition, scope, DConstants::INVALID_INDEX, WHERE_WHAT, offsets));
 		}
 		node->where_clause = AndAll(std::move(conditions));
 		node->modifiers.push_back(make_uniq<DistinctModifier>());
@@ -280,6 +283,8 @@ private:
 	SemanticBridgeResolver resolver;
 	idx_t home;
 	const vector<idx_t> &using_relationships;
+	//! OFFSET metrics of the block: bridged dimensions and conditions are shifted like the others
+	const vector<idx_t> &offsets;
 	optional_ptr<const SemanticTableSources> sources;
 	vector<Group> groups;
 };
@@ -303,12 +308,16 @@ public:
 				blocks.push_back(Block {atoms[a].home,
 				                        atoms[a].context.using_relationships,
 				                        atoms[a].context.non_additive_member,
+				                        atoms[a].context.filters,
 				                        atoms[a].context.offsets,
 				                        offset_key,
 				                        {}});
 				block = blocks.end() - 1;
 			}
 			block->atoms.push_back(a);
+		}
+		if (!options.allow_unshifted_offsets) {
+			CheckOffsetColumns();
 		}
 	}
 
@@ -362,7 +371,7 @@ public:
 	unique_ptr<SelectNode> BuildStateBlock(idx_t b, const SemanticStateBuilder &states) {
 		auto &block = blocks[b];
 		SemanticJoinScope scope(model, aliases, block.home, block.using_relationships, string(), options.sources);
-		BlockBridges bridges(model, analyzer, compiler, aliases, block.home, block.using_relationships,
+		BlockBridges bridges(model, analyzer, compiler, aliases, block.home, block.using_relationships, block.offsets,
 		                     options.sources);
 		auto parts = BuildRows(block, scope, bridges);
 		auto aggregate = make_uniq<SelectNode>();
@@ -385,6 +394,66 @@ public:
 	}
 
 private:
+	//! Columns read by a row-level expression, following row-level members
+	void CollectColumns(const ParsedExpression &expr, vector<SemanticRef> &columns) const {
+		auto ref = SemanticMarkers::Classify(expr);
+		if (ref.Is(SemanticRefKind::COLUMN)) {
+			columns.push_back(ref);
+			return;
+		}
+		if (ref.Is(SemanticRefKind::MEMBER)) {
+			if (model.members[ref.index].IsRowLevel()) {
+				CollectColumns(*model.members[ref.index].resolved, columns);
+			}
+			return;
+		}
+		ParsedExpressionIterator::EnumerateChildren(
+		    expr, [&](const ParsedExpression &child) { CollectColumns(child, columns); });
+	}
+
+	//! An OFFSET only shifts its column: the query must read it (otherwise the offset would have no effect), and must
+	//! not read other columns of its table when that is not the metric's own table (a stored year of a date table
+	//! would not be shifted with the date)
+	void CheckOffsetColumns() const {
+		vector<std::pair<string, vector<SemanticRef>>> reads;
+		for (auto *dimension : dimensions) {
+			reads.emplace_back(ItemWhat(*dimension), vector<SemanticRef>());
+			CollectColumns(*dimension->resolved, reads.back().second);
+		}
+		if (spec.where) {
+			reads.emplace_back("Invalid WHERE clause", vector<SemanticRef>());
+			CollectColumns(*spec.where, reads.back().second);
+		}
+		for (auto &block : blocks) {
+			for (auto metric : block.offsets) {
+				auto &offset = *model.members[metric].offset;
+				bool shifted = false;
+				for (auto &read : reads) {
+					for (auto &column : read.second) {
+						if (column.index != offset.table) {
+							continue;
+						}
+						if (StringUtil::CIEquals(column.column, offset.column)) {
+							shifted = true;
+						} else if (offset.table != block.home) {
+							throw SemanticDefinitionException(
+							    "%s: column \"%s.%s\" would not be shifted by the OFFSET of metric \"%s\" (only "
+							    "\"%s\" and expressions computed from it are)",
+							    read.first, model.tables[offset.table].name, column.column,
+							    model.MemberDisplayName(metric), model.MemberDisplayName(offset.dimension));
+						}
+					}
+				}
+				if (!shifted) {
+					throw SemanticDefinitionException(
+					    "Metric \"%s\" must be queried with a dimension or WHERE condition computed from \"%s\" (its "
+					    "OFFSET dimension)",
+					    model.MemberDisplayName(metric), model.MemberDisplayName(offset.dimension));
+				}
+			}
+		}
+	}
+
 	static SemanticAtom CopyAtom(const SemanticAtom &atom) {
 		SemanticAtom result;
 		result.home = atom.home;
@@ -463,6 +532,10 @@ private:
 				                                  "Invalid WHERE clause", block.offsets));
 			}
 		}
+		for (auto metric : block.filters) {
+			conditions.push_back(
+			    compiler.Row(*model.members[metric].filter, scope, DConstants::INVALID_INDEX, "Invalid metric"));
+		}
 		if (options.row_filter) {
 			auto filter = options.row_filter(scope, result.groups);
 			if (filter) {
@@ -508,7 +581,7 @@ private:
 	                                        optional_ptr<SemanticBlockDependencies> dependencies = nullptr) {
 		SemanticJoinScope scope(model, aliases, block.home, block.using_relationships, string(), options.sources,
 		                        dependencies);
-		BlockBridges bridges(model, analyzer, compiler, aliases, block.home, block.using_relationships,
+		BlockBridges bridges(model, analyzer, compiler, aliases, block.home, block.using_relationships, block.offsets,
 		                     options.sources);
 		auto parts = BuildRows(block, scope, bridges);
 		auto aggregate = make_uniq<SelectNode>();
@@ -815,6 +888,7 @@ vector<SemanticBlockPlan> SemanticQueryCompiler::PlanBlocks(const SemanticQueryS
 	SemanticAliasGenerator aliases;
 	SemanticExpressionCompiler compiler(model, analyzer);
 	SemanticCompileOptions options;
+	options.allow_unshifted_offsets = true;
 	MetricQueryCompiler metric_compiler(model, analyzer, compiler, aliases, spec, dimensions, metrics, options);
 	vector<SemanticBlockPlan> result;
 	for (idx_t b = 0; b < metric_compiler.BlockCount(); b++) {
@@ -919,7 +993,9 @@ unique_ptr<SelectStatement> SemanticQueryCompiler::CompileMemberProbe(idx_t memb
 	auto kind = entry.Kind() == SemanticMemberKind::METRIC ? SemanticMemberKind::METRIC : SemanticMemberKind::FACT;
 	spec.items.push_back(SemanticQueryItem {kind, SemanticMarkers::Member(member), entry.Name()});
 	column = spec.items.size() - 1;
-	return Compile(spec);
+	SemanticCompileOptions options;
+	options.allow_unshifted_offsets = true;
+	return Compile(spec, options);
 }
 
 void ProbeSemanticModelTypes(ClientContext &context, SemanticModel &model) {

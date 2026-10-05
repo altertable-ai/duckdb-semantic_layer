@@ -27,7 +27,8 @@ struct SemanticMetricContext {
 	vector<idx_t> using_relationships;
 	//! Metric whose NON ADDITIVE BY applies, or INVALID_INDEX
 	idx_t non_additive_member = DConstants::INVALID_INDEX;
-	//! Metrics whose FILTER applies to the aggregates (outer metrics first)
+	//! Metrics whose FILTER applies to the aggregates (outer metrics first). Once an atom is created, its filters are
+	//! folded into its aggregate's FILTER, except for semi-additive atoms whose block rows they filter.
 	vector<idx_t> filters;
 	//! Metrics whose OFFSET applies, in the order the shifts are applied (innermost metric first)
 	vector<idx_t> offsets;
