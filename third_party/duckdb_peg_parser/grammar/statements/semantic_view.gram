@@ -49,29 +49,30 @@ SemanticLabels <- 'LABELS' '=' Parens(List(ColId))
 SemanticUsing <- 'USING' Parens(List(ColId))
 SemanticNonAdditive <- 'NON' 'ADDITIVE' 'BY' Parens(List(OrderByExpression))
 SemanticMemberOption <- SemanticWithSynonyms / SemanticComment / SemanticTag / SemanticSampleValues / SemanticIsEnum / SemanticCortexSearch
-SemanticWithSynonyms <- 'WITH'? 'SYNONYMS' '='? Parens(List(StringLiteral))
-SemanticComment <- 'COMMENT' '=' StringLiteral
+SemanticWithSynonyms <- 'WITH'? 'SYNONYMS' '='? Parens(List(SemanticString))
+SemanticComment <- 'COMMENT' '=' SemanticString
+SemanticString <- StringLiteral+
 SemanticTag <- 'WITH'? 'TAG' Parens(List(SemanticTagEntry))
-SemanticTagEntry <- SemanticDottedName '=' StringLiteral
+SemanticTagEntry <- SemanticDottedName '=' SemanticString
 SemanticDottedName <- ColId ('.' ColLabel)*
-SemanticSampleValues <- 'SAMPLE_VALUES' Parens(List(StringLiteral))
+SemanticSampleValues <- 'SAMPLE_VALUES' Parens(List(SemanticString))
 SemanticIsEnum <- 'IS_ENUM'
 SemanticCortexSearch <- 'WITH' 'CORTEX' 'SEARCH' 'SERVICE' SemanticDottedName SemanticCortexSearchColumn?
 SemanticCortexSearchColumn <- 'USING' ColId
 
 SemanticViewProperty <- SemanticComment / SemanticMaxStaleness / SemanticAiSqlGeneration / SemanticAiQuestionCategorization / SemanticAiVerifiedQueries / SemanticTag / SemanticCopyGrants
 SemanticMaxStaleness <- 'MAX_STALENESS' '=' NumberLiteral
-SemanticAiSqlGeneration <- 'AI_SQL_GENERATION' StringLiteral
-SemanticAiQuestionCategorization <- 'AI_QUESTION_CATEGORIZATION' StringLiteral
+SemanticAiSqlGeneration <- 'AI_SQL_GENERATION' SemanticString
+SemanticAiQuestionCategorization <- 'AI_QUESTION_CATEGORIZATION' SemanticString
 SemanticAiVerifiedQueries <- 'AI_VERIFIED_QUERIES' Parens(List(SemanticVerifiedQuery))
 SemanticVerifiedQuery <- ColId 'AS' Parens(SemanticVerifiedQueryProperty+)
 SemanticVerifiedQueryProperty <- SemanticVqQuestion / SemanticVqVerifiedAt / SemanticVqOnboarding / SemanticVqVerifiedBy / SemanticVqSql
-SemanticVqQuestion <- 'QUESTION' StringLiteral
+SemanticVqQuestion <- 'QUESTION' SemanticString
 SemanticVqVerifiedAt <- 'VERIFIED_AT' NumberLiteral
 SemanticVqOnboarding <- 'ONBOARDING_QUESTION' SemanticBoolean
 SemanticBoolean <- 'TRUE' / 'FALSE'
-SemanticVqVerifiedBy <- 'VERIFIED_BY' StringLiteral
-SemanticVqSql <- 'SQL' StringLiteral
+SemanticVqVerifiedBy <- 'VERIFIED_BY' SemanticString
+SemanticVqSql <- 'SQL' SemanticString
 SemanticCopyGrants <- 'COPY' 'GRANTS'
 
 DropSemanticViewStmt <- 'DROP' 'SEMANTIC' 'VIEW' IfExists? QualifiedName
@@ -79,7 +80,7 @@ DropSemanticViewStmt <- 'DROP' 'SEMANTIC' 'VIEW' IfExists? QualifiedName
 AlterSemanticViewStmt <- 'ALTER' 'SEMANTIC' 'VIEW' IfExists? QualifiedName SemanticAlterAction
 SemanticAlterAction <- SemanticAlterRename / SemanticAlterSetComment / SemanticAlterUnsetComment / SemanticAlterSetMaxStaleness / SemanticAlterUnsetMaxStaleness / SemanticAlterAddMaterialization / SemanticAlterDropMaterialization / SemanticAlterRefreshMaterialization
 SemanticAlterRename <- 'RENAME' 'TO' QualifiedName
-SemanticAlterSetComment <- 'SET' 'COMMENT' '=' StringLiteral
+SemanticAlterSetComment <- 'SET' 'COMMENT' '=' SemanticString
 SemanticAlterUnsetComment <- 'UNSET' 'COMMENT'
 SemanticAlterSetMaxStaleness <- 'SET' 'MAX_STALENESS' '=' NumberLiteral
 SemanticAlterUnsetMaxStaleness <- 'UNSET' 'MAX_STALENESS'

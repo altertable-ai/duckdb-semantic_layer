@@ -96,14 +96,23 @@ vector<string> TransformSemanticColumnList(PEGTransformer &transformer, optional
 	return TransformAll<string>(transformer, ParenthesizedList(List(parse_result).GetChild(0)));
 }
 
-// 'WITH'? 'SYNONYMS' '='? Parens(List(StringLiteral))
+// 'WITH'? 'SYNONYMS' '='? Parens(List(SemanticString))
 vector<string> TransformSemanticWithSynonyms(PEGTransformer &transformer, optional_ptr<ParseResult> parse_result) {
 	return TransformAll<string>(transformer, ParenthesizedList(List(parse_result).GetChild(3)));
 }
 
-// 'COMMENT' '=' StringLiteral
+// 'COMMENT' '=' SemanticString
 string TransformSemanticComment(PEGTransformer &transformer, optional_ptr<ParseResult> parse_result) {
 	return transformer.Transform<string>(List(parse_result), 2);
+}
+
+// StringLiteral+ (adjacent string literals are concatenated, as in DuckDB's SQL parser)
+string TransformSemanticString(PEGTransformer &transformer, optional_ptr<ParseResult> parse_result) {
+	string result;
+	for (auto &literal : Repeated(List(parse_result).GetChild(0))) {
+		result += transformer.Transform<string>(literal);
+	}
+	return result;
 }
 
 // 'WITH'? 'TAG' Parens(List(SemanticTagEntry))
@@ -111,7 +120,7 @@ vector<ParsedSemanticTag> TransformSemanticTag(PEGTransformer &transformer, opti
 	return TransformAll<ParsedSemanticTag>(transformer, ParenthesizedList(List(parse_result).GetChild(2)));
 }
 
-// SemanticDottedName '=' StringLiteral
+// SemanticDottedName '=' SemanticString
 ParsedSemanticTag TransformSemanticTagEntry(PEGTransformer &transformer, optional_ptr<ParseResult> parse_result) {
 	auto &list = List(parse_result);
 	ParsedSemanticTag tag;
@@ -300,7 +309,7 @@ ParsedSemanticMember TransformSemanticMember(PEGTransformer &transformer, option
 		} else if (option->name == "SemanticTag") {
 			member.tags = transformer.Transform<vector<ParsedSemanticTag>>(option);
 		} else if (option->name == "SemanticSampleValues") {
-			// 'SAMPLE_VALUES' Parens(List(StringLiteral))
+			// 'SAMPLE_VALUES' Parens(List(SemanticString))
 			member.sample_values = TransformAll<string>(transformer, ParenthesizedList(option_list.GetChild(1)));
 		} else if (option->name == "SemanticIsEnum") {
 			member.is_enum = true;
@@ -517,7 +526,7 @@ unique_ptr<SQLStatement> TransformAlterSemanticViewStmt(PEGTransformer &transfor
 		}
 		return SemanticLowering::SelectAll(SemanticLowering::SetMaxStaleness(name, if_exists, seconds));
 	}
-	// 'SET' 'COMMENT' '=' StringLiteral / 'UNSET' 'COMMENT' (a NULL comment)
+	// 'SET' 'COMMENT' '=' SemanticString / 'UNSET' 'COMMENT' (a NULL comment)
 	Value comment(LogicalType::VARCHAR);
 	if (action->name == "SemanticAlterSetComment") {
 		comment = Value(transformer.Transform<string>(List(action), 3));
@@ -813,6 +822,7 @@ void PEGTransformerFactory::RegisterSemanticView() {
 	Register("SemanticColumnList", &TransformSemanticColumnList);
 	Register("SemanticWithSynonyms", &TransformSemanticWithSynonyms);
 	Register("SemanticComment", &TransformSemanticComment);
+	Register("SemanticString", &TransformSemanticString);
 	Register("SemanticTag", &TransformSemanticTag);
 	Register("SemanticTagEntry", &TransformSemanticTagEntry);
 	Register("SemanticDottedName", &TransformSemanticDottedName);
