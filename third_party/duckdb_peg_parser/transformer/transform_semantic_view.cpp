@@ -274,7 +274,7 @@ vector<ParsedSemanticMember> TransformSemanticMemberClause(PEGTransformer &trans
 }
 
 // SemanticVisibility? SemanticMemberName SemanticLabels? SemanticUsing? SemanticNonAdditive? SemanticMetricFilter?
-// SemanticMetricOffset? 'AS' Expression SemanticMemberOption*
+// SemanticMetricOffset? SemanticMetricCumulative? 'AS' Expression SemanticMemberOption*
 ParsedSemanticMember TransformSemanticMember(PEGTransformer &transformer, optional_ptr<ParseResult> parse_result) {
 	auto &list = List(parse_result);
 	ParsedSemanticMember member;
@@ -310,8 +310,30 @@ ParsedSemanticMember TransformSemanticMember(PEGTransformer &transformer, option
 		member.offset_dimension = transformer.Transform<vector<string>>(body_list, 0);
 		member.offset_interval = transformer.Transform<unique_ptr<ParsedExpression>>(body_list, 2);
 	}
-	member.expression = transformer.Transform<unique_ptr<ParsedExpression>>(list, 8);
-	for (auto &option_node : Repeated(list.GetChild(9))) {
+	if (Present(list, 7)) {
+		// 'CUMULATIVE' Parens(SemanticDottedName SemanticCumulativeFrame? SemanticCumulativePeriod?)
+		auto body = PEGTransformerFactory::ExtractResultFromParens(List(Optional(list, 7)).GetChild(1));
+		auto &body_list = List(body);
+		member.cumulative_dimension = transformer.Transform<vector<string>>(body_list, 0);
+		if (Present(body_list, 1)) {
+			auto frame = Choice(Optional(body_list, 1));
+			if (frame->name == "SemanticCumulativeWindow") {
+				// 'OVER' Expression
+				member.cumulative_window = transformer.Transform<unique_ptr<ParsedExpression>>(List(frame), 1);
+			} else {
+				// 'TO' ColLabel
+				member.cumulative_part = StringUtil::Lower(transformer.Transform<string>(List(frame), 1));
+			}
+		}
+		if (Present(body_list, 2)) {
+			auto period = Keyword(Optional(body_list, 2));
+			member.cumulative_period = period == "FIRST"     ? SemanticCumulativePeriod::FIRST
+			                           : period == "AVERAGE" ? SemanticCumulativePeriod::AVERAGE
+			                                                 : SemanticCumulativePeriod::LAST;
+		}
+	}
+	member.expression = transformer.Transform<unique_ptr<ParsedExpression>>(list, 9);
+	for (auto &option_node : Repeated(list.GetChild(10))) {
 		auto option = Choice(option_node);
 		auto &option_list = List(option);
 		if (option->name == "SemanticWithSynonyms") {

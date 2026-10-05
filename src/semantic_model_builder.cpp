@@ -23,6 +23,9 @@
 #include "semantic_model.hpp"
 #include "semantic_materialization.hpp"
 #include "semantic_offsets.hpp"
+#include "semantic_ast_helpers.hpp"
+#include "duckdb/parser/expression/function_expression.hpp"
+#include "duckdb/common/enums/date_part_specifier.hpp"
 #include "semantic_query_compiler.hpp"
 
 namespace duckdb {
@@ -78,6 +81,7 @@ public:
 		BuildMembers();
 		ResolveMembers();
 		ResolveOffsets();
+		ResolveCumulatives();
 		CheckMemberCycles();
 		CheckMemberKinds();
 		ProbeSemanticModelTypes(context, *model);
@@ -370,6 +374,9 @@ private:
 			if (!parsed.offset_dimension.empty() && member.Kind() != SemanticMemberKind::METRIC) {
 				Fail("OFFSET is only allowed on metrics (\"%s\")", parsed.FullName());
 			}
+			if (!parsed.cumulative_dimension.empty() && member.Kind() != SemanticMemberKind::METRIC) {
+				Fail("CUMULATIVE is only allowed on metrics (\"%s\")", parsed.FullName());
+			}
 			model->members.push_back(std::move(member));
 		}
 	}
@@ -418,6 +425,29 @@ private:
 		}
 	}
 
+	//! The dimension of a metric's OFFSET / CUMULATIVE clause: a dimension defined as a column (returned)
+	SemanticRef ResolveColumnDimension(const vector<string> &name_parts, idx_t m, const string &what,
+	                                   idx_t &dimension) {
+		auto name = StringUtil::Join(name_parts, ".");
+		SemanticResolveContext resolve_context;
+		resolve_context.owner_table = model->members[m].table;
+		resolve_context.what = what;
+		string error;
+		auto ref = model->Lookup(name_parts, resolve_context, error);
+		if (ref.Is(SemanticRefKind::NONE)) {
+			Fail("%s: %s", what, error.empty() ? "unknown dimension \"" + name + "\"" : error);
+		}
+		if (!ref.Is(SemanticRefKind::MEMBER) || model->members[ref.index].Kind() != SemanticMemberKind::DIMENSION) {
+			Fail("%s: \"%s\" is not a dimension", what, name);
+		}
+		auto column = SemanticMarkers::Classify(*model->members[ref.index].resolved);
+		if (!column.Is(SemanticRefKind::COLUMN)) {
+			Fail("%s: dimension \"%s\" must be defined as a column of its logical table", what, name);
+		}
+		dimension = ref.index;
+		return column;
+	}
+
 	//! OFFSET dimensions resolve to a dimension defined as a column; the interval must be constant and shift the
 	//! column's type. Equal offsets are stored once.
 	void ResolveOffsets() {
@@ -429,22 +459,8 @@ private:
 				continue;
 			}
 			auto what = What(m) + " OFFSET";
-			auto name = StringUtil::Join(parsed.offset_dimension, ".");
-			SemanticResolveContext resolve_context;
-			resolve_context.owner_table = member.table;
-			resolve_context.what = what;
-			string error;
-			auto ref = model->Lookup(parsed.offset_dimension, resolve_context, error);
-			if (ref.Is(SemanticRefKind::NONE)) {
-				Fail("%s: %s", what, error.empty() ? "unknown dimension \"" + name + "\"" : error);
-			}
-			if (!ref.Is(SemanticRefKind::MEMBER) || model->members[ref.index].Kind() != SemanticMemberKind::DIMENSION) {
-				Fail("%s: \"%s\" is not a dimension", what, name);
-			}
-			auto column = SemanticMarkers::Classify(*model->members[ref.index].resolved);
-			if (!column.Is(SemanticRefKind::COLUMN)) {
-				Fail("%s: dimension \"%s\" must be defined as a column of its logical table", what, name);
-			}
+			idx_t dimension;
+			auto column = ResolveColumnDimension(parsed.offset_dimension, m, what, dimension);
 			auto &interval = *parsed.offset_interval;
 			if (!interval.IsScalar() || analyzer.ContainsAggregateOrMetric(interval) ||
 			    SemanticAnalyzer::ContainsWindow(interval)) {
@@ -452,7 +468,7 @@ private:
 			}
 			auto &table = model->tables[column.index];
 			SemanticOffset offset;
-			offset.dimension = ref.index;
+			offset.dimension = dimension;
 			offset.table = column.index;
 			offset.column = column.column;
 			offset.type = table.column_types[table.columns.at(column.column)];
@@ -468,11 +484,10 @@ private:
 		}
 	}
 
-	//! Binds SELECT CAST(CAST(NULL AS <type>) + <interval> AS <type>)
-	void CheckOffsetType(const SemanticOffset &offset, const string &what) {
+	//! Binds SELECT <expr>; the binder's error message, or empty
+	string BindError(unique_ptr<ParsedExpression> expr) {
 		auto node = make_uniq<SelectNode>();
-		node->select_list.push_back(SemanticShiftColumn(
-		    make_uniq<CastExpression>(offset.type, make_uniq<ConstantExpression>(Value())), offset));
+		node->select_list.push_back(std::move(expr));
 		node->from_table = make_uniq<EmptyTableRef>();
 		auto statement = make_uniq<SelectStatement>();
 		statement->node = std::move(node);
@@ -481,8 +496,116 @@ private:
 			binder->Bind(statement->Cast<SQLStatement>());
 		} catch (std::exception &ex) {
 			ErrorData error(ex);
+			return error.RawMessage();
+		}
+		return string();
+	}
+
+	//! Binds SELECT CAST(CAST(NULL AS <type>) + <interval> AS <type>)
+	void CheckOffsetType(const SemanticOffset &offset, const string &what) {
+		auto error = BindError(SemanticShiftColumn(
+		    make_uniq<CastExpression>(offset.type, make_uniq<ConstantExpression>(Value())), offset));
+		if (!error.empty()) {
 			Fail("%s: cannot shift column \"%s.%s\" (%s) by %s: %s", what, model->tables[offset.table].name,
-			     offset.column, offset.type.ToString(), offset.interval->ToString(), error.RawMessage());
+			     offset.column, offset.type.ToString(), offset.interval->ToString(), error);
+		}
+	}
+
+	//! CUMULATIVE dimensions resolve like OFFSET dimensions; the OVER window is constant and subtracts from the
+	//! column, the TO part truncates it. Equal clauses are stored once.
+	void ResolveCumulatives() {
+		SemanticAnalyzer analyzer(*model, context);
+		for (idx_t m = 0; m < model->members.size(); m++) {
+			auto &member = model->members[m];
+			auto &parsed = *member.parsed;
+			if (parsed.cumulative_dimension.empty()) {
+				continue;
+			}
+			auto what = What(m) + " CUMULATIVE";
+			SemanticCumulative cumulative;
+			auto column = ResolveColumnDimension(parsed.cumulative_dimension, m, what, cumulative.dimension);
+			auto &table = model->tables[column.index];
+			cumulative.table = column.index;
+			cumulative.column = column.column;
+			cumulative.type = table.column_types[table.columns.at(column.column)];
+			cumulative.period = parsed.cumulative_period;
+			auto column_name = table.name + "." + column.column;
+			auto value = [&]() {
+				return make_uniq<CastExpression>(cumulative.type, make_uniq<ConstantExpression>(Value()));
+			};
+			string error;
+			if (parsed.cumulative_window) {
+				auto &window = *parsed.cumulative_window;
+				if (!window.IsScalar() || analyzer.ContainsAggregateOrMetric(window) ||
+				    SemanticAnalyzer::ContainsWindow(window)) {
+					Fail("%s: the window must be a constant expression", what);
+				}
+				cumulative.kind = SemanticCumulativeKind::WINDOW;
+				cumulative.window = window.Copy();
+				vector<unique_ptr<ParsedExpression>> children;
+				children.push_back(value());
+				children.push_back(window.Copy());
+				error = BindError(
+				    Compare(ExpressionType::COMPARE_GREATERTHAN, value(),
+				            make_uniq<FunctionExpression>("-", std::move(children), nullptr, nullptr, false, true)));
+				if (!error.empty()) {
+					Fail("%s: cannot use %s as the window of column \"%s\" (%s): %s", what, window.ToString(),
+					     column_name, cumulative.type.ToString(), error);
+				}
+			} else if (!parsed.cumulative_part.empty()) {
+				DatePartSpecifier specifier;
+				if (!TryGetDatePartSpecifier(parsed.cumulative_part, specifier) || !IsTruncationPart(specifier)) {
+					Fail("%s: \"%s\" is not a date part to truncate to (e.g. day, week, month, quarter, year)", what,
+					     parsed.cumulative_part);
+				}
+				cumulative.kind = SemanticCumulativeKind::GRAIN;
+				cumulative.part = parsed.cumulative_part;
+				vector<unique_ptr<ParsedExpression>> children;
+				children.push_back(make_uniq<ConstantExpression>(Value(cumulative.part)));
+				children.push_back(value());
+				error = BindError(make_uniq<FunctionExpression>("date_trunc", std::move(children)));
+				if (!error.empty()) {
+					Fail("%s: cannot truncate column \"%s\" (%s) to %s: %s", what, column_name,
+					     cumulative.type.ToString(), cumulative.part, error);
+				}
+			} else {
+				cumulative.kind = SemanticCumulativeKind::ALL;
+				error = BindError(Compare(ExpressionType::COMPARE_LESSTHANOREQUALTO, value(), value()));
+				if (!error.empty()) {
+					Fail("%s: column \"%s\" (%s) cannot be ordered: %s", what, column_name, cumulative.type.ToString(),
+					     error);
+				}
+			}
+			auto existing = std::find_if(model->cumulatives.begin(), model->cumulatives.end(),
+			                             [&](const SemanticCumulative &other) { return other.Equals(cumulative); });
+			if (existing == model->cumulatives.end()) {
+				model->cumulatives.push_back(std::move(cumulative));
+				existing = model->cumulatives.end() - 1;
+			}
+			member.cumulative = NumericCast<idx_t>(existing - model->cumulatives.begin());
+		}
+	}
+
+	//! The parts date_trunc truncates to (others, like dow, are accepted by date_trunc but are not periods)
+	static bool IsTruncationPart(DatePartSpecifier specifier) {
+		switch (specifier) {
+		case DatePartSpecifier::MILLENNIUM:
+		case DatePartSpecifier::CENTURY:
+		case DatePartSpecifier::DECADE:
+		case DatePartSpecifier::YEAR:
+		case DatePartSpecifier::QUARTER:
+		case DatePartSpecifier::MONTH:
+		case DatePartSpecifier::WEEK:
+		case DatePartSpecifier::ISOYEAR:
+		case DatePartSpecifier::DAY:
+		case DatePartSpecifier::HOUR:
+		case DatePartSpecifier::MINUTE:
+		case DatePartSpecifier::SECOND:
+		case DatePartSpecifier::MILLISECONDS:
+		case DatePartSpecifier::MICROSECONDS:
+			return true;
+		default:
+			return false;
 		}
 	}
 

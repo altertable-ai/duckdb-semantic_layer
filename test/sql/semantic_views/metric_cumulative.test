@@ -1,0 +1,194 @@
+# name: test/sql/semantic_views/metric_cumulative.test
+# description: cumulative metrics (CUMULATIVE (<dimension> [OVER <interval> | TO <part>] [FIRST | LAST | AVERAGE])):
+# group: [semantic_views]
+
+# every row counts for each anchor date whose window contains its date
+
+require semantic_views
+
+statement ok
+PRAGMA enable_verification
+
+statement ok
+CREATE TABLE users (user_id INTEGER, country VARCHAR);
+
+statement ok
+INSERT INTO users VALUES (1, 'FR'), (2, 'US'), (3, 'FR');
+
+statement ok
+CREATE TABLE teams (team_id INTEGER, name VARCHAR);
+
+statement ok
+INSERT INTO teams VALUES (1, 'red'), (2, 'blue');
+
+statement ok
+CREATE TABLE memberships (user_id INTEGER, team_id INTEGER);
+
+statement ok
+INSERT INTO memberships VALUES (1, 1), (2, 1), (3, 2), (1, 2);
+
+statement ok
+CREATE TABLE events (event_id INTEGER, user_id INTEGER, event_date DATE, amount INTEGER);
+
+statement ok
+INSERT INTO events VALUES
+  (1, 1, '2026-01-01', 10), (2, 1, '2026-01-02', 20), (3, 2, '2026-01-02', 30), (4, 1, '2026-01-05', 40),
+  (5, 3, '2026-01-08', 50), (6, 2, '2026-01-20', 60), (7, 1, '2026-02-03', 70), (8, 3, '2026-02-03', 80),
+  (9, 2, '2026-03-31', 90);
+
+statement ok
+CREATE TABLE costs (cost_id INTEGER, cost_date DATE, cost INTEGER);
+
+statement ok
+INSERT INTO costs VALUES (1, '2026-01-02', 5), (2, '2026-01-20', 15), (3, '2026-02-10', 25), (4, '2026-03-15', 35);
+
+# a date table running well past the data (anchors stop at the latest row)
+statement ok
+CREATE TABLE dates AS SELECT range::DATE AS day, year(range)::INTEGER AS year FROM range(DATE '2025-12-01', DATE '2027-01-01', INTERVAL 1 DAY);
+
+statement ok
+CREATE SEMANTIC VIEW activity
+  TABLES (
+    users PRIMARY KEY (user_id),
+    teams PRIMARY KEY (team_id),
+    memberships PRIMARY KEY (user_id, team_id),
+    dates PRIMARY KEY (day),
+    events PRIMARY KEY (event_id),
+    costs PRIMARY KEY (cost_id)
+  )
+  RELATIONSHIPS (
+    events (user_id) REFERENCES users,
+    events (event_date) REFERENCES dates,
+    costs (cost_date) REFERENCES dates,
+    memberships (user_id) REFERENCES users,
+    memberships (team_id) REFERENCES teams
+  )
+  DIMENSIONS (
+    users.country AS country,
+    teams.team AS name,
+    dates.day AS day,
+    dates.week AS DATE_TRUNC('week', day)::DATE,
+    dates.month AS DATE_TRUNC('month', day)::DATE,
+    dates.stored_year AS year,
+    events.event_month AS DATE_TRUNC('month', event_date)::DATE
+  )
+  METRICS (
+    events.revenue AS SUM(amount),
+    events.revenue_total CUMULATIVE (dates.day) AS revenue,
+    events.revenue_mtd CUMULATIVE (dates.day TO MONTH) AS revenue,
+    events.revenue_ytd CUMULATIVE (dates.day TO YEAR) AS revenue,
+    events.revenue_7d CUMULATIVE (dates.day OVER INTERVAL 7 DAYS) AS revenue,
+    events.wau CUMULATIVE (dates.day OVER INTERVAL 7 DAYS) AS COUNT(DISTINCT user_id),
+    events.wau_first CUMULATIVE (dates.day OVER INTERVAL 7 DAYS FIRST) AS COUNT(DISTINCT user_id),
+    events.wau_avg CUMULATIVE (dates.day OVER INTERVAL 7 DAYS AVERAGE) AS COUNT(DISTINCT user_id),
+    events.events_7d CUMULATIVE (dates.day OVER INTERVAL 7 DAYS) AS COUNT(*),
+    events.avg_7d CUMULATIVE (dates.day OVER INTERVAL 7 DAYS) AS AVG(amount),
+    events.min_7d CUMULATIVE (dates.day OVER INTERVAL 7 DAYS) AS MIN(amount),
+    events.max_7d CUMULATIVE (dates.day OVER INTERVAL 7 DAYS) AS MAX(amount),
+    events.median_7d CUMULATIVE (dates.day OVER INTERVAL 7 DAYS) AS MEDIAN(amount),
+    events.fr_wau FILTER (WHERE users.country = 'FR') CUMULATIVE (dates.day OVER INTERVAL 7 DAYS) AS COUNT(DISTINCT user_id),
+    fr_revenue_total FILTER (WHERE users.country = 'FR') AS events.revenue_total,
+    events.revenue_total_lm OFFSET (dates.day BY INTERVAL 1 MONTH) AS revenue_total,
+    costs.cost AS SUM(cost),
+    margin_total CUMULATIVE (dates.day) AS events.revenue - costs.cost,
+    revenue_total_prev AS LAG(events.revenue_total) OVER (ORDER BY dates.month)
+  );
+
+# DESCRIBE shows the clause, with its period
+query II
+SELECT object_name, property_value FROM (DESCRIBE SEMANTIC VIEW activity)
+WHERE property = 'CUMULATIVE' AND object_name IN ('revenue_total', 'revenue_mtd', 'margin_total') ORDER BY 1;
+----
+margin_total	dates.day LAST
+revenue_mtd	dates.day TO MONTH LAST
+revenue_total	dates.day LAST
+
+query II
+SELECT object_name, property_value LIKE 'dates.day OVER % FIRST' FROM (DESCRIBE SEMANTIC VIEW activity)
+WHERE property = 'CUMULATIVE' AND object_name = 'wau_first';
+----
+wau_first	true
+
+# the clause survives copies of the definition
+statement ok
+ALTER SEMANTIC VIEW activity RENAME TO activity_renamed;
+
+query I
+SELECT count(*) FROM (DESCRIBE SEMANTIC VIEW activity_renamed) WHERE property = 'CUMULATIVE' AND object_name = 'wau_avg' AND property_value LIKE '% AVERAGE';
+----
+1
+
+statement ok
+ALTER SEMANTIC VIEW activity_renamed RENAME TO activity;
+
+# grammar: lower case, TO ... FIRST, a bare period, a string interval
+statement ok
+CREATE SEMANTIC VIEW grammar
+  TABLES (dates PRIMARY KEY (day), events PRIMARY KEY (event_id))
+  RELATIONSHIPS (events (event_date) REFERENCES dates)
+  DIMENSIONS (dates.day AS day)
+  METRICS (
+    events.a cumulative (dates.day over interval 7 days first) AS SUM(amount),
+    events.b CUMULATIVE (dates.day TO MONTH FIRST) AS SUM(amount),
+    events.c CUMULATIVE (dates.day AVERAGE) AS SUM(amount),
+    events.d CUMULATIVE (dates.day OVER INTERVAL '7 days' LAST) AS SUM(amount)
+  );
+
+query II
+SELECT object_name, property_value FROM (DESCRIBE SEMANTIC VIEW grammar) WHERE property = 'CUMULATIVE' AND object_name IN ('b', 'c') ORDER BY 1;
+----
+b	dates.day TO MONTH FIRST
+c	dates.day AVERAGE
+
+query I
+SELECT count(*) FROM (DESCRIBE SEMANTIC VIEW grammar) WHERE property = 'CUMULATIVE' AND object_name IN ('a', 'd') AND property_value LIKE 'dates.day OVER %';
+----
+2
+
+# errors
+statement error
+CREATE SEMANTIC VIEW bad TABLES (dates PRIMARY KEY (day)) DIMENSIONS (dates.d2 CUMULATIVE (dates.day) AS day);
+----
+CUMULATIVE is only allowed on metrics
+
+statement error
+CREATE SEMANTIC VIEW bad TABLES (dates PRIMARY KEY (day), events PRIMARY KEY (event_id)) RELATIONSHIPS (events (event_date) REFERENCES dates)
+  DIMENSIONS (dates.month AS DATE_TRUNC('month', day)) METRICS (events.x CUMULATIVE (dates.month) AS SUM(amount));
+----
+must be defined as a column of its logical table
+
+statement error
+CREATE SEMANTIC VIEW bad TABLES (dates PRIMARY KEY (day), events PRIMARY KEY (event_id)) RELATIONSHIPS (events (event_date) REFERENCES dates)
+  DIMENSIONS (dates.day AS day) METRICS (events.x CUMULATIVE (dates.nope) AS SUM(amount));
+----
+nope
+
+statement error
+CREATE SEMANTIC VIEW bad TABLES (dates PRIMARY KEY (day), events PRIMARY KEY (event_id)) RELATIONSHIPS (events (event_date) REFERENCES dates)
+  DIMENSIONS (dates.day AS day) METRICS (events.x CUMULATIVE (dates.day OVER events.amount) AS SUM(amount));
+----
+the window must be a constant expression
+
+statement error
+CREATE SEMANTIC VIEW bad TABLES (dates PRIMARY KEY (day), events PRIMARY KEY (event_id)) RELATIONSHIPS (events (event_date) REFERENCES dates)
+  DIMENSIONS (dates.day AS day) METRICS (events.x CUMULATIVE (dates.day OVER TRUE) AS SUM(amount));
+----
+as the window of column "dates.day"
+
+statement error
+CREATE SEMANTIC VIEW bad TABLES (dates PRIMARY KEY (day), events PRIMARY KEY (event_id)) RELATIONSHIPS (events (event_date) REFERENCES dates)
+  DIMENSIONS (dates.day AS day) METRICS (events.x CUMULATIVE (dates.day TO fortnight) AS SUM(amount));
+----
+"fortnight" is not a date part to truncate to
+
+statement error
+CREATE SEMANTIC VIEW bad TABLES (dates PRIMARY KEY (day), events PRIMARY KEY (event_id)) RELATIONSHIPS (events (event_date) REFERENCES dates)
+  DIMENSIONS (dates.day AS day) METRICS (events.x CUMULATIVE (dates.day TO dow) AS SUM(amount));
+----
+"dow" is not a date part to truncate to
+
+statement error
+CREATE SEMANTIC VIEW bad TABLES (dates PRIMARY KEY (day), events PRIMARY KEY (event_id)) RELATIONSHIPS (events (event_date) REFERENCES dates)
+  DIMENSIONS (dates.y AS year) METRICS (events.x CUMULATIVE (dates.y TO MONTH) AS SUM(amount));
+----
+cannot truncate column "dates.year" (INTEGER) to month

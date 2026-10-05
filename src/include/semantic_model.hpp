@@ -115,6 +115,46 @@ struct SemanticOffset {
 	}
 };
 
+enum class SemanticCumulativeKind : uint8_t {
+	//! running total: c <= t
+	ALL,
+	//! OVER <interval>: t - interval < c <= t
+	WINDOW,
+	//! TO <part>: date_trunc(part, t) <= c <= t
+	GRAIN
+};
+
+//! CUMULATIVE (<dimension> ...) of metrics: in their aggregation blocks, each row counts for every anchor date t (a
+//! value of the dimension's column) whose window holds its date, and the query's dimensions and WHERE read t
+//! (semantic_cumulative.hpp). Equal clauses are stored once.
+//! Move-only: MSVC instantiates `vector`'s copy constructor unless the copy is explicitly deleted.
+struct SemanticCumulative {
+	//! The cumulative dimension: a dimension defined as a column
+	idx_t dimension;
+	idx_t table;
+	string column;
+	LogicalType type;
+	SemanticCumulativeKind kind;
+	//! WINDOW: constant interval expression, as written
+	unique_ptr<ParsedExpression> window;
+	//! GRAIN: date part (lower case)
+	string part;
+	SemanticCumulativePeriod period;
+
+	SemanticCumulative() = default;
+	SemanticCumulative(const SemanticCumulative &) = delete;
+	SemanticCumulative &operator=(const SemanticCumulative &) = delete;
+	SemanticCumulative(SemanticCumulative &&) noexcept = default;
+	SemanticCumulative &operator=(SemanticCumulative &&) noexcept = default;
+
+	//! Whether both aggregate the same windows of the same column and reduce them the same way
+	bool Equals(const SemanticCumulative &other) const {
+		return table == other.table && StringUtil::CIEquals(column, other.column) && kind == other.kind &&
+		       part == other.part && period == other.period &&
+		       (window ? other.window && window->Equals(*other.window) : !other.window);
+	}
+};
+
 struct SemanticMember {
 	//! Definition entry, owned by SemanticModel::definition
 	const ParsedSemanticMember *parsed;
@@ -132,6 +172,8 @@ struct SemanticMember {
 	unique_ptr<ParsedExpression> filter;
 	//! OFFSET (metrics only): index into SemanticModel::offsets
 	optional_idx offset;
+	//! CUMULATIVE (metrics only): index into SemanticModel::cumulatives
+	optional_idx cumulative;
 
 	SemanticMemberKind Kind() const {
 		return parsed->kind;
@@ -177,6 +219,8 @@ public:
 	vector<SemanticMember> members;
 	//! Distinct OFFSETs of the metrics
 	vector<SemanticOffset> offsets;
+	//! Distinct CUMULATIVE clauses of the metrics
+	vector<SemanticCumulative> cumulatives;
 	//! Materializations of the view (semantic_materialization.hpp), in definition order
 	vector<shared_ptr<SemanticMaterialization>> materializations;
 

@@ -78,6 +78,12 @@ struct ParsedSemanticRelationship {
 	static ParsedSemanticRelationship Deserialize(Deserializer &deserializer);
 };
 
+//! How a CUMULATIVE metric is reduced to a coarser grain than its dimension: its value at the last / first anchor date
+//! of each group, or the average over them
+enum class SemanticCumulativePeriod : uint8_t { LAST, FIRST, AVERAGE };
+
+string SemanticCumulativePeriodToString(SemanticCumulativePeriod period);
+
 struct ParsedSemanticMember {
 	SemanticMemberKind kind = SemanticMemberKind::DIMENSION;
 	//! Owning logical table; empty for derived metrics
@@ -92,6 +98,14 @@ struct ParsedSemanticMember {
 	//! OFFSET (<dimension> BY <interval>) (metrics only): the dimension's name parts, empty when absent
 	vector<string> offset_dimension;
 	unique_ptr<ParsedExpression> offset_interval;
+	//! CUMULATIVE (<dimension> [OVER <interval> | TO <part>] [FIRST | LAST | AVERAGE]) (metrics only): the
+	//! dimension's name parts, empty when absent
+	vector<string> cumulative_dimension;
+	//! OVER <interval>, or null
+	unique_ptr<ParsedExpression> cumulative_window;
+	//! TO <part> (lower case), or empty
+	string cumulative_part;
+	SemanticCumulativePeriod cumulative_period = SemanticCumulativePeriod::LAST;
 	unique_ptr<ParsedExpression> expression;
 	vector<string> synonyms;
 	string comment;
@@ -102,6 +116,8 @@ struct ParsedSemanticMember {
 	string cortex_search_column;
 
 	string FullName() const;
+	//! The CUMULATIVE clause's body as written, with its period (`dates.day TO MONTH LAST`)
+	string CumulativeToString() const;
 	void Serialize(Serializer &serializer) const;
 	static ParsedSemanticMember Deserialize(Deserializer &deserializer);
 };

@@ -1443,7 +1443,7 @@ SemanticAsof <- 'ASOF'
 SemanticFactsClause <- 'FACTS' Parens(List(SemanticMember))
 SemanticDimensionsClause <- 'DIMENSIONS' Parens(List(SemanticMember))
 SemanticMetricsClause <- 'METRICS' Parens(List(SemanticMember))
-SemanticMember <- SemanticVisibility? SemanticMemberName SemanticLabels? SemanticUsing? SemanticNonAdditive? SemanticMetricFilter? SemanticMetricOffset? 'AS' Expression SemanticMemberOption*
+SemanticMember <- SemanticVisibility? SemanticMemberName SemanticLabels? SemanticUsing? SemanticNonAdditive? SemanticMetricFilter? SemanticMetricOffset? SemanticMetricCumulative? 'AS' Expression SemanticMemberOption*
 SemanticVisibility <- 'PRIVATE' / 'PUBLIC'
 SemanticMemberName <- SemanticQualifiedMemberName / ColId
 SemanticQualifiedMemberName <- ColId '.' ColLabel
@@ -1454,6 +1454,12 @@ SemanticMetricFilter <- 'FILTER' Parens(SemanticMetricFilterBody)
 SemanticMetricFilterBody <- 'WHERE' Expression
 SemanticMetricOffset <- 'OFFSET' Parens(SemanticMetricOffsetBody)
 SemanticMetricOffsetBody <- SemanticDottedName 'BY' Expression
+SemanticMetricCumulative <- 'CUMULATIVE' Parens(SemanticCumulativeBody)
+SemanticCumulativeBody <- SemanticDottedName SemanticCumulativeFrame? SemanticCumulativePeriod?
+SemanticCumulativeFrame <- SemanticCumulativeWindow / SemanticCumulativeGrain
+SemanticCumulativeWindow <- 'OVER' Expression
+SemanticCumulativeGrain <- 'TO' ColLabel
+SemanticCumulativePeriod <- 'FIRST' / 'LAST' / 'AVERAGE'
 SemanticMemberOption <- SemanticWithSynonyms / SemanticComment / SemanticTag / SemanticSampleValues / SemanticIsEnum / SemanticCortexSearch
 SemanticWithSynonyms <- 'WITH'? 'SYNONYMS' '='? Parens(List(SemanticString))
 SemanticComment <- 'COMMENT' '=' SemanticString
