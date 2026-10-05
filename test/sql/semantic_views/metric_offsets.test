@@ -377,7 +377,7 @@ CREATE SEMANTIC VIEW bad TABLES (t AS spine PRIMARY KEY (day), invoices PRIMARY 
   RELATIONSHIPS (invoices (invoiced_at) REFERENCES t)
   DIMENSIONS (t.day AS day, invoices.amount_ly OFFSET (t.day BY INTERVAL 1 YEAR) AS amount);
 ----
-FILTER and OFFSET are only allowed on metrics
+OFFSET is only allowed on metrics
 
 statement error
 CREATE SEMANTIC VIEW bad TABLES (account AS accounts PRIMARY KEY (account_id), invoices PRIMARY KEY (invoice_id), costs PRIMARY KEY (cost_id))

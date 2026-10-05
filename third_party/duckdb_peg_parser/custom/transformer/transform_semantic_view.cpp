@@ -265,10 +265,6 @@ vector<ParsedSemanticMember> TransformSemanticMemberClause(PEGTransformer &trans
 		if (member.is_private && kind == SemanticMemberKind::DIMENSION) {
 			throw ParserException("semantic view: dimensions cannot be PRIVATE");
 		}
-		if (kind != SemanticMemberKind::METRIC && (member.filter || !member.offset_dimension.empty())) {
-			throw ParserException("semantic view: FILTER and OFFSET are only allowed on metrics ('%s')",
-			                      member.FullName());
-		}
 		if (member.table.empty() && kind != SemanticMemberKind::METRIC) {
 			throw ParserException("semantic view: %s '%s' must be qualified with its logical table (table.name)",
 			                      StringUtil::Lower(SemanticMemberKindToString(kind)), member.name);

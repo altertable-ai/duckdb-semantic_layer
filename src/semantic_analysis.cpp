@@ -177,28 +177,23 @@ SemanticMetricContext SemanticAnalyzer::MetricContext(idx_t metric, const Semant
 	if (member.filter) {
 		result.filters.push_back(metric);
 	}
-	if (member.offset) {
-		result.offsets.push_back(metric);
+	if (member.offset.IsValid()) {
+		result.offsets.push_back(member.offset.GetIndex());
 	}
 	result.offsets.insert(result.offsets.end(), outer.offsets.begin(), outer.offsets.end());
 	return result;
 }
 
 void SemanticAnalyzer::ApplyMetricContext(SemanticAtom &atom, const string &what) {
-	for (auto metric : atom.context.offsets) {
-		auto &offset = *model.members[metric].offset;
+	for (auto o : atom.context.offsets) {
+		auto &offset = model.offsets[o];
 		if (!model.Reaches(atom.home, offset.table)) {
-			throw SemanticDefinitionException(
-			    "%s: OFFSET dimension \"%s\" of metric \"%s\" is not reachable from logical table \"%s\"", what,
-			    model.MemberDisplayName(offset.dimension), model.MemberDisplayName(metric),
-			    model.tables[atom.home].name);
+			throw SemanticDefinitionException("%s: OFFSET dimension \"%s\" is not reachable from logical table \"%s\"",
+			                                  what, model.MemberDisplayName(offset.dimension),
+			                                  model.tables[atom.home].name);
 		}
 	}
-	if (atom.context.filters.empty()) {
-		return;
-	}
 	auto &aggregate = atom.aggregate->Cast<FunctionExpression>();
-	auto description = aggregate.ToString();
 	for (auto metric : atom.context.filters) {
 		set<idx_t> tables;
 		RowTables(*model.members[metric].filter, DConstants::INVALID_INDEX, tables, what);
@@ -208,23 +203,23 @@ void SemanticAnalyzer::ApplyMetricContext(SemanticAtom &atom, const string &what
 				    "%s: FILTER of metric \"%s\" references logical table \"%s\", which is not reachable from \"%s\" "
 				    "(aggregated by %s)",
 				    what, model.MemberDisplayName(metric), model.tables[table].name, model.tables[atom.home].name,
-				    description);
+				    aggregate.ToString());
 			}
 		}
 	}
 	if (atom.context.non_additive_member != DConstants::INVALID_INDEX) {
-		// the last snapshot is picked among the filtered rows: the filters stay in the context and filter the block's
-		// rows (semantic_query_compiler.cpp)
-		return;
+		// the last snapshot is picked among the filtered rows
+		atom.row_filters = std::move(atom.context.filters);
+	} else if (!atom.context.filters.empty()) {
+		vector<unique_ptr<ParsedExpression>> conditions;
+		if (aggregate.filter) {
+			conditions.push_back(std::move(aggregate.filter));
+		}
+		for (auto metric : atom.context.filters) {
+			conditions.push_back(model.members[metric].filter->Copy());
+		}
+		aggregate.filter = AndAll(std::move(conditions));
 	}
-	vector<unique_ptr<ParsedExpression>> conditions;
-	if (aggregate.filter) {
-		conditions.push_back(std::move(aggregate.filter));
-	}
-	for (auto metric : atom.context.filters) {
-		conditions.push_back(model.members[metric].filter->Copy());
-	}
-	aggregate.filter = AndAll(std::move(conditions));
 	atom.context.filters.clear();
 }
 
@@ -318,15 +313,6 @@ unique_ptr<ParsedExpression> SemanticAnalyzer::Decompose(const ParsedExpression 
 	};
 	rewrite(result);
 	return result;
-}
-
-string SemanticOffsetKey(const SemanticModel &model, const vector<idx_t> &offsets) {
-	string key;
-	for (auto metric : offsets) {
-		auto &offset = *model.members[metric].offset;
-		key += to_string(offset.table) + "." + offset.column + "+" + offset.interval->ToString() + ";";
-	}
-	return key;
 }
 
 } // namespace duckdb

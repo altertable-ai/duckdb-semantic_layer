@@ -192,7 +192,7 @@ statement error
 CREATE SEMANTIC VIEW bad TABLES (invoices PRIMARY KEY (invoice_id))
   DIMENSIONS (invoices.year FILTER (WHERE amount > 1) AS year(invoiced_at));
 ----
-FILTER and OFFSET are only allowed on metrics
+FILTER is only allowed on metrics
 
 # a cycle through a metric filter is reported, like any circular reference
 statement error

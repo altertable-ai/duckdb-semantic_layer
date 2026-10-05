@@ -6,20 +6,10 @@
 #include "duckdb/common/exception/catalog_exception.hpp"
 #include "duckdb/common/to_string.hpp"
 #include "duckdb/common/string_util.hpp"
-#include "duckdb/parser/expression/cast_expression.hpp"
-#include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/expression/subquery_expression.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
 
 namespace duckdb {
-
-unique_ptr<ParsedExpression> SemanticShiftColumn(unique_ptr<ParsedExpression> column, const SemanticOffset &offset) {
-	vector<unique_ptr<ParsedExpression>> children;
-	children.push_back(std::move(column));
-	children.push_back(offset.interval->Copy());
-	auto sum = make_uniq<FunctionExpression>("+", std::move(children), nullptr, nullptr, false, true);
-	return make_uniq<CastExpression>(offset.type, std::move(sum));
-}
 
 bool SemanticTable::IsKey(const vector<string> &cols) const {
 	auto matches = [&](const vector<string> &key) {

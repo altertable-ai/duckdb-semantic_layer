@@ -22,6 +22,7 @@
 #include "semantic_analysis.hpp"
 #include "semantic_model.hpp"
 #include "semantic_materialization.hpp"
+#include "semantic_offsets.hpp"
 #include "semantic_query_compiler.hpp"
 
 namespace duckdb {
@@ -417,20 +418,10 @@ private:
 		}
 	}
 
-	static bool ContainsColumnOrSubquery(const ParsedExpression &expr) {
-		if (expr.GetExpressionClass() == ExpressionClass::COLUMN_REF ||
-		    expr.GetExpressionClass() == ExpressionClass::SUBQUERY) {
-			return true;
-		}
-		bool found = false;
-		ParsedExpressionIterator::EnumerateChildren(
-		    expr, [&](const ParsedExpression &child) { found = found || ContainsColumnOrSubquery(child); });
-		return found;
-	}
-
 	//! OFFSET dimensions resolve to a dimension defined as a column; the interval must be constant and shift the
-	//! column's type
+	//! column's type. Equal offsets are stored once.
 	void ResolveOffsets() {
+		SemanticAnalyzer analyzer(*model, context);
 		for (idx_t m = 0; m < model->members.size(); m++) {
 			auto &member = model->members[m];
 			auto &parsed = *member.parsed;
@@ -454,21 +445,26 @@ private:
 			if (!column.Is(SemanticRefKind::COLUMN)) {
 				Fail("%s: dimension \"%s\" must be defined as a column of its logical table", what, name);
 			}
-			SemanticAnalyzer analyzer(*model, context);
-			if (ContainsColumnOrSubquery(*parsed.offset_interval) ||
-			    analyzer.ContainsAggregateOrMetric(*parsed.offset_interval) ||
-			    SemanticAnalyzer::ContainsWindow(*parsed.offset_interval)) {
+			auto &interval = *parsed.offset_interval;
+			if (!interval.IsScalar() || analyzer.ContainsAggregateOrMetric(interval) ||
+			    SemanticAnalyzer::ContainsWindow(interval)) {
 				Fail("%s: the interval must be a constant expression", what);
 			}
 			auto &table = model->tables[column.index];
-			auto offset = make_uniq<SemanticOffset>();
-			offset->dimension = ref.index;
-			offset->table = column.index;
-			offset->column = column.column;
-			offset->type = table.column_types[table.columns.at(column.column)];
-			offset->interval = parsed.offset_interval->Copy();
-			CheckOffsetType(*offset, what);
-			member.offset = std::move(offset);
+			SemanticOffset offset;
+			offset.dimension = ref.index;
+			offset.table = column.index;
+			offset.column = column.column;
+			offset.type = table.column_types[table.columns.at(column.column)];
+			offset.interval = interval.Copy();
+			auto existing = std::find_if(model->offsets.begin(), model->offsets.end(),
+			                             [&](const SemanticOffset &other) { return other.Equals(offset); });
+			if (existing == model->offsets.end()) {
+				CheckOffsetType(offset, what);
+				model->offsets.push_back(std::move(offset));
+				existing = model->offsets.end() - 1;
+			}
+			member.offset = NumericCast<idx_t>(existing - model->offsets.begin());
 		}
 	}
 
