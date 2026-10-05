@@ -74,14 +74,20 @@ shared_ptr<SemanticMaterialization> PlanSemanticMaterialization(ClientContext &c
 	idx_t atom_count = 0;
 
 	for (auto &plan : plans) {
-		if (plan.non_additive_member != DConstants::INVALID_INDEX) {
+		if (plan.key.non_additive_member != DConstants::INVALID_INDEX) {
 			throw SemanticDefinitionException(
 			    "%s: semi-additive metric \"%s\" (NON ADDITIVE BY) cannot be materialized", what,
-			    model.MemberDisplayName(plan.non_additive_member));
+			    model.MemberDisplayName(plan.key.non_additive_member));
+		}
+		if (!plan.key.offsets.empty()) {
+			auto &offset = model.offsets[plan.key.offsets[0]];
+			throw SemanticDefinitionException("%s: a metric uses OFFSET and cannot be materialized (OFFSET (%s BY %s))",
+			                                  what, model.MemberDisplayName(offset.dimension),
+			                                  offset.interval->ToString());
 		}
 		SemanticMaterializedBlock block;
-		block.home = plan.home;
-		block.using_relationships = plan.using_relationships;
+		block.home = plan.key.home;
+		block.using_relationships = plan.key.using_relationships;
 		block.tables = std::move(plan.dependencies.tables);
 		block.nested_tables = std::move(plan.dependencies.nested_tables);
 		block.children = std::move(plan.dependencies.children);
@@ -343,11 +349,6 @@ static unique_ptr<ParsedExpression> RewriteOverDimensions(const ParsedExpression
 	return failed ? nullptr : std::move(result);
 }
 
-static bool SameContext(const SemanticMetricContext &a, const SemanticMetricContext &b) {
-	return a.table == b.table && a.using_relationships == b.using_relationships &&
-	       a.non_additive_member == b.non_additive_member;
-}
-
 SemanticMaterializationMatcher::SemanticMaterializationMatcher(ClientContext &context, const SemanticModel &model)
     : context(context), model(model), enabled(true) {
 	Value setting;
@@ -367,7 +368,7 @@ bool SemanticMaterializationMatcher::IsUsable(const SemanticMaterialization &mat
 }
 
 unique_ptr<SemanticMaterializedRead> SemanticMaterializationMatcher::Find(
-    const SemanticBlockPlan &block, const vector<idx_t> &atoms, const vector<SemanticAtom> &all_atoms,
+    const SemanticBlockKey &block, const vector<idx_t> &atoms, const vector<SemanticAtom> &all_atoms,
     const vector<const ParsedExpression *> &dimensions, optional_ptr<const ParsedExpression> where) {
 	if (!enabled || block.non_additive_member != DConstants::INVALID_INDEX) {
 		return nullptr;
@@ -391,8 +392,7 @@ unique_ptr<SemanticMaterializedRead> SemanticMaterializationMatcher::Find(
 				auto &atom = all_atoms[a];
 				optional_ptr<const SemanticMaterializedAtom> found;
 				for (auto &candidate : stored.atoms) {
-					if (candidate.atom.aggregate->Equals(*atom.aggregate) &&
-					    SameContext(candidate.atom.context, atom.context)) {
+					if (candidate.atom.Equals(atom)) {
 						found = &candidate;
 						break;
 					}

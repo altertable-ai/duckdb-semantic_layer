@@ -87,6 +87,11 @@ struct ParsedSemanticMember {
 	vector<string> labels;
 	vector<string> using_relationships;
 	vector<OrderByNode> non_additive_by;
+	//! FILTER (WHERE <condition>) (metrics only); null when absent
+	unique_ptr<ParsedExpression> filter;
+	//! OFFSET (<dimension> BY <interval>) (metrics only): the dimension's name parts, empty when absent
+	vector<string> offset_dimension;
+	unique_ptr<ParsedExpression> offset_interval;
 	unique_ptr<ParsedExpression> expression;
 	vector<string> synonyms;
 	string comment;

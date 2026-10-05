@@ -125,3 +125,27 @@ SELECT count(*) FROM (
 );
 ----
 0
+
+# adjacent string literals are concatenated, as in DuckDB's SQL parser
+statement ok
+CREATE SEMANTIC VIEW concat_view
+  TABLES (p AS products PRIMARY KEY (id))
+  DIMENSIONS (p.category AS category COMMENT = 'Product'
+    ' category')
+  COMMENT = 'Catalog'
+    ' view';
+
+query II
+SELECT object_name, property_value FROM (DESCRIBE SEMANTIC VIEW concat_view) WHERE property = 'COMMENT' AND property_value <> '' ORDER BY object_name NULLS FIRST;
+----
+NULL	Catalog view
+category	Product category
+
+statement ok
+ALTER SEMANTIC VIEW concat_view SET COMMENT = 'Catalog'
+  ' view, renamed';
+
+query I
+SELECT comment FROM (SHOW SEMANTIC VIEWS) WHERE name = 'concat_view';
+----
+Catalog view, renamed

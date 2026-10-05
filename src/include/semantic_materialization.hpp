@@ -183,7 +183,7 @@ class SemanticMaterializationMatcher : public SemanticMaterializationProvider {
 public:
 	SemanticMaterializationMatcher(ClientContext &context, const SemanticModel &model);
 
-	unique_ptr<SemanticMaterializedRead> Find(const SemanticBlockPlan &block, const vector<idx_t> &atoms,
+	unique_ptr<SemanticMaterializedRead> Find(const SemanticBlockKey &block, const vector<idx_t> &atoms,
 	                                          const vector<SemanticAtom> &all_atoms,
 	                                          const vector<const ParsedExpression *> &dimensions,
 	                                          optional_ptr<const ParsedExpression> where) override;

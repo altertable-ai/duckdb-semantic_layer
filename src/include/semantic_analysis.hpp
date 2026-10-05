@@ -27,21 +27,71 @@ struct SemanticMetricContext {
 	vector<idx_t> using_relationships;
 	//! Metric whose NON ADDITIVE BY applies, or INVALID_INDEX
 	idx_t non_additive_member = DConstants::INVALID_INDEX;
+	//! While decomposing: metrics whose FILTER applies (outer metrics first). Applied, then cleared, when an atom is
+	//! created (SemanticAnalyzer::ApplyMetricContext).
+	vector<idx_t> filters;
+	//! Offsets (SemanticModel::offsets) that apply, in the order the shifts are applied (innermost metric first)
+	vector<idx_t> offsets;
+
+	bool operator==(const SemanticMetricContext &other) const {
+		return table == other.table && using_relationships == other.using_relationships &&
+		       non_additive_member == other.non_additive_member && filters == other.filters && offsets == other.offsets;
+	}
+};
+
+//! What atoms aggregated together (one aggregation block) share: the rows of the same home table, joined through the
+//! same USING relationships, filtered, picked (NON ADDITIVE BY) and shifted (OFFSET) the same way
+struct SemanticBlockKey {
+	idx_t home;
+	vector<idx_t> using_relationships;
+	//! Metric whose NON ADDITIVE BY picks the last snapshot, or INVALID_INDEX
+	idx_t non_additive_member;
+	//! Metrics whose FILTER filters the rows (semi-additive atoms only, see SemanticAtom::row_filters)
+	vector<idx_t> row_filters;
+	//! Offsets (SemanticModel::offsets) shifting the query's dimensions and WHERE, in application order
+	vector<idx_t> offsets;
+
+	bool operator==(const SemanticBlockKey &other) const {
+		return home == other.home && using_relationships == other.using_relationships &&
+		       non_additive_member == other.non_additive_member && row_filters == other.row_filters &&
+		       offsets == other.offsets;
+	}
 };
 
 //! An aggregate evaluated over the rows of `home`.
 //! Move-only: MSVC instantiates `vector`'s copy constructor unless the copy is explicitly deleted.
 struct SemanticAtom {
 	idx_t home;
-	//! The aggregate expression (resolved; marker references)
+	//! The aggregate expression (resolved; marker references), metric FILTERs included
 	unique_ptr<ParsedExpression> aggregate;
 	SemanticMetricContext context;
+	//! Metrics whose FILTER filters the rows of the atom's block instead of its aggregate: semi-additive atoms pick
+	//! their last snapshot among the filtered rows
+	vector<idx_t> row_filters;
 
 	SemanticAtom() = default;
 	SemanticAtom(const SemanticAtom &) = delete;
 	SemanticAtom &operator=(const SemanticAtom &) = delete;
 	SemanticAtom(SemanticAtom &&) noexcept = default;
 	SemanticAtom &operator=(SemanticAtom &&) noexcept = default;
+
+	SemanticAtom Copy() const {
+		SemanticAtom result;
+		result.home = home;
+		result.aggregate = aggregate->Copy();
+		result.context = context;
+		result.row_filters = row_filters;
+		return result;
+	}
+	//! Whether both atoms compute the same values
+	bool Equals(const SemanticAtom &other) const {
+		return home == other.home && aggregate->Equals(*other.aggregate) && context == other.context &&
+		       row_filters == other.row_filters;
+	}
+	SemanticBlockKey BlockKey() const {
+		return SemanticBlockKey {home, context.using_relationships, context.non_additive_member, row_filters,
+		                         context.offsets};
+	}
 };
 
 class SemanticAnalyzer {
@@ -77,6 +127,10 @@ public:
 	void WindowDimensions(const ParsedExpression &expr, set<idx_t> &dimensions) const;
 
 private:
+	//! Applies the metric context of a new atom: checks the tables of its OFFSET dimensions and FILTERs are reachable
+	//! from its home table, and moves the FILTERs out of the context, AND-ed into its aggregate (or into its row
+	//! filters when it is semi-additive)
+	void ApplyMetricContext(SemanticAtom &atom, const string &what);
 	SemanticMetricContext MetricContext(idx_t metric, const SemanticMetricContext &outer) const;
 
 	const SemanticModel &model;

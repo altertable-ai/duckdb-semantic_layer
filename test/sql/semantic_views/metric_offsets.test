@@ -1,0 +1,397 @@
+# name: test/sql/semantic_views/metric_offsets.test
+# description: metric time offsets (OFFSET (<dimension> BY <interval>)): a metric computed from the rows dated one
+# group: [semantic_views]
+
+# interval earlier
+
+require semantic_views
+
+statement ok
+PRAGMA enable_verification
+
+statement ok
+CREATE TABLE accounts (account_id INTEGER, segment VARCHAR, country VARCHAR);
+
+statement ok
+INSERT INTO accounts VALUES (1, 'enterprise', 'FR'), (2, 'startup', 'US'), (3, 'enterprise', 'DE'), (4, 'startup', 'FR');
+
+statement ok
+CREATE TABLE invoices (invoice_id INTEGER, account_id INTEGER, reseller_id INTEGER, invoiced_at DATE, amount INTEGER);
+
+statement ok
+INSERT INTO invoices VALUES
+  (1, 1, 2, '2025-09-03', 800), (2, 2, 3, '2025-09-10', 400), (3, 3, 1, '2025-10-20', 600), (4, 4, 1, '2025-12-31', 300),
+  (5, 1, 2, '2026-09-01', 1000), (6, 2, 3, '2026-09-15', 500), (7, 1, 4, '2026-09-15', 1200), (8, 3, NULL, '2026-10-10', 900),
+  (9, 4, 3, '2026-02-28', 250);
+
+statement ok
+CREATE TABLE costs (cost_id INTEGER, account_id INTEGER, incurred_at DATE, cost INTEGER);
+
+statement ok
+INSERT INTO costs VALUES (1, 1, '2025-09-03', 160), (2, 2, '2025-09-10', 90), (3, 3, '2025-10-20', 170),
+  (4, 1, '2026-09-01', 250), (5, 2, '2026-09-15', 80), (6, 3, '2026-10-10', 180);
+
+statement ok
+CREATE TABLE spine AS SELECT range::DATE AS day FROM range(DATE '2024-01-01', DATE '2028-01-01', INTERVAL 1 DAY);
+
+statement ok
+CREATE SEMANTIC VIEW ledger
+  TABLES (
+    account AS accounts PRIMARY KEY (account_id),
+    t AS spine PRIMARY KEY (day),
+    invoices PRIMARY KEY (invoice_id),
+    costs PRIMARY KEY (cost_id)
+  )
+  RELATIONSHIPS (
+    invoices (account_id) REFERENCES account,
+    invoices (invoiced_at) REFERENCES t,
+    costs (account_id) REFERENCES account,
+    costs (incurred_at) REFERENCES t
+  )
+  DIMENSIONS (
+    account.segment AS segment,
+    account.country AS country,
+    t.day AS day,
+    t.month AS DATE_TRUNC('month', day)::DATE,
+    t.year AS year(day),
+    invoices.invoice_date AS invoiced_at,
+    invoices.invoice_month AS DATE_TRUNC('month', invoiced_at)::DATE
+  )
+  METRICS (
+    invoices.revenue AS SUM(amount),
+    invoices.enterprise_revenue FILTER (WHERE account.segment = 'enterprise') AS SUM(amount),
+    invoices.revenue_ly OFFSET (t.day BY INTERVAL 1 YEAR) AS revenue,
+    invoices.revenue_ly_lm OFFSET (t.day BY INTERVAL 1 MONTH) AS revenue_ly,
+    invoices.revenue_next_month OFFSET (t.day BY INTERVAL '-1 month') AS revenue,
+    enterprise_revenue_ly OFFSET (t.day BY INTERVAL 1 YEAR) AS invoices.enterprise_revenue,
+    invoices.revenue_2025 FILTER (WHERE t.year = 2025) AS SUM(amount),
+    invoices.revenue_2025_ly OFFSET (t.day BY INTERVAL 1 YEAR) AS revenue_2025,
+    invoices.revenue_prev_invoice_month OFFSET (invoices.invoice_date BY INTERVAL 1 MONTH) AS revenue,
+    costs.cost AS SUM(cost),
+    margin AS (invoices.revenue - costs.cost) / invoices.revenue,
+    margin_ly OFFSET (t.day BY INTERVAL 1 YEAR) AS margin,
+    margin_growth AS (margin - margin_ly) / NULLIF(margin_ly, 0)
+  );
+
+# monthly grain; a negative interval looks forward
+query IIII
+SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS t.month METRICS invoices.revenue, invoices.revenue_ly, invoices.revenue_next_month)
+ORDER BY month;
+----
+2025-08-01	NULL	NULL	1200
+2025-09-01	1200	NULL	600
+2025-10-01	600	NULL	NULL
+2025-11-01	NULL	NULL	300
+2025-12-01	300	NULL	NULL
+2026-01-01	NULL	NULL	250
+2026-02-01	250	NULL	NULL
+2026-08-01	NULL	NULL	2700
+2026-09-01	2700	1200	900
+2026-10-01	900	600	NULL
+2026-12-01	NULL	300	NULL
+2027-02-01	NULL	250	NULL
+2027-09-01	NULL	2700	NULL
+2027-10-01	NULL	900	NULL
+
+# yearly grain; stacked offsets (1 year, then 1 month)
+query IIII
+SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS t.year METRICS invoices.revenue, invoices.revenue_ly, invoices.revenue_ly_lm)
+ORDER BY year;
+----
+2025	2100	NULL	NULL
+2026	3850	2100	1800
+2027	NULL	3850	4150
+
+# daily grain; WHERE on time selects the previous period's rows
+query II
+SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS t.day METRICS invoices.revenue_ly WHERE t.year = 2026) ORDER BY day;
+----
+2026-09-03	800
+2026-09-10	400
+2026-10-20	600
+2026-12-31	300
+
+query II
+SELECT * FROM SEMANTIC_VIEW(ledger METRICS invoices.revenue, invoices.revenue_ly WHERE t.year = 2026);
+----
+3850	2100
+
+# an offset metric needs a dimension or WHERE condition computed from its offset column
+statement error
+SELECT * FROM SEMANTIC_VIEW(ledger METRICS invoices.revenue, invoices.revenue_ly);
+----
+must be queried with a dimension or WHERE condition computed from "t.day"
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS invoices.invoice_month METRICS invoices.revenue_ly);
+----
+must be queried with a dimension or WHERE condition computed from "t.day"
+
+# other columns of the offset dimension's table (a stored year) would not be shifted
+statement ok
+CREATE TABLE date_dim AS SELECT day AS d_date, year(day) AS d_year FROM spine;
+
+statement ok
+CREATE SEMANTIC VIEW stored_year
+  TABLES (d AS date_dim PRIMARY KEY (d_date), invoices PRIMARY KEY (invoice_id))
+  RELATIONSHIPS (invoices (invoiced_at) REFERENCES d)
+  DIMENSIONS (d.date AS d_date, d.year AS d_year, d.computed_year AS year(d_date))
+  METRICS (invoices.revenue AS SUM(amount), invoices.revenue_ly OFFSET (d.date BY INTERVAL 1 YEAR) AS revenue);
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(stored_year DIMENSIONS d.year METRICS invoices.revenue_ly);
+----
+would not be shifted
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(stored_year DIMENSIONS d.computed_year METRICS invoices.revenue_ly WHERE d.year = 2026);
+----
+would not be shifted
+
+query II
+SELECT * FROM SEMANTIC_VIEW(stored_year DIMENSIONS d.computed_year METRICS invoices.revenue_ly) ORDER BY computed_year;
+----
+2026	2100
+2027	3850
+
+# conditions and dimensions reached through a many-to-many bridge are shifted too
+statement ok
+CREATE TABLE orders (order_id INTEGER, order_date DATE);
+
+statement ok
+INSERT INTO orders VALUES (1, '2025-03-01'), (2, '2026-03-01'), (3, '2026-04-01');
+
+statement ok
+CREATE TABLE order_lines (order_id INTEGER, line_no INTEGER, amount INTEGER);
+
+statement ok
+INSERT INTO order_lines VALUES (1, 1, 10), (1, 2, 20), (2, 1, 100), (3, 1, 1000);
+
+statement ok
+CREATE TABLE promos (promo_id INTEGER, code VARCHAR);
+
+statement ok
+INSERT INTO promos VALUES (1, 'X'), (2, 'Y');
+
+statement ok
+CREATE TABLE order_promos (order_id INTEGER, promo_id INTEGER);
+
+statement ok
+INSERT INTO order_promos VALUES (1, 1), (2, 2), (3, 2);
+
+statement ok
+CREATE SEMANTIC VIEW promo_sales
+  TABLES (orders PRIMARY KEY (order_id), lines AS order_lines PRIMARY KEY (order_id, line_no), promos PRIMARY KEY (promo_id),
+    op AS order_promos PRIMARY KEY (order_id, promo_id))
+  RELATIONSHIPS (lines (order_id) REFERENCES orders, op (order_id) REFERENCES orders, op (promo_id) REFERENCES promos)
+  DIMENSIONS (orders.d AS order_date, orders.y AS year(order_date), promos.code AS code)
+  METRICS (lines.rev AS SUM(amount), lines.rev_ly OFFSET (orders.d BY INTERVAL 1 YEAR) AS rev);
+
+query II
+SELECT * FROM SEMANTIC_VIEW(promo_sales METRICS lines.rev, lines.rev_ly WHERE promos.code = 'X' OR orders.y = 2026);
+----
+1130	30
+
+query III
+SELECT * FROM SEMANTIC_VIEW(promo_sales DIMENSIONS promos.code || '-' || CAST(orders.y AS VARCHAR) AS k METRICS lines.rev, lines.rev_ly) ORDER BY k;
+----
+X-2025	30	NULL
+X-2026	NULL	30
+Y-2026	1100	NULL
+Y-2027	NULL	1100
+
+# output types are those of the unshifted dimensions
+query II
+SELECT DISTINCT typeof(day), typeof(month) FROM SEMANTIC_VIEW(ledger DIMENSIONS t.day, t.month METRICS invoices.revenue_ly);
+----
+DATE	DATE
+
+# offset of a filtered metric, of a derived metric over two tables, and growth combining both
+query IIIIII
+SELECT year, country, enterprise_revenue_ly, round(margin, 6), round(margin_ly, 6), round(margin_growth, 6)
+FROM SEMANTIC_VIEW(ledger DIMENSIONS t.year, account.country METRICS enterprise_revenue_ly, margin, margin_ly, margin_growth)
+ORDER BY year, country;
+----
+2025	DE	NULL	0.716667	NULL	NULL
+2025	FR	NULL	0.854545	NULL	NULL
+2025	US	NULL	0.775	NULL	NULL
+2026	DE	600	0.8	0.716667	0.116279
+2026	FR	800	0.897959	0.854545	0.050803
+2026	US	NULL	0.84	0.775	0.083871
+2027	DE	900	NULL	0.8	NULL
+2027	FR	2200	NULL	0.897959	NULL
+2027	US	NULL	NULL	0.84	NULL
+
+# the offset metric's own definition is not shifted: revenue_2025 one year later is the 2025 revenue
+query III
+SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS t.year METRICS invoices.revenue_2025, invoices.revenue_2025_ly) ORDER BY year;
+----
+2025	2100	NULL
+2026	NULL	2100
+2027	NULL	NULL
+
+# offset of a fact table's own date column
+query III
+SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS invoices.invoice_month METRICS invoices.revenue, invoices.revenue_prev_invoice_month)
+ORDER BY invoice_month;
+----
+2025-09-01	1200	NULL
+2025-10-01	600	1200
+2025-11-01	NULL	600
+2025-12-01	300	NULL
+2026-01-01	NULL	300
+2026-02-01	250	NULL
+2026-03-01	NULL	250
+2026-09-01	2700	NULL
+2026-10-01	900	2700
+2026-11-01	NULL	900
+
+# ad-hoc expressions combining offset and plain metrics; querying by name
+query II
+SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS t.year METRICS invoices.revenue - invoices.revenue_ly AS delta) ORDER BY year;
+----
+2025	NULL
+2026	1750
+2027	NULL
+
+query II
+SELECT t.year, AGG(invoices.revenue_ly) FROM ledger GROUP BY ALL ORDER BY ALL;
+----
+2026	2100
+2027	3850
+
+# the offset survives the definition round trip
+statement ok
+ALTER SEMANTIC VIEW ledger RENAME TO ledger_renamed;
+
+query II
+SELECT * FROM SEMANTIC_VIEW(ledger_renamed DIMENSIONS t.year METRICS invoices.revenue_ly) ORDER BY year;
+----
+2026	2100
+2027	3850
+
+statement ok
+ALTER SEMANTIC VIEW ledger_renamed RENAME TO ledger;
+
+query I
+SELECT property_value LIKE 't.day BY %' FROM (DESCRIBE SEMANTIC VIEW ledger) WHERE object_name = 'revenue_ly' AND property = 'OFFSET';
+----
+true
+
+# offset metrics cannot be materialized; other blocks of the same query still read materializations
+statement error
+ALTER SEMANTIC VIEW ledger ADD MATERIALIZATION bad AS DIMENSIONS t.month METRICS invoices.revenue_ly;
+----
+uses OFFSET and cannot be materialized
+
+statement ok
+ALTER SEMANTIC VIEW ledger ADD MATERIALIZATION revenue_by_month AS DIMENSIONS t.month METRICS invoices.revenue;
+
+statement ok
+ALTER SEMANTIC VIEW ledger SET MAX_STALENESS = 3600;
+
+query I
+SELECT sql ILIKE '%ledger__revenue_by_month__0%' FROM semantic_view_sql('SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS t.month METRICS invoices.revenue, invoices.revenue_ly)');
+----
+true
+
+query III
+SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS t.month METRICS invoices.revenue, invoices.revenue_ly) ORDER BY month;
+----
+2025-09-01	1200	NULL
+2025-10-01	600	NULL
+2025-12-01	300	NULL
+2026-02-01	250	NULL
+2026-09-01	2700	1200
+2026-10-01	900	600
+2026-12-01	NULL	300
+2027-02-01	NULL	250
+2027-09-01	NULL	2700
+2027-10-01	NULL	900
+
+# TIMESTAMP columns and sub-day intervals
+statement ok
+CREATE TABLE ticks (id INTEGER, ts TIMESTAMP, v INTEGER);
+
+statement ok
+INSERT INTO ticks VALUES (1, '2026-01-01 10:15:00', 1), (2, '2026-01-01 10:45:00', 2), (3, '2026-01-01 11:30:00', 4), (4, '2026-01-01 13:00:00', 8);
+
+statement ok
+CREATE SEMANTIC VIEW clock
+  TABLES (ticks PRIMARY KEY (id))
+  DIMENSIONS (ticks.at AS ts, ticks.hour AS date_trunc('hour', ts))
+  METRICS (ticks.total AS SUM(v), ticks.total_prev_hour OFFSET (ticks.at BY INTERVAL 1 HOUR) AS total);
+
+query IIII
+SELECT hour, typeof(hour), total, total_prev_hour FROM SEMANTIC_VIEW(clock DIMENSIONS ticks.hour METRICS ticks.total, ticks.total_prev_hour) ORDER BY hour;
+----
+2026-01-01 10:00:00	TIMESTAMP	3	NULL
+2026-01-01 11:00:00	TIMESTAMP	4	3
+2026-01-01 12:00:00	TIMESTAMP	NULL	4
+2026-01-01 13:00:00	TIMESTAMP	8	NULL
+2026-01-01 14:00:00	TIMESTAMP	NULL	8
+
+# errors
+statement error
+CREATE SEMANTIC VIEW bad TABLES (t AS spine PRIMARY KEY (day), invoices PRIMARY KEY (invoice_id))
+  RELATIONSHIPS (invoices (invoiced_at) REFERENCES t)
+  DIMENSIONS (t.month AS DATE_TRUNC('month', day)::DATE)
+  METRICS (invoices.revenue AS SUM(amount), invoices.bad OFFSET (t.month BY INTERVAL 1 YEAR) AS revenue);
+----
+must be defined as a column of its logical table
+
+statement error
+CREATE SEMANTIC VIEW bad TABLES (account AS accounts PRIMARY KEY (account_id), invoices PRIMARY KEY (invoice_id))
+  RELATIONSHIPS (invoices (account_id) REFERENCES account)
+  DIMENSIONS (account.id AS account_id)
+  METRICS (invoices.revenue AS SUM(amount), invoices.bad OFFSET (account.id BY INTERVAL 1 YEAR) AS revenue);
+----
+cannot shift column
+
+statement error
+CREATE SEMANTIC VIEW bad TABLES (t AS spine PRIMARY KEY (day), invoices PRIMARY KEY (invoice_id))
+  RELATIONSHIPS (invoices (invoiced_at) REFERENCES t)
+  DIMENSIONS (t.day AS day)
+  METRICS (invoices.revenue AS SUM(amount), invoices.bad OFFSET (t.day BY to_days(amount)) AS revenue);
+----
+the interval must be a constant expression
+
+statement error
+CREATE SEMANTIC VIEW bad TABLES (t AS spine PRIMARY KEY (day), invoices PRIMARY KEY (invoice_id))
+  RELATIONSHIPS (invoices (invoiced_at) REFERENCES t)
+  DIMENSIONS (t.day AS day)
+  METRICS (invoices.revenue AS SUM(amount), invoices.bad OFFSET (t.day BY to_days(CAST(count(*) AS INTEGER))) AS revenue);
+----
+the interval must be a constant expression
+
+statement error
+CREATE SEMANTIC VIEW bad TABLES (t AS spine PRIMARY KEY (day), invoices PRIMARY KEY (invoice_id))
+  RELATIONSHIPS (invoices (invoiced_at) REFERENCES t)
+  DIMENSIONS (t.day AS day)
+  METRICS (invoices.revenue AS SUM(amount), invoices.bad OFFSET (t.nope BY INTERVAL 1 YEAR) AS revenue);
+----
+nope
+
+statement error
+CREATE SEMANTIC VIEW bad TABLES (t AS spine PRIMARY KEY (day), invoices PRIMARY KEY (invoice_id))
+  RELATIONSHIPS (invoices (invoiced_at) REFERENCES t)
+  DIMENSIONS (t.day AS day, invoices.amount_ly OFFSET (t.day BY INTERVAL 1 YEAR) AS amount);
+----
+OFFSET is only allowed on metrics
+
+statement error
+CREATE SEMANTIC VIEW bad TABLES (account AS accounts PRIMARY KEY (account_id), invoices PRIMARY KEY (invoice_id), costs PRIMARY KEY (cost_id))
+  RELATIONSHIPS (invoices (account_id) REFERENCES account, costs (account_id) REFERENCES account)
+  DIMENSIONS (invoices.invoice_date AS invoiced_at)
+  METRICS (costs.cost AS SUM(cost), costs.cost_ly OFFSET (invoices.invoice_date BY INTERVAL 1 YEAR) AS cost);
+----
+is not reachable from logical table "costs"
+
+statement error
+CREATE SEMANTIC VIEW bad TABLES (account AS accounts PRIMARY KEY (account_id), t AS spine PRIMARY KEY (day), invoices PRIMARY KEY (invoice_id))
+  RELATIONSHIPS (invoices (account_id) REFERENCES account, invoices (invoiced_at) REFERENCES t)
+  FACTS (account.revenue_ly AS invoices.revenue_ly)
+  DIMENSIONS (t.day AS day)
+  METRICS (invoices.revenue AS SUM(amount), invoices.revenue_ly OFFSET (t.day BY INTERVAL 1 YEAR) AS revenue);
+----
+which uses OFFSET

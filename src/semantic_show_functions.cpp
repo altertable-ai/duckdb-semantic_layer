@@ -257,6 +257,13 @@ static unique_ptr<FunctionData> DescribeBind(ClientContext &context, TableFuncti
 			add(kind, object, parent, "TABLE", model->tables[member.table].name);
 		}
 		add(kind, object, parent, "EXPRESSION", member.Expression().ToString());
+		if (parsed.filter) {
+			add(kind, object, parent, "FILTER", parsed.filter->ToString());
+		}
+		if (!parsed.offset_dimension.empty()) {
+			add(kind, object, parent, "OFFSET",
+			    StringUtil::Join(parsed.offset_dimension, ".") + " BY " + parsed.offset_interval->ToString());
+		}
 		if (member.type.id() != LogicalTypeId::UNKNOWN) {
 			add(kind, object, parent, "DATA_TYPE", member.type.ToString());
 		}

@@ -8,16 +8,21 @@
 #include "duckdb/common/to_string.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/common/error_data.hpp"
+#include "duckdb/parser/expression/cast_expression.hpp"
+#include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/star_expression.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
+#include "duckdb/parser/tableref/emptytableref.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "semantic_analysis.hpp"
 #include "semantic_model.hpp"
 #include "semantic_materialization.hpp"
+#include "semantic_offsets.hpp"
 #include "semantic_query_compiler.hpp"
 
 namespace duckdb {
@@ -72,6 +77,7 @@ public:
 		BuildGraph();
 		BuildMembers();
 		ResolveMembers();
+		ResolveOffsets();
 		CheckMemberCycles();
 		CheckMemberKinds();
 		ProbeSemanticModelTypes(context, *model);
@@ -358,6 +364,12 @@ private:
 			if (!parsed.non_additive_by.empty() && member.Kind() != SemanticMemberKind::METRIC) {
 				Fail("NON ADDITIVE BY is only allowed on metrics (\"%s\")", parsed.FullName());
 			}
+			if (parsed.filter && member.Kind() != SemanticMemberKind::METRIC) {
+				Fail("FILTER is only allowed on metrics (\"%s\")", parsed.FullName());
+			}
+			if (!parsed.offset_dimension.empty() && member.Kind() != SemanticMemberKind::METRIC) {
+				Fail("OFFSET is only allowed on metrics (\"%s\")", parsed.FullName());
+			}
 			model->members.push_back(std::move(member));
 		}
 	}
@@ -398,6 +410,79 @@ private:
 				}
 				member.non_additive.push_back(std::move(entry));
 			}
+			if (member.parsed->filter) {
+				resolve_context.self_member = DConstants::INVALID_INDEX;
+				resolve_context.what = What(m) + " FILTER";
+				member.filter = model->Resolve(*member.parsed->filter, resolve_context);
+			}
+		}
+	}
+
+	//! OFFSET dimensions resolve to a dimension defined as a column; the interval must be constant and shift the
+	//! column's type. Equal offsets are stored once.
+	void ResolveOffsets() {
+		SemanticAnalyzer analyzer(*model, context);
+		for (idx_t m = 0; m < model->members.size(); m++) {
+			auto &member = model->members[m];
+			auto &parsed = *member.parsed;
+			if (parsed.offset_dimension.empty()) {
+				continue;
+			}
+			auto what = What(m) + " OFFSET";
+			auto name = StringUtil::Join(parsed.offset_dimension, ".");
+			SemanticResolveContext resolve_context;
+			resolve_context.owner_table = member.table;
+			resolve_context.what = what;
+			string error;
+			auto ref = model->Lookup(parsed.offset_dimension, resolve_context, error);
+			if (ref.Is(SemanticRefKind::NONE)) {
+				Fail("%s: %s", what, error.empty() ? "unknown dimension \"" + name + "\"" : error);
+			}
+			if (!ref.Is(SemanticRefKind::MEMBER) || model->members[ref.index].Kind() != SemanticMemberKind::DIMENSION) {
+				Fail("%s: \"%s\" is not a dimension", what, name);
+			}
+			auto column = SemanticMarkers::Classify(*model->members[ref.index].resolved);
+			if (!column.Is(SemanticRefKind::COLUMN)) {
+				Fail("%s: dimension \"%s\" must be defined as a column of its logical table", what, name);
+			}
+			auto &interval = *parsed.offset_interval;
+			if (!interval.IsScalar() || analyzer.ContainsAggregateOrMetric(interval) ||
+			    SemanticAnalyzer::ContainsWindow(interval)) {
+				Fail("%s: the interval must be a constant expression", what);
+			}
+			auto &table = model->tables[column.index];
+			SemanticOffset offset;
+			offset.dimension = ref.index;
+			offset.table = column.index;
+			offset.column = column.column;
+			offset.type = table.column_types[table.columns.at(column.column)];
+			offset.interval = interval.Copy();
+			auto existing = std::find_if(model->offsets.begin(), model->offsets.end(),
+			                             [&](const SemanticOffset &other) { return other.Equals(offset); });
+			if (existing == model->offsets.end()) {
+				CheckOffsetType(offset, what);
+				model->offsets.push_back(std::move(offset));
+				existing = model->offsets.end() - 1;
+			}
+			member.offset = NumericCast<idx_t>(existing - model->offsets.begin());
+		}
+	}
+
+	//! Binds SELECT CAST(CAST(NULL AS <type>) + <interval> AS <type>)
+	void CheckOffsetType(const SemanticOffset &offset, const string &what) {
+		auto node = make_uniq<SelectNode>();
+		node->select_list.push_back(SemanticShiftColumn(
+		    make_uniq<CastExpression>(offset.type, make_uniq<ConstantExpression>(Value())), offset));
+		node->from_table = make_uniq<EmptyTableRef>();
+		auto statement = make_uniq<SelectStatement>();
+		statement->node = std::move(node);
+		try {
+			auto binder = Binder::CreateBinder(context);
+			binder->Bind(statement->Cast<SQLStatement>());
+		} catch (std::exception &ex) {
+			ErrorData error(ex);
+			Fail("%s: cannot shift column \"%s.%s\" (%s) by %s: %s", what, model->tables[offset.table].name,
+			     offset.column, offset.type.ToString(), offset.interval->ToString(), error.RawMessage());
 		}
 	}
 
@@ -416,6 +501,9 @@ private:
 		vector<vector<idx_t>> deps(count);
 		for (idx_t m = 0; m < count; m++) {
 			CollectMemberRefs(*model->members[m].resolved, deps[m]);
+			if (model->members[m].filter) {
+				CollectMemberRefs(*model->members[m].filter, deps[m]);
+			}
 		}
 		auto cycle = FindCycle(deps);
 		if (!cycle.empty()) {
@@ -446,6 +534,10 @@ private:
 				vector<SemanticAtom> atoms;
 				analyzer.DecomposeMetric(member, atoms, what);
 				for (auto &atom : atoms) {
+					if (!atom.context.offsets.empty()) {
+						Fail("%s cannot reference metric \"%s\", which uses OFFSET", what,
+						     model->MemberDisplayName(member));
+					}
 					if (atom.home == table || !model->Reaches(atom.home, table) || model->Reaches(table, atom.home)) {
 						Fail("%s cannot reference metric \"%s\": its logical table must have a higher granularity "
 						     "than \"%s\"",
@@ -501,6 +593,10 @@ private:
 
 	void CheckMetric(SemanticAnalyzer &analyzer, idx_t m, const string &what) {
 		auto &member = model->members[m];
+		if (member.filter &&
+		    (analyzer.ContainsAggregateOrMetric(*member.filter) || SemanticAnalyzer::ContainsWindow(*member.filter))) {
+			Fail("%s: FILTER must be a row-level condition (dimensions, facts and columns only)", what);
+		}
 		if (SemanticAnalyzer::ContainsWindow(*member.resolved)) {
 			set<idx_t> dimensions;
 			analyzer.WindowDimensions(*member.resolved, dimensions);

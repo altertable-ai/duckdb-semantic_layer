@@ -6,12 +6,24 @@
 #include "duckdb/catalog/entry_lookup_info.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "semantic_ast_helpers.hpp"
+#include "semantic_offsets.hpp"
 
 namespace duckdb {
 
-//! A row-level expression, evaluated per row of `scope`'s base in the row context of `context_table`
 unique_ptr<ParsedExpression> SemanticExpressionCompiler::Row(const ParsedExpression &expr, SemanticJoinScope &scope,
                                                              idx_t context_table, const string &what) {
+	return CompileRow(expr, scope, context_table, what, vector<idx_t>());
+}
+
+unique_ptr<ParsedExpression> SemanticExpressionCompiler::ShiftedRow(const ParsedExpression &expr,
+                                                                    SemanticJoinScope &scope, const string &what,
+                                                                    const vector<idx_t> &offsets) {
+	return CompileRow(expr, scope, DConstants::INVALID_INDEX, what, offsets);
+}
+
+unique_ptr<ParsedExpression> SemanticExpressionCompiler::CompileRow(const ParsedExpression &expr,
+                                                                    SemanticJoinScope &scope, idx_t context_table,
+                                                                    const string &what, const vector<idx_t> &offsets) {
 	auto dependencies = scope.Dependencies();
 	if (dependencies && expr.GetExpressionClass() == ExpressionClass::SUBQUERY) {
 		dependencies->complete = false;
@@ -39,9 +51,15 @@ unique_ptr<ParsedExpression> SemanticExpressionCompiler::Row(const ParsedExpress
 	unique_ptr<ParsedExpression> result;
 	if (ref.Is(SemanticRefKind::COLUMN)) {
 		result = scope.ColumnReference(ref.index, ref.column);
+		for (auto o : offsets) {
+			auto &offset = model.offsets[o];
+			if (offset.table == ref.index && StringUtil::CIEquals(offset.column, ref.column)) {
+				result = SemanticShiftColumn(std::move(result), offset);
+			}
+		}
 	} else if (ref.Is(SemanticRefKind::MEMBER) && model.members[ref.index].IsRowLevel()) {
 		auto &member = model.members[ref.index];
-		result = Row(*member.resolved, scope, member.table, what);
+		result = CompileRow(*member.resolved, scope, member.table, what, offsets);
 	} else if (ref.Is(SemanticRefKind::MEMBER)) {
 		// a metric in a row-level expression: aggregate the finer rows belonging to the current row
 		vector<SemanticAtom> atoms;
@@ -57,8 +75,9 @@ unique_ptr<ParsedExpression> SemanticExpressionCompiler::Row(const ParsedExpress
 		result = ChildAggregate(atom, context_table, scope, what);
 	} else {
 		result = expr.Copy();
-		ParsedExpressionIterator::EnumerateChildren(
-		    *result, [&](unique_ptr<ParsedExpression> &child) { child = Row(*child, scope, context_table, what); });
+		ParsedExpressionIterator::EnumerateChildren(*result, [&](unique_ptr<ParsedExpression> &child) {
+			child = CompileRow(*child, scope, context_table, what, offsets);
+		});
 		return result;
 	}
 	result->alias = expr.alias;

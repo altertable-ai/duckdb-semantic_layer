@@ -13,6 +13,7 @@
 #include "duckdb/common/case_insensitive_map.hpp"
 #include "duckdb/common/optional_idx.hpp"
 #include "duckdb/common/set.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
 #include "parsed_semantic_view.hpp"
@@ -89,6 +90,31 @@ struct SemanticNonAdditive {
 	OrderByNullType null_order;
 };
 
+//! OFFSET (<dimension> BY <interval>) of metrics: in their aggregation blocks, the dimension's column reads shifted by
+//! the interval in the query's dimensions and WHERE (semantic_offsets.hpp). Equal offsets are stored once.
+//! Move-only: MSVC instantiates `vector`'s copy constructor unless the copy is explicitly deleted.
+struct SemanticOffset {
+	//! The offset dimension: a dimension defined as a column
+	idx_t dimension;
+	idx_t table;
+	string column;
+	//! The column's type: shifted values are cast back to it
+	LogicalType type;
+	//! Constant interval expression, as written
+	unique_ptr<ParsedExpression> interval;
+
+	SemanticOffset() = default;
+	SemanticOffset(const SemanticOffset &) = delete;
+	SemanticOffset &operator=(const SemanticOffset &) = delete;
+	SemanticOffset(SemanticOffset &&) noexcept = default;
+	SemanticOffset &operator=(SemanticOffset &&) noexcept = default;
+
+	//! Whether both shift the same column by the same interval
+	bool Equals(const SemanticOffset &other) const {
+		return table == other.table && StringUtil::CIEquals(column, other.column) && interval->Equals(*other.interval);
+	}
+};
+
 struct SemanticMember {
 	//! Definition entry, owned by SemanticModel::definition
 	const ParsedSemanticMember *parsed;
@@ -102,6 +128,10 @@ struct SemanticMember {
 	vector<idx_t> using_relationships;
 	//! NON ADDITIVE BY (...) (metrics only)
 	vector<SemanticNonAdditive> non_additive;
+	//! Resolved FILTER condition (metrics only), or null
+	unique_ptr<ParsedExpression> filter;
+	//! OFFSET (metrics only): index into SemanticModel::offsets
+	optional_idx offset;
 
 	SemanticMemberKind Kind() const {
 		return parsed->kind;
@@ -145,6 +175,8 @@ public:
 	vector<SemanticTable> tables;
 	vector<SemanticRelationship> relationships;
 	vector<SemanticMember> members;
+	//! Distinct OFFSETs of the metrics
+	vector<SemanticOffset> offsets;
 	//! Materializations of the view (semantic_materialization.hpp), in definition order
 	vector<shared_ptr<SemanticMaterialization>> materializations;
 

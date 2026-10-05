@@ -39,7 +39,9 @@ string AtomColumn(idx_t index) {
 
 constexpr const char *BLOCK_COLUMN = "__sv_block";
 
-string ItemWhat(const SemanticQueryItem &item) {
+} // namespace
+
+string SemanticItemWhat(const SemanticQueryItem &item) {
 	switch (item.kind) {
 	case SemanticMemberKind::DIMENSION:
 		return "Invalid dimension \"" + item.output_name + "\"";
@@ -49,8 +51,6 @@ string ItemWhat(const SemanticQueryItem &item) {
 		return "Invalid metric \"" + item.output_name + "\"";
 	}
 }
-
-} // namespace
 
 string SemanticDimensionColumn(idx_t dimension) {
 	return "__sv_d" + to_string(dimension);
@@ -127,17 +127,11 @@ void MapWindowDimensions(const SemanticModel &model, unique_ptr<ParsedExpression
 //===--------------------------------------------------------------------===//
 // Metric queries
 //===--------------------------------------------------------------------===//
-//! Atoms aggregated together: same home table, USING relationships and NON ADDITIVE BY metric
+//! Atoms aggregated together: equal block keys
 struct Block {
-	idx_t home;
-	vector<idx_t> using_relationships;
-	idx_t non_additive_member;
+	SemanticBlockKey key;
 	vector<idx_t> atoms;
 
-	bool Accepts(const SemanticAtom &atom) const {
-		return home == atom.home && using_relationships == atom.context.using_relationships &&
-		       non_additive_member == atom.context.non_additive_member;
-	}
 	bool Owns(idx_t atom) const {
 		return std::find(atoms.begin(), atoms.end(), atom) != atoms.end();
 	}
@@ -151,10 +145,10 @@ struct Block {
 class BlockBridges {
 public:
 	BlockBridges(const SemanticModel &model, SemanticAnalyzer &analyzer, SemanticExpressionCompiler &compiler,
-	             SemanticAliasGenerator &aliases, idx_t home, const vector<idx_t> &using_relationships,
+	             SemanticAliasGenerator &aliases, const SemanticBlockKey &block,
 	             optional_ptr<const SemanticTableSources> sources)
-	    : model(model), analyzer(analyzer), compiler(compiler), aliases(aliases), resolver(model), home(home),
-	      using_relationships(using_relationships), sources(sources) {
+	    : model(model), analyzer(analyzer), compiler(compiler), aliases(aliases), resolver(model), block(block),
+	      sources(sources) {
 	}
 
 	//! The reference, in the block's rows, to dimension `expr` (output column `column`) when it is reached through a
@@ -231,12 +225,12 @@ private:
 		analyzer.RowTables(expr, DConstants::INVALID_INDEX, tables, what);
 		bool local = true;
 		for (auto table : tables) {
-			local = local && model.Reaches(home, table);
+			local = local && model.Reaches(block.home, table);
 		}
 		if (local) {
 			return nullptr;
 		}
-		auto bridge = resolver.Resolve(home, tables, using_relationships, what, hint);
+		auto bridge = resolver.Resolve(block.home, tables, block.using_relationships, what, hint);
 		for (auto &group : groups) {
 			if (group.bridge.SameAs(bridge)) {
 				return &group;
@@ -248,7 +242,8 @@ private:
 
 	unique_ptr<QueryNode> MappingQuery(const Group &group) {
 		auto &bridge = group.bridge;
-		SemanticJoinScope scope(model, aliases, bridge.bridge, using_relationships, aliases.NestedPrefix(), sources);
+		SemanticJoinScope scope(model, aliases, bridge.bridge, block.using_relationships, aliases.NestedPrefix(),
+		                        sources);
 		auto node = make_uniq<SelectNode>();
 		for (idx_t c = 0; c < bridge.key_source_columns.size(); c++) {
 			auto key = scope.ColumnReference(bridge.key_source, bridge.key_source_columns[c]);
@@ -256,13 +251,13 @@ private:
 			node->select_list.push_back(std::move(key));
 		}
 		for (auto &dimension : group.dimensions) {
-			auto expr = compiler.Row(*dimension.expr, scope, DConstants::INVALID_INDEX, dimension.what);
+			auto expr = compiler.ShiftedRow(*dimension.expr, scope, dimension.what, block.offsets);
 			expr->alias = dimension.column;
 			node->select_list.push_back(std::move(expr));
 		}
 		vector<unique_ptr<ParsedExpression>> conditions;
 		for (auto *condition : group.conditions) {
-			conditions.push_back(compiler.Row(*condition, scope, DConstants::INVALID_INDEX, WHERE_WHAT));
+			conditions.push_back(compiler.ShiftedRow(*condition, scope, WHERE_WHAT, block.offsets));
 		}
 		node->where_clause = AndAll(std::move(conditions));
 		node->modifiers.push_back(make_uniq<DistinctModifier>());
@@ -275,8 +270,8 @@ private:
 	SemanticExpressionCompiler &compiler;
 	SemanticAliasGenerator &aliases;
 	SemanticBridgeResolver resolver;
-	idx_t home;
-	const vector<idx_t> &using_relationships;
+	//! Bridged dimensions and conditions are shifted (OFFSET) like the others
+	const SemanticBlockKey &block;
 	optional_ptr<const SemanticTableSources> sources;
 	vector<Group> groups;
 };
@@ -290,14 +285,14 @@ public:
 	    : model(model), analyzer(analyzer), compiler(compiler), aliases(aliases), spec(spec), dimensions(dimensions),
 	      options(options) {
 		for (auto *item : metrics) {
-			posts.push_back(analyzer.Decompose(*item->resolved, SemanticMetricContext(), atoms, ItemWhat(*item)));
+			posts.push_back(
+			    analyzer.Decompose(*item->resolved, SemanticMetricContext(), atoms, SemanticItemWhat(*item)));
 		}
 		for (idx_t a = 0; a < atoms.size(); a++) {
-			auto block =
-			    std::find_if(blocks.begin(), blocks.end(), [&](const Block &b) { return b.Accepts(atoms[a]); });
+			auto key = atoms[a].BlockKey();
+			auto block = std::find_if(blocks.begin(), blocks.end(), [&](const Block &b) { return b.key == key; });
 			if (block == blocks.end()) {
-				blocks.push_back(Block {
-				    atoms[a].home, atoms[a].context.using_relationships, atoms[a].context.non_additive_member, {}});
+				blocks.push_back(Block {std::move(key), {}});
 				block = blocks.end() - 1;
 			}
 			block->atoms.push_back(a);
@@ -336,11 +331,9 @@ public:
 	SemanticBlockPlan Plan(idx_t b) const {
 		auto &block = blocks[b];
 		SemanticBlockPlan result;
-		result.home = block.home;
-		result.using_relationships = block.using_relationships;
-		result.non_additive_member = block.non_additive_member;
+		result.key = block.key;
 		for (auto a : block.atoms) {
-			result.atoms.push_back(CopyAtom(atoms[a]));
+			result.atoms.push_back(atoms[a].Copy());
 		}
 		return result;
 	}
@@ -352,9 +345,9 @@ public:
 	//! SELECT <dimensions>, count(*) AS __sv_rows, <states of the block's atoms> ... GROUP BY <dimensions>
 	unique_ptr<SelectNode> BuildStateBlock(idx_t b, const SemanticStateBuilder &states) {
 		auto &block = blocks[b];
-		SemanticJoinScope scope(model, aliases, block.home, block.using_relationships, string(), options.sources);
-		BlockBridges bridges(model, analyzer, compiler, aliases, block.home, block.using_relationships,
-		                     options.sources);
+		SemanticJoinScope scope(model, aliases, block.key.home, block.key.using_relationships, string(),
+		                        options.sources);
+		BlockBridges bridges(model, analyzer, compiler, aliases, block.key, options.sources);
 		auto parts = BuildRows(block, scope, bridges);
 		auto aggregate = make_uniq<SelectNode>();
 		for (idx_t d = 0; d < dimensions.size(); d++) {
@@ -376,14 +369,6 @@ public:
 	}
 
 private:
-	static SemanticAtom CopyAtom(const SemanticAtom &atom) {
-		SemanticAtom result;
-		result.home = atom.home;
-		result.aggregate = atom.aggregate->Copy();
-		result.context = atom.context;
-		return result;
-	}
-
 	//! The rows of a block: its dimensions and the arguments of its aggregates, filtered by the query's WHERE (and the
 	//! state query's row filter); `aggregates` holds the compiled aggregate of each atom of the block, reading the rows
 	struct BlockRows {
@@ -401,13 +386,13 @@ private:
 			dependencies->in_dimension = true;
 		}
 		for (idx_t d = 0; d < dimensions.size(); d++) {
-			auto what = ItemWhat(*dimensions[d]);
+			auto what = SemanticItemWhat(*dimensions[d]);
 			auto expr = bridges.Dimension(*dimensions[d]->resolved, DimensionColumn(d), what);
 			if (expr && dependencies) {
 				throw SemanticDefinitionException("%s: many-to-many bridges cannot be materialized", what);
 			}
 			if (!expr) {
-				expr = compiler.Row(*dimensions[d]->resolved, scope, DConstants::INVALID_INDEX, what);
+				expr = compiler.ShiftedRow(*dimensions[d]->resolved, scope, what, block.key.offsets);
 			}
 			result.groups.push_back(expr->Copy());
 			expr->alias = DimensionColumn(d);
@@ -450,9 +435,13 @@ private:
 				}
 			}
 			if (!local_conjuncts.empty()) {
-				conditions.push_back(compiler.Row(*AndAll(std::move(local_conjuncts)), scope, DConstants::INVALID_INDEX,
-				                                  "Invalid WHERE clause"));
+				conditions.push_back(compiler.ShiftedRow(*AndAll(std::move(local_conjuncts)), scope,
+				                                         "Invalid WHERE clause", block.key.offsets));
 			}
+		}
+		for (auto metric : block.key.row_filters) {
+			conditions.push_back(
+			    compiler.Row(*model.members[metric].filter, scope, DConstants::INVALID_INDEX, "Invalid metric"));
 		}
 		if (options.row_filter) {
 			auto filter = options.row_filter(scope, result.groups);
@@ -482,11 +471,8 @@ private:
 			for (auto *dimension : dimensions) {
 				dimension_exprs.push_back(dimension->resolved.get());
 			}
-			SemanticBlockPlan plan;
-			plan.home = block.home;
-			plan.using_relationships = block.using_relationships;
-			plan.non_additive_member = block.non_additive_member;
-			auto read = options.materializations->Find(plan, block.atoms, atoms, dimension_exprs, spec.where.get());
+			auto read =
+			    options.materializations->Find(block.key, block.atoms, atoms, dimension_exprs, spec.where.get());
 			if (read) {
 				return BuildMaterializedBlock(block, tag, *read);
 			}
@@ -496,10 +482,9 @@ private:
 
 	unique_ptr<SelectNode> BuildSourceBlock(const Block &block, optional_idx tag,
 	                                        optional_ptr<SemanticBlockDependencies> dependencies = nullptr) {
-		SemanticJoinScope scope(model, aliases, block.home, block.using_relationships, string(), options.sources,
-		                        dependencies);
-		BlockBridges bridges(model, analyzer, compiler, aliases, block.home, block.using_relationships,
-		                     options.sources);
+		SemanticJoinScope scope(model, aliases, block.key.home, block.key.using_relationships, string(),
+		                        options.sources, dependencies);
+		BlockBridges bridges(model, analyzer, compiler, aliases, block.key, options.sources);
 		auto parts = BuildRows(block, scope, bridges);
 		auto aggregate = make_uniq<SelectNode>();
 		for (idx_t d = 0; d < dimensions.size(); d++) {
@@ -519,8 +504,8 @@ private:
 			expr->alias = AtomColumn(a);
 			aggregate->select_list.push_back(std::move(expr));
 		}
-		if (block.non_additive_member != DConstants::INVALID_INDEX) {
-			aggregate->where_clause = LastSnapshotFilter(model.members[block.non_additive_member], scope,
+		if (block.key.non_additive_member != DConstants::INVALID_INDEX) {
+			aggregate->where_clause = LastSnapshotFilter(model.members[block.key.non_additive_member], scope,
 			                                             std::move(parts.groups), *parts.rows);
 		}
 		FinishRows(*parts.rows, scope, bridges);
@@ -726,10 +711,11 @@ void SemanticQueryCompiler::SplitItems(const SemanticQuerySpec &spec, vector<con
 			throw SemanticDefinitionException(
 			    "%s: a METRICS expression must aggregate (use a metric or an aggregate function); "
 			    "use DIMENSIONS or FACTS for row-level values",
-			    ItemWhat(item));
+			    SemanticItemWhat(item));
 		}
 		if (item.kind != SemanticMemberKind::METRIC && aggregates) {
-			throw SemanticDefinitionException("%s: metrics and aggregates are only allowed in METRICS", ItemWhat(item));
+			throw SemanticDefinitionException("%s: metrics and aggregates are only allowed in METRICS",
+			                                  SemanticItemWhat(item));
 		}
 		auto &list = item.kind == SemanticMemberKind::METRIC      ? metrics
 		             : item.kind == SemanticMemberKind::DIMENSION ? dimensions
@@ -745,7 +731,7 @@ void SemanticQueryCompiler::SplitItems(const SemanticQuerySpec &spec, vector<con
 	// row-level tables referenced by dimensions / facts / WHERE
 	for (auto &item : spec.items) {
 		if (item.kind != SemanticMemberKind::METRIC) {
-			analyzer.RowTables(*item.resolved, DConstants::INVALID_INDEX, row_tables, ItemWhat(item));
+			analyzer.RowTables(*item.resolved, DConstants::INVALID_INDEX, row_tables, SemanticItemWhat(item));
 		}
 	}
 	if (spec.where) {
@@ -871,7 +857,7 @@ unique_ptr<SelectStatement> SemanticQueryCompiler::CompileRowQuery(SemanticExpre
 	SemanticJoinScope scope(model, aliases, base, {}, string(), options.sources);
 	auto node = make_uniq<SelectNode>();
 	for (auto &item : spec.items) {
-		auto expr = compiler.Row(*item.resolved, scope, DConstants::INVALID_INDEX, ItemWhat(item));
+		auto expr = compiler.Row(*item.resolved, scope, DConstants::INVALID_INDEX, SemanticItemWhat(item));
 		if (has_facts && item.kind == SemanticMemberKind::DIMENSION) {
 			node->groups.group_expressions.push_back(expr->Copy());
 		}

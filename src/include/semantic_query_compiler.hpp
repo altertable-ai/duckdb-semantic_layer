@@ -40,6 +40,9 @@ struct SemanticQueryItem {
 	SemanticQueryItem &operator=(SemanticQueryItem &&) noexcept = default;
 };
 
+//! Error message prefix for item `item`: Invalid <kind> "<output name>"
+string SemanticItemWhat(const SemanticQueryItem &item);
+
 struct SemanticQuerySpec {
 	vector<SemanticQueryItem> items;
 	//! Resolved filter, may be null
@@ -50,11 +53,9 @@ struct SemanticQuerySpec {
 string SemanticDimensionColumn(idx_t dimension);
 static constexpr const char *MATERIALIZED_ROWS_COLUMN = "__sv_rows";
 
-//! An aggregation block: the atoms aggregated over the rows of the same home table (and USING / NON ADDITIVE BY)
+//! An aggregation block: the atoms aggregated together
 struct SemanticBlockPlan {
-	idx_t home;
-	vector<idx_t> using_relationships;
-	idx_t non_additive_member;
+	SemanticBlockKey key;
 	vector<SemanticAtom> atoms;
 	//! Result type of every atom
 	vector<LogicalType> atom_types;
@@ -82,9 +83,9 @@ struct SemanticMaterializedRead {
 class SemanticMaterializationProvider {
 public:
 	virtual ~SemanticMaterializationProvider() = default;
-	//! A fresh materialization holding `atoms` (all over `block`'s home table) at a grain from which `dimensions` and
-	//! `where` can be computed; nullptr when there is none
-	virtual unique_ptr<SemanticMaterializedRead> Find(const SemanticBlockPlan &block, const vector<idx_t> &atoms,
+	//! A fresh materialization holding `atoms` (all of block `block`) at a grain from which `dimensions` and `where`
+	//! can be computed; nullptr when there is none
+	virtual unique_ptr<SemanticMaterializedRead> Find(const SemanticBlockKey &block, const vector<idx_t> &atoms,
 	                                                  const vector<SemanticAtom> &all_atoms,
 	                                                  const vector<const ParsedExpression *> &dimensions,
 	                                                  optional_ptr<const ParsedExpression> where) = 0;
@@ -109,6 +110,10 @@ struct SemanticCompileOptions {
 class SemanticQueryCompiler {
 public:
 	SemanticQueryCompiler(const SemanticModel &model, ClientContext &context);
+
+	SemanticAnalyzer &Analyzer() {
+		return analyzer;
+	}
 
 	//! Resolves the items and filter of a SEMANTIC_VIEW(...) clause (wildcards, names, PRIVATE checks)
 	SemanticQuerySpec Resolve(const vector<ParsedSemanticQueryItem> &items, optional_ptr<ParsedExpression> where);

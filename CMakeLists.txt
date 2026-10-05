@@ -37,6 +37,7 @@ set(EXTENSION_SOURCES
     src/semantic_materialization_refresh.cpp
     src/semantic_model.cpp
     src/semantic_model_builder.cpp
+    src/semantic_offsets.cpp
     src/semantic_query_compiler.cpp
     src/semantic_sql_rewrite.cpp
     src/semantic_statement_visitor.cpp
