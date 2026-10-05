@@ -7,7 +7,8 @@
 // lies in t's window; the query's dimensions and WHERE read t instead of the stored date:
 //   1. rows: the stored date __sv_c, leaves __sv_i<n> (everything else the dimensions / WHERE read), the aggregate
 //      arguments __sv_x<n>, filtered by the WHERE conjuncts that do not read the date
-//   2. the latest date __sv_cmax (anchors never come after it)
+//   2. pre-aggregated by date and leaves when every aggregate allows it, with the latest date __sv_cmax (anchors
+//      never come after it)
 //   3. joined to the anchors __sv_t (distinct dates of the cumulative column's table) whose window holds __sv_c
 //   4. aggregated per dimension tuple and anchor (the dimensions read __sv_t)
 //   5. one row per dimension tuple: the value at its last / first anchor, or the average over its anchors
@@ -64,7 +65,7 @@ struct SemanticCumulativeParts {
 };
 
 //! SELECT <dimensions AS __sv_d<i>>, <atom k AS atom_columns[k]> ... GROUP BY <dimensions>
-unique_ptr<SelectNode> BuildSemanticCumulativeBlock(const SemanticCumulative &cumulative, SemanticCumulativeParts parts,
-                                                    const vector<string> &atom_columns);
+unique_ptr<SelectNode> BuildSemanticCumulativeBlock(ClientContext &context, const SemanticCumulative &cumulative,
+                                                    SemanticCumulativeParts parts, const vector<string> &atom_columns);
 
 } // namespace duckdb

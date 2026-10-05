@@ -508,3 +508,77 @@ SELECT * FROM SEMANTIC_VIEW(activity DIMENSIONS dates.month METRICS events.reven
 2026-01-01	210	210
 2026-02-01	150	360
 2026-03-01	90	450
+
+# pre-aggregation: decomposable aggregates are rolled up from states grouped by date ...
+query I
+SELECT sql LIKE '%__sv_s0_sum%' FROM semantic_view_sql('SELECT * FROM SEMANTIC_VIEW(activity DIMENSIONS dates.month METRICS events.revenue_total)');
+----
+true
+
+# ... DISTINCT aggregates from rows deduplicated on their arguments ...
+query I
+SELECT sql LIKE '%GROUP BY __sv_c, __sv_x0%' FROM semantic_view_sql('SELECT * FROM SEMANTIC_VIEW(activity DIMENSIONS dates.month METRICS events.wau)');
+----
+true
+
+# ... and a block with an opaque aggregate fans out its raw rows
+query I
+SELECT sql LIKE '%__sv_s0_%' FROM semantic_view_sql('SELECT * FROM SEMANTIC_VIEW(activity DIMENSIONS dates.month METRICS events.median_7d)');
+----
+false
+
+# pre-aggregated blocks equal the hand-written time-spine query over the raw rows
+statement ok
+CREATE TABLE big_events AS SELECT range AS event_id, (hash(range) % 50)::INTEGER AS user_id,
+  DATE '2026-01-01' + (hash(range * 7) % 200)::INTEGER AS event_date, (hash(range * 13) % 100)::INTEGER AS amount
+FROM range(3000);
+
+statement ok
+CREATE SEMANTIC VIEW big TABLES (dates PRIMARY KEY (day), e AS big_events PRIMARY KEY (event_id))
+  RELATIONSHIPS (e (event_date) REFERENCES dates)
+  DIMENSIONS (dates.day AS day, dates.week AS DATE_TRUNC('week', day)::DATE, dates.month AS DATE_TRUNC('month', day)::DATE,
+    e.user_bucket AS user_id % 5)
+  METRICS (
+    e.wau CUMULATIVE (dates.day OVER INTERVAL 7 DAYS) AS COUNT(DISTINCT user_id),
+    e.revenue_7d CUMULATIVE (dates.day OVER INTERVAL 7 DAYS) AS SUM(amount),
+    e.avg_7d CUMULATIVE (dates.day OVER INTERVAL 7 DAYS) AS AVG(amount),
+    e.revenue_mtd CUMULATIVE (dates.day TO MONTH FIRST) AS SUM(amount),
+    e.users_total CUMULATIVE (dates.day AVERAGE) AS COUNT(DISTINCT user_id)
+  );
+
+query I
+WITH s AS (
+  SELECT week, user_bucket, wau, revenue_7d, round(avg_7d, 9) AS avg_7d
+  FROM SEMANTIC_VIEW(big DIMENSIONS dates.week, e.user_bucket METRICS e.wau, e.revenue_7d, e.avg_7d)
+), a AS (
+  SELECT d.day AS t, e.user_id % 5 AS b, count(DISTINCT e.user_id) AS wau, sum(e.amount) AS r, avg(e.amount) AS av
+  FROM dates d JOIN big_events e ON e.event_date <= d.day AND e.event_date > d.day - INTERVAL 7 DAY
+  WHERE d.day <= (SELECT max(event_date) FROM big_events) GROUP BY ALL
+), r AS (
+  SELECT date_trunc('week', t)::DATE AS week, b AS user_bucket, arg_max(wau, t) AS wau, arg_max(r, t) AS revenue_7d,
+    round(arg_max(av, t), 9) AS avg_7d
+  FROM a GROUP BY ALL
+)
+SELECT count(*) FROM ((SELECT * FROM s EXCEPT ALL SELECT * FROM r) UNION ALL (SELECT * FROM r EXCEPT ALL SELECT * FROM s));
+----
+0
+
+query I
+WITH s AS (
+  SELECT month, revenue_mtd, round(users_total, 9) AS users_total FROM SEMANTIC_VIEW(big DIMENSIONS dates.month METRICS e.revenue_mtd, e.users_total)
+), a1 AS (
+  SELECT d.day AS t, sum(e.amount) AS v
+  FROM dates d JOIN big_events e ON e.event_date <= d.day AND e.event_date >= date_trunc('month', d.day)
+  WHERE d.day <= (SELECT max(event_date) FROM big_events) GROUP BY ALL
+), a2 AS (
+  SELECT d.day AS t, count(DISTINCT e.user_id) AS v
+  FROM dates d JOIN big_events e ON e.event_date <= d.day
+  WHERE d.day <= (SELECT max(event_date) FROM big_events) GROUP BY ALL
+), r AS (
+  SELECT month, revenue_mtd, users_total FROM
+    (SELECT date_trunc('month', t)::DATE AS month, arg_min(v, t) AS revenue_mtd FROM a1 GROUP BY 1)
+    FULL JOIN (SELECT date_trunc('month', t)::DATE AS month, round(avg(v), 9) AS users_total FROM a2 GROUP BY 1) USING (month)
+)
+SELECT count(*) FROM ((SELECT * FROM s EXCEPT ALL SELECT * FROM r) UNION ALL (SELECT * FROM r EXCEPT ALL SELECT * FROM s));
+----
+0

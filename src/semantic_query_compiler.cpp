@@ -612,7 +612,7 @@ private:
 		for (auto a : block.atoms) {
 			atom_columns.push_back(AtomColumn(a));
 		}
-		auto result = BuildSemanticCumulativeBlock(cumulative, std::move(parts), atom_columns);
+		auto result = BuildSemanticCumulativeBlock(analyzer.Context(), cumulative, std::move(parts), atom_columns);
 		if (!tag.IsValid()) {
 			return result;
 		}
