@@ -17,6 +17,7 @@
 #include "duckdb/planner/binder.hpp"
 #include "semantic_analysis.hpp"
 #include "semantic_model.hpp"
+#include "semantic_materialization.hpp"
 #include "semantic_query_compiler.hpp"
 
 namespace duckdb {
@@ -74,6 +75,7 @@ public:
 		CheckMemberCycles();
 		CheckMemberKinds();
 		ProbeSemanticModelTypes(context, *model);
+		PlanSemanticMaterializations(context, *model);
 		return model;
 	}
 
@@ -131,8 +133,12 @@ private:
 			SemanticTable table;
 			if (parsed.source->type == TableReferenceType::BASE_TABLE) {
 				auto &base = parsed.source->Cast<BaseTableRef>();
+				// `x.table`: x may be a schema of the default database or a database (as in DuckDB's binder)
+				auto catalog_name = base.catalog_name;
+				auto schema_name = base.schema_name;
+				Binder::BindSchemaOrCatalog(context, catalog_name, schema_name);
 				EntryLookupInfo lookup(CatalogType::TABLE_ENTRY, base.table_name);
-				auto &entry = Catalog::GetEntry(context, base.catalog_name, base.schema_name, lookup);
+				auto &entry = Catalog::GetEntry(context, catalog_name, schema_name, lookup);
 				table.catalog_name = entry.ParentCatalog().GetName();
 				table.schema_name = entry.ParentSchema().name;
 				table.table_name = entry.name;

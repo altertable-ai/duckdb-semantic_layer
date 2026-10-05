@@ -9,6 +9,8 @@
 
 #pragma once
 
+#include <functional>
+
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "semantic_model.hpp"
@@ -28,13 +30,16 @@ public:
 	static QualifiedName ResolveDDLName(ClientContext &context, const QualifiedName &name,
 	                                    OnEntryNotFound if_not_found = OnEntryNotFound::THROW_EXCEPTION);
 
-	//! Registers `model`; returns false when a view with the same name exists and `replace` is false
-	bool Create(shared_ptr<SemanticModel> model, bool replace);
+	//! Preparation runs under the DDL lock, after conflict checks and before publication; a failure leaves the registry
+	//! intact. Registers `model`; returns false when a view with the same name exists and `replace` is false
+	bool Create(shared_ptr<SemanticModel> model, bool replace,
+	            const std::function<void(shared_ptr<SemanticModel>)> &prepare = {});
 	//! Returns false when the view does not exist
-	bool Drop(const QualifiedName &name);
+	bool Drop(const QualifiedName &name, const std::function<void(shared_ptr<SemanticModel>)> &prepare = {});
 	//! Atomically replaces `expected` with `model` (ALTER), which may have a different name; throws when the new name
 	//! is taken by another view. Returns false when `expected` is no longer registered (dropped or altered meanwhile).
-	bool Replace(const SemanticModel &expected, shared_ptr<SemanticModel> model);
+	bool Replace(const SemanticModel &expected, shared_ptr<SemanticModel> model,
+	             const std::function<void()> &prepare = {});
 
 	shared_ptr<SemanticModel> Get(const QualifiedName &fully_qualified) const;
 	//! Looks up a name as used in a query (unqualified names follow the search path); nullptr when missing
@@ -48,6 +53,8 @@ private:
 	static string Key(const QualifiedName &name);
 
 	mutable mutex lock;
+	//! Serializes DDL preparation/publication without blocking lookups from internally compiled SQL.
+	mutex ddl_lock;
 	map<string, shared_ptr<SemanticModel>> views;
 };
 

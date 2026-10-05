@@ -30,6 +30,7 @@ right grain.
 - [Defining a semantic view](#defining-a-semantic-view)
 - [Querying](#querying)
 - [Advanced modeling](#advanced-modeling)
+- [Materializations](#materializations)
 - [Managing and inspecting semantic views](#managing-and-inspecting-semantic-views)
 - [BI tools and the catalog](#bi-tools-and-the-catalog)
 - [How it works](#how-it-works)
@@ -340,6 +341,108 @@ Window function metrics are evaluated over the aggregated rows. The dimensions t
 query (`SHOW SEMANTIC DIMENSIONS IN <view> FOR METRIC <metric>` marks them as `required`).
 `PARTITION BY EXCLUDING d` partitions by every requested dimension except `d`.
 
+## Materializations
+
+A materialization stores the aggregates of some metrics at a chosen grain. Queries that can be answered from it read
+the stored aggregates instead of scanning the sources, transparently: nothing changes in how the semantic view is
+queried.
+
+```sql
+ALTER SEMANTIC VIEW sales ADD MATERIALIZATION revenue_by_segment_year
+  AS DIMENSIONS customers.segment, orders.order_year
+     METRICS lines.revenue, orders.avg_order;
+
+-- read from the materialization, rolled up from (segment, year) to segment
+SELECT customers.segment, AGG(lines.revenue) FROM sales GROUP BY customers.segment;
+```
+
+```sql
+ALTER SEMANTIC VIEW <view> ADD MATERIALIZATION [IF NOT EXISTS] <name>
+  [REFRESH_MODE = AUTO | FULL | INCREMENTAL] [IN <database>[.<schema>]]
+  AS DIMENSIONS <dimension> [, ...] METRICS <metric> [, ...]
+ALTER SEMANTIC VIEW <view> REFRESH MATERIALIZATION <name> [AUTO | FULL | INCREMENTAL]
+ALTER SEMANTIC VIEW <view> DROP MATERIALIZATION [IF EXISTS] <name>
+ALTER SEMANTIC VIEW <view> SET MAX_STALENESS = <seconds> | UNSET MAX_STALENESS
+SHOW SEMANTIC MATERIALIZATIONS [LIKE '<pattern>'] [IN <view>]
+```
+
+**What is stored.** One table per aggregation block (the metrics' aggregates over the same table), in the schema
+`__semantic_materializations` of the semantic view's database, or of the database named by `IN` (any writable
+DuckDB database, file or in-memory, or DuckLake catalog; `IN lake.analytics` also picks the schema). Each row is a
+group of the materialization's dimensions and holds the *state* of every aggregate rather than its final value, so
+that coarser queries and incremental refreshes stay exact: `SUM` stores a sum and a count, `AVG` a sum and a count,
+`COUNT` a count, `MIN` / `MAX` the extreme value, plus the number of rows of the group. Other aggregates
+(`COUNT(DISTINCT ...)`, `median`, ...) are stored as they are. Physical table names include a persisted allocation ID,
+so identically named views in different schemas or databases have separate storage; renames keep the same tables.
+Restoration rejects legacy allocations claimed by multiple owners and preserves their tables and metadata.
+
+**When a query uses it.** A block of a query is read from a materialization when the materialization stores all of
+its aggregates, the query's dimensions and `WHERE` clause can be computed from the stored dimensions (for example
+`YEAR(orders.order_date)` from `orders.order_date`), and the materialization is fresh. Grouping by fewer dimensions
+rolls the stored groups up (`SUM` of sums, sum of sums divided by sum of counts for `AVG`, ...); aggregates stored as
+they are only answer queries at the materialization's own grain. When several materializations qualify, the one with
+the fewest dimensions (the fewest groups to aggregate) is read. Derived metrics combine blocks read from
+materializations and blocks computed from the sources. `semantic_view_sql()` shows which tables a query reads, and
+`SET semantic_view_materializations = false` disables them.
+
+**Freshness.** Materializations of DuckLake tables record the snapshot they were built at; a query uses one only if
+none of its sources changed since (or within `MAX_STALENESS`, see below). DuckDB tables have no change tracking, so a
+materialization over them is used only when the semantic view sets `MAX_STALENESS` (seconds since its last refresh);
+otherwise queries read the sources. SQL subqueries can read sources outside the semantic model, and user-defined SQL
+macros can be replaced without changing any source snapshot. Materializations using either have unknown freshness
+and require `MAX_STALENESS` to be read. Prepared statements check freshness again at every execution.
+`SHOW SEMANTIC MATERIALIZATIONS` tells whether each materialization is usable and why not.
+
+**Refresh.** `REFRESH MATERIALIZATION` brings a materialization up to date in its own transaction, using its
+`REFRESH_MODE` unless another mode is given:
+
+- `FULL` rebuilds it from the sources (read at one consistent snapshot).
+- `INCREMENTAL` applies the changes since the last refresh, and fails (explaining why) when that is not possible.
+- `AUTO` (the default) refreshes incrementally when possible and rebuilds otherwise; `SHOW SEMANTIC MATERIALIZATIONS`
+  reports what the last refresh did and why.
+
+Incremental refresh needs every source to be a DuckLake table. It finds the changed tables in the snapshots'
+metadata, reads their inserted and deleted rows since the last refresh (`ducklake_table_insertions()` /
+`ducklake_table_deletions()`), and works on those rows and the groups they touch:
+
+- changed rows of a metric's table (inserts, deletes, updates, also of foreign keys) are removed with their old
+  values and dimensions and added back with the new ones;
+- changed rows of a table its dimensions come from (a customer changing segment) move the unchanged rows that
+  reference them from their old group to their new one. Finding those rows scans the metric's table twice (as of
+  before and as of now), so `AUTO` rebuilds such blocks instead, which scans it once;
+- changed rows of a table aggregated by a nested aggregation (`FACTS (customers.order_total AS
+  SUM(orders.amount))` aggregated again by `AVG(customers.order_total)`) recompute, as of before and as of now, the
+  rows whose nested aggregation reads them; here too `AUTO` rebuilds the block instead;
+- `SUM`, `COUNT` and `AVG` states are updated arithmetically; groups whose row count drops to zero disappear;
+- `MIN` / `MAX` merge new rows directly, and groups that lost rows are recomputed from the sources, like every
+  affected group of an aggregate stored as is.
+
+A refresh falls back to a full rebuild (or fails in `INCREMENTAL` mode) when a source is not a DuckLake table, a
+dimension aggregates other rows, a metric uses a subquery, a replaceable SQL macro, or a nested aggregation of anything but the columns of a
+table directly referencing a table of the materialization, a join uses an `ASOF` or range relationship, the change
+history since the last refresh was expired, the definition of a source table changed (altered, dropped or
+re-created: changes to other tables do not matter), or the materialization's table is missing. Without source
+changes, a refresh does nothing. A failed refresh leaves the materialization as it was. Inserts cost about the number of new rows; deletes
+and updates also read the deleted rows' old values from DuckLake's data files. See
+[docs/benchmarks.md](docs/benchmarks.md#materialization-refresh) for measurements on 100M rows.
+
+**Persistence.** Next to its tables, each storage schema `__semantic_materializations` holds a table
+`__sv_materializations` recording every materialization stored in that database: its definition, tables, the
+snapshots it was built at and its last refresh, updated in the refresh's transaction. Semantic views live in memory,
+but their materializations survive restarts: re-creating the view (`CREATE`, `CREATE OR REPLACE`) brings back the
+materializations stored for it in every attached database, reattached to their tables. One whose aggregates changed
+with the new definition is rebuilt by its next refresh; one the new definition can no longer serve is dropped. Adding
+a materialization that is already stored with the same definition reattaches it too. `DROP SEMANTIC VIEW` and
+`DROP MATERIALIZATION` drop the tables and their records; renaming the view keeps them. A DuckLake catalog attached
+under another name is found again (materializations stored in in-memory databases are gone with them).
+
+Valid materializations can be reattached from read-only storage; adding, refreshing, dropping or renaming them
+requires writable storage. DDL stages its storage changes before publishing the new semantic view, so a failed
+build or storage update leaves the registered view intact. Tables and metadata change together in each storage
+database. Changes spanning multiple databases prepare all operations before committing each database separately.
+
+Materializations cannot include semi-additive metrics or dimensions reached through a many-to-many bridge.
+
 ## Managing and inspecting semantic views
 
 | Statement | Description |
@@ -351,6 +454,7 @@ query (`SHOW SEMANTIC DIMENSIONS IN <view> FOR METRIC <metric>` marks them as `r
 | `SHOW SEMANTIC VIEWS [LIKE '<pattern>'] [IN SCHEMA <schema> \| IN DATABASE <database>]` | |
 | `SHOW SEMANTIC DIMENSIONS \| FACTS \| METRICS [LIKE '<pattern>'] [IN <name>]` | defined members (including private ones), with their data types |
 | `SHOW SEMANTIC DIMENSIONS [LIKE '<pattern>'] IN <name> FOR METRIC <metric>` | the dimensions a metric can be grouped by |
+| `SHOW SEMANTIC MATERIALIZATIONS [LIKE '<pattern>'] [IN <name>]` | materializations, their tables, last refresh and whether queries can use them ([materializations](#materializations)) |
 
 Every statement can be used as a table expression: `SELECT name FROM (SHOW SEMANTIC METRICS IN sales)`.
 
@@ -394,7 +498,7 @@ relationships are about 9x faster than a hand-written range join. See [docs/benc
 ## Limitations
 
 - **Definitions live in memory**, per database instance. They are not saved in the database file and must be
-  re-created after a restart. They are not transactional: a `CREATE` inside a rolled-back transaction stays.
+  re-created after a restart (their [materializations](#materializations) are saved, and come back with them). They are not transactional: a `CREATE` inside a rolled-back transaction stays.
 - The **catalog placeholder views**, however, are saved in database files like any view. After a restart a
   placeholder stays listed, and querying it fails with `Semantic view "x" is not defined in this session`.
   `CREATE SEMANTIC VIEW x` replaces it and `DROP SEMANTIC VIEW x` removes it. Without the extension loaded, querying it
@@ -454,21 +558,27 @@ queries written for Snowflake run on DuckDB.
 
 **Accepted and kept as metadata** (shown by `DESCRIBE SEMANTIC VIEW`, otherwise ignored), so that Snowflake
 definitions can be pasted as is: `WITH SYNONYMS`, `LABELS = (FILTER)`, `SAMPLE_VALUES`, `IS_ENUM`, `WITH CORTEX SEARCH
-SERVICE`, `AI_SQL_GENERATION`, `AI_QUESTION_CATEGORIZATION`, `AI_VERIFIED_QUERIES`, `[WITH] TAG`, `COPY GRANTS`,
-`MAX_STALENESS`.
+SERVICE`, `AI_SQL_GENERATION`, `AI_QUESTION_CATEGORIZATION`, `AI_VERIFIED_QUERIES`, `[WITH] TAG`, `COPY GRANTS`, and the
+`WAREHOUSE` of a materialization.
 
 **Not supported:**
 
-- materializations;
 - `GET_DDL` and YAML import/export;
 - window functions in fact and dimension definitions;
 - the `INFORMATION_SCHEMA.SEMANTIC_*` views (semantic views appear in the regular catalog instead, see above);
-- `SHOW ... TERSE / STARTS WITH / LIMIT`, and `ALTER ... SET TAG / MAX_STALENESS`;
+- `SHOW ... TERSE / STARTS WITH / LIMIT`, and `ALTER ... SET TAG`;
+- materialization filters (`WHERE`, `IMMUTABLE WHERE`), `SUSPEND` / `RESUME MATERIALIZATION` and automatic
+  background refreshes: materializations are refreshed with `REFRESH MATERIALIZATION`;
 - privileges (DuckDB has none).
 
 **Differences:**
 
-- `CREATE OR ALTER` behaves like `CREATE OR REPLACE`.
+- `CREATE OR ALTER` behaves like `CREATE OR REPLACE` (materializations the new definition can still serve are
+  kept).
+- `MAX_STALENESS` is a number of seconds. Materializations of DuckDB tables, whose changes cannot be tracked, are only
+  read within it.
+- `REFRESH MATERIALIZATION` accepts an explicit `AUTO`, `FULL` or `INCREMENTAL` mode, and `ADD MATERIALIZATION` a
+  storage database (`IN`).
 - Expressions may reference physical columns of other logical tables directly (Snowflake requires a fact).
 
 ## License

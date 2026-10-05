@@ -1,3 +1,4 @@
+#include "semantic_definition_exception.hpp"
 #include "semantic_bridge.hpp"
 
 #include "duckdb/common/exception/binder_exception.hpp"
@@ -144,10 +145,11 @@ SemanticBridge SemanticBridgeResolver::Resolve(idx_t home, const set<idx_t> &tab
 	for (auto table : far_tables) {
 		auto single = Candidates(home, {table}, using_relationships);
 		if (single.empty()) {
-			throw BinderException("Invalid dimension specified: The dimension entity '%s' must be related to and have "
-			                      "an equal or lower level of granularity compared to the base metric or dimension "
-			                      "entity '%s'.",
-			                      model.tables[table].name, model.tables[home].name);
+			throw SemanticDefinitionException(
+			    "Invalid dimension specified: The dimension entity '%s' must be related to and have "
+			    "an equal or lower level of granularity compared to the base metric or dimension "
+			    "entity '%s'.",
+			    model.tables[table].name, model.tables[home].name);
 		}
 		if (single.size() > 1) {
 			throw AmbiguityError(home, {table}, single);
@@ -155,11 +157,11 @@ SemanticBridge SemanticBridgeResolver::Resolve(idx_t home, const set<idx_t> &tab
 		bridges.insert(single[0].bridge);
 	}
 	if (bridges.size() == 1) {
-		throw BinderException("%s: combines tables that the many-to-many bridge %s does not relate%s", what,
-		                      TableList(bridges), hint);
+		throw SemanticDefinitionException("%s: combines tables that the many-to-many bridge %s does not relate%s", what,
+		                                  TableList(bridges), hint);
 	}
-	throw BinderException("%s: combines tables reached through different many-to-many bridges (%s)%s", what,
-	                      TableList(bridges), hint);
+	throw SemanticDefinitionException("%s: combines tables reached through different many-to-many bridges (%s)%s", what,
+	                                  TableList(bridges), hint);
 }
 
 idx_t SemanticBridgeResolver::CommonBase(const set<idx_t> &tables) const {
@@ -194,8 +196,8 @@ idx_t SemanticBridgeResolver::CommonBase(const set<idx_t> &tables) const {
 	}
 	if (candidates.size() > 1) {
 		vector<idx_t> table_list(tables.begin(), tables.end());
-		throw BinderException("Ambiguous many-to-many path between %s: bridge tables %s both qualify",
-		                      TableList(table_list), TableList(candidates));
+		throw SemanticDefinitionException("Ambiguous many-to-many path between %s: bridge tables %s both qualify",
+		                                  TableList(table_list), TableList(candidates));
 	}
 	return candidates[0];
 }

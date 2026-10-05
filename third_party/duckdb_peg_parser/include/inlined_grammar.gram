@@ -1479,19 +1479,32 @@ SemanticCopyGrants <- 'COPY' 'GRANTS'
 DropSemanticViewStmt <- 'DROP' 'SEMANTIC' 'VIEW' IfExists? QualifiedName
 
 AlterSemanticViewStmt <- 'ALTER' 'SEMANTIC' 'VIEW' IfExists? QualifiedName SemanticAlterAction
-SemanticAlterAction <- SemanticAlterRename / SemanticAlterSetComment / SemanticAlterUnsetComment
+SemanticAlterAction <- SemanticAlterRename / SemanticAlterSetComment / SemanticAlterUnsetComment / SemanticAlterSetMaxStaleness / SemanticAlterUnsetMaxStaleness / SemanticAlterAddMaterialization / SemanticAlterDropMaterialization / SemanticAlterRefreshMaterialization
 SemanticAlterRename <- 'RENAME' 'TO' QualifiedName
 SemanticAlterSetComment <- 'SET' 'COMMENT' '=' StringLiteral
 SemanticAlterUnsetComment <- 'UNSET' 'COMMENT'
+SemanticAlterSetMaxStaleness <- 'SET' 'MAX_STALENESS' '=' NumberLiteral
+SemanticAlterUnsetMaxStaleness <- 'UNSET' 'MAX_STALENESS'
+
+# Materializations: the body is a flat SEMANTIC_VIEW(...) item list (DIMENSIONS ... METRICS ...)
+SemanticAlterAddMaterialization <- 'ADD' 'MATERIALIZATION' IfNotExists? ColId SemanticMaterializationOption* 'AS' SemanticQueryPiece*
+SemanticMaterializationOption <- SemanticMaterializationWarehouse / SemanticMaterializationRefreshMode / SemanticMaterializationStorage
+SemanticMaterializationStorage <- 'IN' QualifiedName
+SemanticMaterializationWarehouse <- 'WAREHOUSE' '=' ColId
+SemanticMaterializationRefreshMode <- 'REFRESH_MODE' '=' SemanticRefreshModeName
+SemanticRefreshModeName <- 'AUTO' / 'FULL' / 'INCREMENTAL'
+SemanticAlterDropMaterialization <- 'DROP' 'MATERIALIZATION' IfExists? ColId
+SemanticAlterRefreshMaterialization <- 'REFRESH' 'MATERIALIZATION' ColId SemanticRefreshModeName?
 
 DescribeSemanticViewStmt <- SemanticDescribeKeyword 'SEMANTIC' 'VIEW' QualifiedName
 SemanticDescribeKeyword <- 'DESCRIBE' / 'DESC'
 
 ShowSemanticStmt <- 'SHOW' 'SEMANTIC' SemanticShowTarget
-SemanticShowTarget <- SemanticShowViews / SemanticShowMembers
+SemanticShowTarget <- SemanticShowViews / SemanticShowMaterializations / SemanticShowMembers
 SemanticShowViews <- 'VIEWS' SemanticShowLike? SemanticShowViewsScope?
 SemanticShowViewsScope <- 'IN' SemanticShowScopeKind QualifiedName
 SemanticShowScopeKind <- 'SCHEMA' / 'DATABASE'
+SemanticShowMaterializations <- 'MATERIALIZATIONS' SemanticShowLike? SemanticShowIn?
 SemanticShowMembers <- SemanticShowMemberKind SemanticShowLike? SemanticShowIn? SemanticShowForMetric?
 SemanticShowMemberKind <- 'DIMENSIONS' / 'METRICS' / 'FACTS'
 SemanticShowLike <- 'LIKE' StringLiteral

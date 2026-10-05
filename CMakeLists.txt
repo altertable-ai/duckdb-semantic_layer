@@ -18,16 +18,23 @@ set(EXTENSION_SOURCES
     src/semantic_views_extension.cpp
     src/semantic_views_binding.cpp
     src/semantic_views_functions.cpp
+    src/semantic_expression_compiler.cpp
     src/semantic_ddl_functions.cpp
     src/semantic_show_functions.cpp
     src/semantic_query_functions.cpp
     src/semantic_lowering.cpp
     src/parsed_semantic_view.cpp
+    src/semantic_aggregate_state.cpp
     src/semantic_analysis.cpp
     src/semantic_bridge.cpp
     src/semantic_catalog.cpp
+    src/semantic_change_tracking.cpp
     src/semantic_join_scope.cpp
     src/semantic_markers.cpp
+    src/semantic_materialization.cpp
+    src/semantic_materialization_storage.cpp
+    src/semantic_materialization_ddl.cpp
+    src/semantic_materialization_refresh.cpp
     src/semantic_model.cpp
     src/semantic_model_builder.cpp
     src/semantic_query_compiler.cpp

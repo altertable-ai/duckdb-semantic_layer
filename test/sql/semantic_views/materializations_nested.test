@@ -1,0 +1,295 @@
+# name: test/sql/semantic_views/materializations_nested.test
+# description: incremental refresh of materializations whose metrics aggregate nested (child) aggregations, checked against full rebuilds
+# group: [semantic_views]
+
+require semantic_views
+
+require parquet
+
+require ducklake
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/nested.ducklake' AS lake (DATA_PATH '__TEST_DIR__/nested_data');
+
+statement ok
+CREATE TABLE lake.regions (id INTEGER, name VARCHAR);
+
+statement ok
+INSERT INTO lake.regions VALUES (1, 'north'), (2, 'south');
+
+statement ok
+CREATE TABLE lake.customers (id INTEGER, segment VARCHAR, region_id INTEGER);
+
+statement ok
+INSERT INTO lake.customers VALUES (1, 'retail', 1), (2, 'retail', 2), (3, 'pro', 1), (4, 'pro', NULL), (5, 'pro', 2);
+
+statement ok
+CREATE TABLE lake.orders (id INTEGER, customer_id INTEGER, amount INTEGER);
+
+statement ok
+INSERT INTO lake.orders VALUES (1, 1, 10), (2, 1, 20), (3, 2, 5), (4, 3, 100), (5, 4, 1), (6, 99, 7);
+
+statement ok
+CREATE TABLE lake.payments (id INTEGER, customer_id INTEGER, paid INTEGER);
+
+statement ok
+INSERT INTO lake.payments VALUES (1, 1, 30), (2, 3, 50), (3, 3, 50);
+
+# per customer: its orders and payments (nested aggregations over child tables)
+statement ok
+CREATE SEMANTIC VIEW nested
+  TABLES (
+    o AS lake.orders PRIMARY KEY (id),
+    c AS lake.customers PRIMARY KEY (id),
+    r AS lake.regions PRIMARY KEY (id),
+    p AS lake.payments PRIMARY KEY (id)
+  )
+  RELATIONSHIPS (o (customer_id) REFERENCES c, p (customer_id) REFERENCES c, c (region_id) REFERENCES r)
+  FACTS (c.order_total AS SUM(o.amount), c.order_count AS COUNT(o.id), c.paid_total AS SUM(p.paid))
+  DIMENSIONS (c.segment AS segment, r.region AS name)
+  METRICS (
+    c.avg_total AS AVG(c.order_total),
+    c.total AS SUM(c.order_total),
+    c.max_total AS MAX(c.order_total),
+    c.customers AS COUNT(*),
+    c.balance AS SUM(coalesce(c.order_total, 0) - coalesce(c.paid_total, 0)),
+    o.unpaid_orders AS COUNT_IF(c.paid_total IS NULL)
+  );
+
+# the same materialization three times: rebuilt, maintained incrementally, AUTO (two blocks: customers and orders)
+statement ok
+ALTER SEMANTIC VIEW nested ADD MATERIALIZATION full_copy REFRESH_MODE = FULL AS
+  DIMENSIONS c.segment, r.region METRICS c.avg_total, c.total, c.max_total, c.customers, c.balance, o.unpaid_orders;
+
+statement ok
+SET VARIABLE nested__full_copy__0 = (SELECT tables[1] FROM (SHOW SEMANTIC MATERIALIZATIONS IN nested) WHERE name = 'full_copy');
+SET VARIABLE nested__full_copy__1 = (SELECT tables[2] FROM (SHOW SEMANTIC MATERIALIZATIONS IN nested) WHERE name = 'full_copy');
+
+statement ok
+ALTER SEMANTIC VIEW nested ADD MATERIALIZATION incr REFRESH_MODE = INCREMENTAL AS
+  DIMENSIONS c.segment, r.region METRICS c.avg_total, c.total, c.max_total, c.customers, c.balance, o.unpaid_orders;
+
+statement ok
+SET VARIABLE nested__incr__0 = (SELECT tables[1] FROM (SHOW SEMANTIC MATERIALIZATIONS IN nested) WHERE name = 'incr');
+SET VARIABLE nested__incr__1 = (SELECT tables[2] FROM (SHOW SEMANTIC MATERIALIZATIONS IN nested) WHERE name = 'incr');
+
+statement ok
+ALTER SEMANTIC VIEW nested ADD MATERIALIZATION auto_copy AS
+  DIMENSIONS c.segment, r.region METRICS c.avg_total, c.total, c.max_total, c.customers, c.balance, o.unpaid_orders;
+
+statement ok
+SET VARIABLE nested__auto_copy__0 = (SELECT tables[1] FROM (SHOW SEMANTIC MATERIALIZATIONS IN nested) WHERE name = 'auto_copy');
+SET VARIABLE nested__auto_copy__1 = (SELECT tables[2] FROM (SHOW SEMANTIC MATERIALIZATIONS IN nested) WHERE name = 'auto_copy');
+
+query IIII
+SELECT name, incremental, not_incremental_reason, len(tables) FROM (SHOW SEMANTIC MATERIALIZATIONS IN nested) ORDER BY name;
+----
+auto_copy	true	NULL	2
+full_copy	true	NULL	2
+incr	true	NULL	2
+
+statement ok
+CREATE MACRO diff(a, b) AS TABLE
+  SELECT count(*) AS d FROM ((FROM query_table(a) EXCEPT ALL FROM query_table(b)) UNION ALL (FROM query_table(b) EXCEPT ALL FROM query_table(a)));
+
+statement ok
+CREATE MACRO compare_copies() AS TABLE
+  SELECT (FROM diff(getvariable('nested__incr__0'), getvariable('nested__full_copy__0')))
+       + (FROM diff(getvariable('nested__incr__1'), getvariable('nested__full_copy__1')))
+       + (FROM diff(getvariable('nested__auto_copy__0'), getvariable('nested__full_copy__0')))
+       + (FROM diff(getvariable('nested__auto_copy__1'), getvariable('nested__full_copy__1'))) AS differences;
+
+statement ok
+CREATE MACRO hand_written() AS TABLE
+  WITH per_customer AS (
+    SELECT c.id, c.segment, r.name AS region,
+           (SELECT sum(amount) FROM lake.orders o WHERE o.customer_id = c.id) AS order_total,
+           (SELECT sum(paid) FROM lake.payments p WHERE p.customer_id = c.id) AS paid_total
+    FROM lake.customers c LEFT JOIN lake.regions r ON c.region_id = r.id
+  )
+  SELECT segment, region, avg(order_total), sum(order_total), max(order_total), count(*),
+         sum(coalesce(order_total, 0) - coalesce(paid_total, 0))
+  FROM per_customer GROUP BY ALL;
+
+query IIIIIIII
+SELECT * FROM SEMANTIC_VIEW(nested DIMENSIONS c.segment, r.region METRICS c.avg_total, c.total, c.max_total, c.customers, c.balance, o.unpaid_orders) ORDER BY ALL;
+----
+pro	north	100.0	100	100	1	0	0
+pro	south	NULL	NULL	NULL	1	0	NULL
+pro	NULL	1.0	1	1	1	1	1
+retail	north	30.0	30	30	1	0	0
+retail	south	5.0	5	5	1	5	1
+NULL	NULL	NULL	NULL	NULL	NULL	NULL	1
+
+# a new order of an existing customer (child table): its customer's order total moves
+statement ok
+INSERT INTO lake.orders VALUES (7, 5, 40);
+
+query I
+ALTER SEMANTIC VIEW nested REFRESH MATERIALIZATION incr;
+----
+Materialization incr refreshed (INCREMENTAL: 2 group(s) changed).
+
+query I
+ALTER SEMANTIC VIEW nested REFRESH MATERIALIZATION auto_copy;
+----
+Materialization auto_copy refreshed (INCREMENTAL: 1 group(s) changed; rebuilt because child table "o" changed).
+
+statement ok
+ALTER SEMANTIC VIEW nested REFRESH MATERIALIZATION full_copy;
+
+query I
+FROM compare_copies();
+----
+0
+
+# the order now belongs to another customer, in another group
+statement ok
+UPDATE lake.orders SET customer_id = 2 WHERE id = 4;
+
+statement ok
+ALTER SEMANTIC VIEW nested REFRESH MATERIALIZATION incr;
+
+statement ok
+ALTER SEMANTIC VIEW nested REFRESH MATERIALIZATION auto_copy;
+
+statement ok
+ALTER SEMANTIC VIEW nested REFRESH MATERIALIZATION full_copy;
+
+query I
+FROM compare_copies();
+----
+0
+
+# amounts change, an order disappears (the max of a group lost its row)
+statement ok
+UPDATE lake.orders SET amount = amount * 2 WHERE customer_id = 1;
+
+statement ok
+DELETE FROM lake.orders WHERE id = 4;
+
+statement ok
+ALTER SEMANTIC VIEW nested REFRESH MATERIALIZATION incr;
+
+statement ok
+ALTER SEMANTIC VIEW nested REFRESH MATERIALIZATION auto_copy;
+
+statement ok
+ALTER SEMANTIC VIEW nested REFRESH MATERIALIZATION full_copy;
+
+query I
+FROM compare_copies();
+----
+0
+
+# a payment (child of the customers, an up table of the orders block)
+statement ok
+INSERT INTO lake.payments VALUES (4, 2, 5), (5, 4, 1);
+
+statement ok
+ALTER SEMANTIC VIEW nested REFRESH MATERIALIZATION incr;
+
+statement ok
+ALTER SEMANTIC VIEW nested REFRESH MATERIALIZATION auto_copy;
+
+statement ok
+ALTER SEMANTIC VIEW nested REFRESH MATERIALIZATION full_copy;
+
+query I
+FROM compare_copies();
+----
+0
+
+# the home table and the child tables change together: a new customer with orders, a customer leaves with its payments
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO lake.customers VALUES (6, 'retail', 2);
+
+statement ok
+INSERT INTO lake.orders VALUES (8, 6, 12), (9, 6, 3);
+
+statement ok
+DELETE FROM lake.customers WHERE id = 3;
+
+statement ok
+DELETE FROM lake.payments WHERE customer_id = 3;
+
+statement ok
+COMMIT;
+
+statement ok
+UPDATE lake.customers SET segment = 'pro' WHERE id = 1;
+
+statement ok
+UPDATE lake.regions SET name = 'east' WHERE id = 2;
+
+statement ok
+ALTER SEMANTIC VIEW nested REFRESH MATERIALIZATION incr;
+
+statement ok
+ALTER SEMANTIC VIEW nested REFRESH MATERIALIZATION auto_copy;
+
+statement ok
+ALTER SEMANTIC VIEW nested REFRESH MATERIALIZATION full_copy;
+
+query I
+FROM compare_copies();
+----
+0
+
+# reads from the materialization match the sources
+query IIIIIII nosort result
+SELECT * FROM SEMANTIC_VIEW(nested DIMENSIONS c.segment, r.region METRICS c.avg_total, c.total, c.max_total, c.customers, c.balance) ORDER BY ALL;
+----
+
+query I
+SELECT sql ILIKE '%nested__auto_copy__0%' OR sql ILIKE '%nested__incr__0%' OR sql ILIKE '%nested__full_copy__0%' FROM semantic_view_sql('SELECT * FROM SEMANTIC_VIEW(nested DIMENSIONS c.segment METRICS c.total)');
+----
+true
+
+query IIIIIII nosort result
+FROM hand_written() ORDER BY ALL;
+----
+
+# the changes of a child table are tracked even when nothing else changes (freshness)
+statement ok
+INSERT INTO lake.payments VALUES (6, 6, 1);
+
+query II
+SELECT name, usable FROM (SHOW SEMANTIC MATERIALIZATIONS IN nested) ORDER BY name;
+----
+auto_copy	false
+full_copy	false
+incr	false
+
+# nested aggregations incremental refresh does not follow
+statement ok
+CREATE SEMANTIC VIEW two_hops
+  TABLES (o AS lake.orders PRIMARY KEY (id), c AS lake.customers PRIMARY KEY (id), r AS lake.regions PRIMARY KEY (id))
+  RELATIONSHIPS (o (customer_id) REFERENCES c, c (region_id) REFERENCES r)
+  FACTS (r.region_total AS SUM(o.amount))
+  DIMENSIONS (r.region AS name)
+  METRICS (r.avg_region_total AS AVG(r.region_total));
+
+statement ok
+ALTER SEMANTIC VIEW two_hops ADD MATERIALIZATION m AS DIMENSIONS r.region METRICS r.avg_region_total;
+
+query II
+SELECT incremental, not_incremental_reason FROM (SHOW SEMANTIC MATERIALIZATIONS IN two_hops);
+----
+false	a metric aggregates rows of logical table "o" in a way incremental refresh does not follow (only aggregations of the columns of a table directly referencing a table of the materialization are)
+
+query I
+ALTER SEMANTIC VIEW two_hops REFRESH MATERIALIZATION m;
+----
+Materialization m is up to date.
+
+statement ok
+INSERT INTO lake.orders VALUES (10, 2, 1);
+
+query I
+ALTER SEMANTIC VIEW two_hops REFRESH MATERIALIZATION m;
+----
+Materialization m refreshed (FULL: a metric aggregates rows of logical table "o" in a way incremental refresh does not follow (only aggregations of the columns of a table directly referencing a table of the materialization are)).

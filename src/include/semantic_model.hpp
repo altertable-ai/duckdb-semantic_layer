@@ -21,6 +21,7 @@
 namespace duckdb {
 
 class ClientContext;
+class SemanticMaterialization;
 
 struct SemanticTable {
 	string name;
@@ -144,6 +145,8 @@ public:
 	vector<SemanticTable> tables;
 	vector<SemanticRelationship> relationships;
 	vector<SemanticMember> members;
+	//! Materializations of the view (semantic_materialization.hpp), in definition order
+	vector<shared_ptr<SemanticMaterialization>> materializations;
 
 	//! Traversal edges leaving each table towards equal-or-lower granularity tables
 	vector<vector<SemanticEdge>> edges;

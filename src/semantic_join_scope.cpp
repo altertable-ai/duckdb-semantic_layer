@@ -9,17 +9,30 @@
 namespace duckdb {
 
 SemanticJoinScope::SemanticJoinScope(const SemanticModel &model, SemanticAliasGenerator &aliases, idx_t base,
-                                     vector<idx_t> using_relationships, string prefix)
+                                     vector<idx_t> using_relationships, string prefix,
+                                     optional_ptr<const SemanticTableSources> sources,
+                                     optional_ptr<SemanticBlockDependencies> dependencies)
     : model(model), aliases(aliases), base(base), using_relationships(std::move(using_relationships)),
-      prefix(std::move(prefix)) {
+      prefix(std::move(prefix)), sources(sources), dependencies(dependencies) {
 	present.insert(base);
 }
 
 SemanticJoinScope SemanticJoinScope::Nested(idx_t nested_base, idx_t context) {
-	SemanticJoinScope result(model, aliases, nested_base, using_relationships, aliases.NestedPrefix());
+	SemanticJoinScope result(model, aliases, nested_base, using_relationships, aliases.NestedPrefix(), sources,
+	                         dependencies);
+	result.depth = depth + 1;
 	result.outer = this;
 	result.outer_context = context;
 	return result;
+}
+
+unique_ptr<TableRef> SemanticJoinScope::Source(idx_t table) const {
+	if (dependencies) {
+		auto reads = dependencies;
+		(depth == 0 ? reads->tables : reads->nested_tables).insert(table);
+		reads->scans[table]++;
+	}
+	return sources ? sources->Source(table) : model.tables[table].source->Copy();
 }
 
 string SemanticJoinScope::AliasOf(idx_t table) const {
@@ -32,6 +45,7 @@ bool SemanticJoinScope::BelongsToOuter(idx_t table) const {
 
 string SemanticJoinScope::Ensure(idx_t table) {
 	if (BelongsToOuter(table)) {
+		reads_outer = true;
 		return outer->Ensure(table);
 	}
 	idx_t current = base;
@@ -52,6 +66,7 @@ string SemanticJoinScope::Ensure(idx_t table) {
 
 unique_ptr<ParsedExpression> SemanticJoinScope::ColumnReference(idx_t table, const string &column) {
 	if (BelongsToOuter(table)) {
+		reads_outer = true;
 		return outer->ColumnReference(table, column);
 	}
 	auto path = model.Path(base, table, using_relationships);
@@ -70,7 +85,12 @@ unique_ptr<ParsedExpression> SemanticJoinScope::RangeLookup(const vector<Semanti
 	auto &rel = model.relationships[path[range_at].relationship];
 	auto source_alias = Ensure(source);
 	auto range_table = path[range_at].target;
-	SemanticJoinScope inner(model, aliases, range_table, using_relationships, aliases.NestedPrefix());
+	SemanticJoinScope inner(model, aliases, range_table, using_relationships, aliases.NestedPrefix(), sources,
+	                        dependencies);
+	inner.depth = depth + 1;
+	if (dependencies) {
+		dependencies->Unsupported("relationship \"" + rel.name + "\" is a range relationship");
+	}
 	auto value = inner.ColumnReference(table, column);
 	auto range_alias = inner.AliasOf(range_table);
 	auto bound = [&](const string &bound_column, ExpressionType comparison) {
@@ -94,7 +114,7 @@ unique_ptr<ParsedExpression> SemanticJoinScope::RangeLookup(const vector<Semanti
 }
 
 unique_ptr<TableRef> SemanticJoinScope::BuildFrom() const {
-	auto result = model.tables[base].source->Copy();
+	auto result = Source(base);
 	result->alias = AliasOf(base);
 	for (auto &join : joins) {
 		auto &rel = model.relationships[join.edge.relationship];
@@ -112,7 +132,7 @@ unique_ptr<TableRef> SemanticJoinScope::BuildFrom() const {
 		    make_uniq<JoinRef>(rel.asof_index != DConstants::INVALID_INDEX ? JoinRefType::ASOF : JoinRefType::REGULAR);
 		join_ref->type = JoinType::LEFT;
 		join_ref->left = std::move(result);
-		join_ref->right = model.tables[join.table].source->Copy();
+		join_ref->right = Source(join.table);
 		join_ref->right->alias = AliasOf(join.table);
 		join_ref->condition = AndAll(std::move(conditions));
 		result = std::move(join_ref);

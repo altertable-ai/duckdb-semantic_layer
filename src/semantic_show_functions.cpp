@@ -6,6 +6,7 @@
 #include "semantic_analysis.hpp"
 #include "semantic_bridge.hpp"
 #include "semantic_lowering.hpp"
+#include "semantic_materialization.hpp"
 #include "semantic_view_registry.hpp"
 #include "semantic_views_functions.hpp"
 
@@ -284,6 +285,88 @@ static unique_ptr<FunctionData> DescribeBind(ClientContext &context, TableFuncti
 	return std::move(result);
 }
 
+//===--------------------------------------------------------------------===//
+// SHOW SEMANTIC MATERIALIZATIONS [IN view]
+//===--------------------------------------------------------------------===//
+static unique_ptr<FunctionData> ShowMaterializationsBind(ClientContext &context, TableFunctionBindInput &input,
+                                                         vector<LogicalType> &return_types, vector<string> &names) {
+	names = {"database_name",
+	         "schema_name",
+	         "semantic_view_name",
+	         "name",
+	         "dimensions",
+	         "metrics",
+	         "refresh_mode",
+	         "incremental",
+	         "not_incremental_reason",
+	         "storage",
+	         "tables",
+	         "last_refresh",
+	         "last_refresh_detail",
+	         "verified_at",
+	         "watermark",
+	         "usable",
+	         "not_usable_reason"};
+	auto list = LogicalType::LIST(LogicalType::VARCHAR);
+	return_types = {LogicalType::VARCHAR,
+	                LogicalType::VARCHAR,
+	                LogicalType::VARCHAR,
+	                LogicalType::VARCHAR,
+	                list,
+	                list,
+	                LogicalType::VARCHAR,
+	                LogicalType::BOOLEAN,
+	                LogicalType::VARCHAR,
+	                LogicalType::VARCHAR,
+	                list,
+	                LogicalType::VARCHAR,
+	                LogicalType::VARCHAR,
+	                LogicalType::TIMESTAMP,
+	                LogicalType::VARCHAR,
+	                LogicalType::BOOLEAN,
+	                LogicalType::VARCHAR};
+	auto view = NameArguments(input, 0);
+	auto &registry = GetSemanticViewsState(input).registry;
+	vector<shared_ptr<SemanticModel>> models;
+	if (!view.name.empty()) {
+		models.push_back(registry.GetOrThrow(context, view));
+	} else {
+		for (auto &model : registry.List()) {
+			if (InDefaultSchema(context, *model)) {
+				models.push_back(model);
+			}
+		}
+	}
+	auto result = make_uniq<RowsFunctionData>();
+	for (auto &model : models) {
+		auto &name = model->Name();
+		for (auto &materialization : model->materializations) {
+			auto status = GetMaterializationStatus(context, *model, *materialization);
+			auto &state = *materialization->state;
+			lock_guard<mutex> guard(state.lock);
+			vector<string> tables;
+			for (idx_t b = 0; state.built && b < state.tables.size(); b++) {
+				tables.push_back(materialization->TableName(b));
+			}
+			vector<string> watermark;
+			for (auto &entry : state.watermark) {
+				watermark.push_back(entry.first + "@" + to_string(entry.second));
+			}
+			result->rows.push_back(
+			    {Value(name.catalog), Value(name.schema), Value(name.name), Value(materialization->name),
+			     StringList(materialization->dimension_names), StringList(materialization->metric_names),
+			     Value(SemanticRefreshModeToString(materialization->refresh_mode)),
+			     Value::BOOLEAN(materialization->incremental), OptionalString(materialization->incremental_reason),
+			     Value(materialization->storage_catalog + "." + materialization->storage_schema), StringList(tables),
+			     OptionalString(state.last_refresh), OptionalString(state.last_refresh_detail),
+			     state.verified_at.value == 0 ? Value(LogicalType::TIMESTAMP) : Value::TIMESTAMP(state.verified_at),
+			     OptionalString(StringUtil::Join(watermark, ", ")), Value::BOOLEAN(status.usable),
+			     OptionalString(status.reason)});
+		}
+	}
+	return std::move(result);
+}
+
 void RegisterSemanticShowFunctions(ExtensionLoader &loader, shared_ptr<SemanticViewsState> state) {
 	vector<LogicalType> name_types(3, LogicalType::VARCHAR);
 	loader.RegisterFunction(SemanticViewsTableFunction(SEMANTIC_VIEW_DESCRIBE_FUNCTION, name_types, RowsFunctionScan,
@@ -298,6 +381,9 @@ void RegisterSemanticShowFunctions(ExtensionLoader &loader, shared_ptr<SemanticV
 	for_metric_types.push_back(LogicalType::LIST(LogicalType::VARCHAR));
 	loader.RegisterFunction(SemanticViewsTableFunction(SEMANTIC_VIEW_SHOW_FOR_METRIC_FUNCTION, for_metric_types,
 	                                                   RowsFunctionScan, ShowForMetricBind, RowsFunctionInit, state));
+	loader.RegisterFunction(SemanticViewsTableFunction(SEMANTIC_VIEW_SHOW_MATERIALIZATIONS_FUNCTION, name_types,
+	                                                   RowsFunctionScan, ShowMaterializationsBind, RowsFunctionInit,
+	                                                   state));
 }
 
 } // namespace duckdb

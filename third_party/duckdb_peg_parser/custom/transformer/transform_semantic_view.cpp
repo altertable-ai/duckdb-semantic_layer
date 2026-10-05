@@ -421,6 +421,59 @@ unique_ptr<SQLStatement> TransformDropSemanticViewStmt(PEGTransformer &transform
 	return SemanticLowering::SelectAll(SemanticLowering::Drop(name, Present(list, 3)));
 }
 
+void TransformQueryPieces(PEGTransformer &transformer, optional_ptr<ParseResult> pieces, ParsedSemanticQuery &query);
+
+SemanticRefreshMode RefreshMode(const string &keyword) {
+	if (keyword == "FULL") {
+		return SemanticRefreshMode::FULL;
+	}
+	if (keyword == "INCREMENTAL") {
+		return SemanticRefreshMode::INCREMENTAL;
+	}
+	return SemanticRefreshMode::AUTO;
+}
+
+// 'ADD' 'MATERIALIZATION' IfNotExists? ColId SemanticMaterializationOption* 'AS' SemanticQueryPiece*
+unique_ptr<SQLStatement> TransformAddMaterialization(PEGTransformer &transformer, optional_ptr<ParseResult> action,
+                                                     const QualifiedName &view, bool if_exists) {
+	auto &list = List(action);
+	ParsedSemanticMaterialization materialization;
+	materialization.name = transformer.Transform<string>(list, 3);
+	for (auto &option_node : Repeated(list.GetChild(4))) {
+		auto option = Choice(option_node);
+		if (option->name == "SemanticMaterializationWarehouse") {
+			// 'WAREHOUSE' '=' ColId
+			materialization.warehouse = transformer.Transform<string>(List(option), 2);
+		} else if (option->name == "SemanticMaterializationStorage") {
+			// 'IN' QualifiedName: <database> or <database>.<schema>
+			auto storage = transformer.Transform<QualifiedName>(List(option), 1);
+			if (!storage.catalog.empty() && storage.catalog != INVALID_CATALOG) {
+				throw ParserException("ADD MATERIALIZATION ... IN expects <database> or <database>.<schema>");
+			}
+			bool has_schema = !storage.schema.empty() && storage.schema != INVALID_SCHEMA;
+			materialization.storage_catalog = has_schema ? storage.schema : storage.name;
+			materialization.storage_schema = has_schema ? storage.name : string();
+		} else {
+			// 'REFRESH_MODE' '=' ('AUTO' / 'FULL' / 'INCREMENTAL')
+			materialization.refresh_mode = RefreshMode(Keyword(List(option).GetChild(2)));
+		}
+	}
+	ParsedSemanticQuery body;
+	body.view = view;
+	TransformQueryPieces(transformer, list.GetChild(6), body);
+	if (body.where) {
+		throw ParserException("ADD MATERIALIZATION does not accept a WHERE clause");
+	}
+	for (auto &item : body.items) {
+		if (item.kind == SemanticMemberKind::FACT) {
+			throw ParserException("ADD MATERIALIZATION accepts DIMENSIONS and METRICS, not FACTS");
+		}
+	}
+	materialization.items = std::move(body.items);
+	return SemanticLowering::SelectAll(
+	    SemanticLowering::AddMaterialization(view, if_exists, materialization, Present(list, 2)));
+}
+
 // 'ALTER' 'SEMANTIC' 'VIEW' IfExists? QualifiedName SemanticAlterAction
 unique_ptr<SQLStatement> TransformAlterSemanticViewStmt(PEGTransformer &transformer,
                                                         optional_ptr<ParseResult> parse_result) {
@@ -435,6 +488,34 @@ unique_ptr<SQLStatement> TransformAlterSemanticViewStmt(PEGTransformer &transfor
 			throw ParserException("ALTER SEMANTIC VIEW ... RENAME TO only accepts an unqualified name");
 		}
 		return SemanticLowering::SelectAll(SemanticLowering::Rename(name, if_exists, new_name.name));
+	}
+	if (action->name == "SemanticAlterAddMaterialization") {
+		return TransformAddMaterialization(transformer, action, name, if_exists);
+	}
+	if (action->name == "SemanticAlterDropMaterialization") {
+		// 'DROP' 'MATERIALIZATION' IfExists? ColId
+		auto &action_list = List(action);
+		return SemanticLowering::SelectAll(SemanticLowering::DropMaterialization(
+		    name, if_exists, transformer.Transform<string>(action_list, 3), Present(action_list, 2)));
+	}
+	if (action->name == "SemanticAlterRefreshMaterialization") {
+		// 'REFRESH' 'MATERIALIZATION' ColId ('AUTO' / 'FULL' / 'INCREMENTAL')?
+		auto &action_list = List(action);
+		Value mode(LogicalType::VARCHAR);
+		if (Present(action_list, 3)) {
+			mode = Value(Keyword(Optional(action_list, 3)));
+		}
+		return SemanticLowering::SelectAll(SemanticLowering::RefreshMaterialization(
+		    name, if_exists, transformer.Transform<string>(action_list, 2), mode));
+	}
+	if (action->name == "SemanticAlterSetMaxStaleness" || action->name == "SemanticAlterUnsetMaxStaleness") {
+		// 'SET' 'MAX_STALENESS' '=' NumberLiteral / 'UNSET' 'MAX_STALENESS' (NULL)
+		Value seconds(LogicalType::BIGINT);
+		if (action->name == "SemanticAlterSetMaxStaleness") {
+			auto value = transformer.Transform<unique_ptr<ParsedExpression>>(List(action), 3);
+			seconds = Value::BIGINT(value->Cast<ConstantExpression>().value.GetValue<int64_t>());
+		}
+		return SemanticLowering::SelectAll(SemanticLowering::SetMaxStaleness(name, if_exists, seconds));
 	}
 	// 'SET' 'COMMENT' '=' StringLiteral / 'UNSET' 'COMMENT' (a NULL comment)
 	Value comment(LogicalType::VARCHAR);
@@ -463,6 +544,14 @@ unique_ptr<TableRef> WithLike(PEGTransformer &transformer, unique_ptr<TableRef> 
 unique_ptr<TableRef> ShowRef(PEGTransformer &transformer, optional_ptr<ParseResult> parse_result) {
 	auto target = Choice(List(parse_result).GetChild(2));
 	auto &list = List(target);
+	if (target->name == "SemanticShowMaterializations") {
+		// 'MATERIALIZATIONS' SemanticShowLike? ('IN' ('SEMANTIC' 'VIEW')? QualifiedName)?
+		QualifiedName view;
+		if (Present(list, 2)) {
+			view = transformer.Transform<QualifiedName>(List(Optional(list, 2)), 2);
+		}
+		return WithLike(transformer, SemanticLowering::ShowMaterializations(view), list, 1);
+	}
 	if (target->name == "SemanticShowViews") {
 		// 'VIEWS' SemanticShowLike? ('IN' ('SCHEMA' / 'DATABASE') QualifiedName)?
 		QualifiedName scope;
@@ -647,14 +736,10 @@ private:
 	idx_t clause_items = 0;
 };
 
-// QualifiedName SemanticQueryPiece*
-unique_ptr<ParsedSemanticQuery> TransformSemanticViewQueryBody(PEGTransformer &transformer,
-                                                               optional_ptr<ParseResult> parse_result) {
-	auto &list = List(parse_result);
-	auto query = make_uniq<ParsedSemanticQuery>();
-	query->view = transformer.Transform<QualifiedName>(list, 0);
-	SemanticQueryBodyBuilder builder(*query);
-	for (auto &piece_node : Repeated(list.GetChild(1))) {
+//! Fills `query` from a `SemanticQueryPiece*` child
+void TransformQueryPieces(PEGTransformer &transformer, optional_ptr<ParseResult> pieces, ParsedSemanticQuery &query) {
+	SemanticQueryBodyBuilder builder(query);
+	for (auto &piece_node : Repeated(pieces)) {
 		auto piece = Choice(piece_node);
 		auto &piece_list = List(piece);
 		if (piece->name == "SemanticQueryComma") {
@@ -673,6 +758,15 @@ unique_ptr<ParsedSemanticQuery> TransformSemanticViewQueryBody(PEGTransformer &t
 		}
 	}
 	builder.Finish();
+}
+
+// QualifiedName SemanticQueryPiece*
+unique_ptr<ParsedSemanticQuery> TransformSemanticViewQueryBody(PEGTransformer &transformer,
+                                                               optional_ptr<ParseResult> parse_result) {
+	auto &list = List(parse_result);
+	auto query = make_uniq<ParsedSemanticQuery>();
+	query->view = transformer.Transform<QualifiedName>(list, 0);
+	TransformQueryPieces(transformer, list.GetChild(1), *query);
 	return query;
 }
 

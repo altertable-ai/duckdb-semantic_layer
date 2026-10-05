@@ -1,0 +1,301 @@
+# name: test/sql/semantic_views/materializations.test
+# description: materializations over plain DuckDB tables (full refresh, read within MAX_STALENESS)
+# group: [semantic_views]
+
+require semantic_views
+
+statement ok
+CREATE TABLE customers (id INTEGER, segment VARCHAR, country VARCHAR);
+INSERT INTO customers VALUES (1, 'retail', 'FR'), (2, 'retail', 'US'), (3, 'pro', 'FR'), (4, 'pro', NULL);
+CREATE TABLE orders (id INTEGER, customer_id INTEGER, amount DECIMAL(10, 2), qty INTEGER, day DATE);
+INSERT INTO orders VALUES (1, 1, 10.00, 1, '2024-01-01'), (2, 1, 20.00, NULL, '2024-01-02'), (3, 2, 5.50, 3, '2024-01-01'), (4, 3, 100.00, 2, '2024-02-01'), (5, 4, 1.00, 1, '2024-02-02'), (6, 99, 7.00, 1, '2024-02-03');
+
+statement ok
+CREATE SEMANTIC VIEW shop
+  TABLES (o AS orders PRIMARY KEY (id), c AS customers PRIMARY KEY (id))
+  RELATIONSHIPS (o (customer_id) REFERENCES c)
+  DIMENSIONS (c.segment AS segment, c.country AS country, o.day AS day)
+  METRICS (
+    o.revenue AS SUM(amount),
+    o.order_count AS COUNT(*),
+    o.qty_count AS COUNT(qty),
+    o.avg_qty AS AVG(qty),
+    o.max_amount AS MAX(amount),
+    o.min_amount AS MIN(amount),
+    o.distinct_customers AS COUNT(DISTINCT customer_id),
+    o.last_day_revenue NON ADDITIVE BY (o.day) AS SUM(amount),
+    c.customer_count AS COUNT(*),
+    revenue_per_customer AS o.revenue / c.customer_count
+  );
+
+statement ok
+ALTER SEMANTIC VIEW shop ADD MATERIALIZATION fine AS
+  DIMENSIONS c.segment, c.country, o.day
+  METRICS o.revenue, o.order_count, o.qty_count, o.avg_qty, o.max_amount, o.min_amount, o.distinct_customers;
+
+statement ok
+SET VARIABLE shop__fine__0 = (SELECT tables[1] FROM (SHOW SEMANTIC MATERIALIZATIONS IN shop) WHERE name = 'fine');
+
+query IIIIIIII
+SELECT name, dimensions, metrics, refresh_mode, incremental, not_incremental_reason, last_refresh, len(tables) FROM (SHOW SEMANTIC MATERIALIZATIONS IN shop);
+----
+fine	[c.segment, c.country, o.day]	[o.revenue, o.order_count, o.qty_count, o.avg_qty, o.max_amount, o.min_amount, o.distinct_customers]	AUTO	false	logical table "o" reads memory.main.orders, which is not a DuckLake table	FULL	1
+
+# the stored state: per group, the number of rows and the state of every aggregate (AVG as sum + count, ...)
+query IIIIIII
+SELECT __sv_d0, __sv_d1, __sv_d2, __sv_rows, s0_sum, s0_cnt, s3_sum FROM query_table(getvariable('shop__fine__0')) ORDER BY ALL;
+----
+pro	FR	2024-02-01	1	100.00	1	2
+pro	NULL	2024-02-02	1	1.00	1	1
+retail	FR	2024-01-01	1	10.00	1	1
+retail	FR	2024-01-02	1	20.00	1	NULL
+retail	US	2024-01-01	1	5.50	1	3
+NULL	NULL	2024-02-03	1	7.00	1	1
+
+# plain DuckDB tables are not change-tracked: the materialization is only read within MAX_STALENESS
+query II
+SELECT usable, not_usable_reason FROM (SHOW SEMANTIC MATERIALIZATIONS IN shop);
+----
+false	its sources are not change-tracked (only DuckLake tables are), so its freshness is unknown
+
+query I
+SELECT sql NOT ILIKE '%__semantic_materializations%' FROM semantic_view_sql('SELECT * FROM SEMANTIC_VIEW(shop DIMENSIONS c.segment METRICS o.revenue)');
+----
+true
+
+statement ok
+ALTER SEMANTIC VIEW shop SET MAX_STALENESS = 3600;
+
+query I
+SELECT usable FROM (SHOW SEMANTIC MATERIALIZATIONS IN shop);
+----
+true
+
+# rolled up from (segment, country, day) to segment
+query I
+SELECT sql ILIKE '%__semantic_materializations%shop__fine__0%' FROM semantic_view_sql('SELECT * FROM SEMANTIC_VIEW(shop DIMENSIONS c.segment METRICS o.revenue)');
+----
+true
+
+loop setting 0 2
+
+statement ok
+SET semantic_view_materializations = ${setting};
+
+query IIIIIII
+SELECT * FROM SEMANTIC_VIEW(shop DIMENSIONS c.segment METRICS o.revenue, o.order_count, o.qty_count, o.avg_qty, o.max_amount, o.min_amount) ORDER BY 1 NULLS LAST;
+----
+pro	101.00	2	2	1.5	100.00	1.00
+retail	35.50	3	2	2.0	20.00	5.50
+NULL	7.00	1	1	1.0	7.00	7.00
+
+# no dimensions: one row
+query II
+SELECT * FROM SEMANTIC_VIEW(shop METRICS o.revenue, o.order_count);
+----
+143.50	6
+
+# a filter and a dimension computed from the stored dimensions
+query II
+SELECT * FROM SEMANTIC_VIEW(shop DIMENSIONS DATE_TRUNC('month', o.day) AS m METRICS o.revenue WHERE c.country = 'FR') ORDER BY 1;
+----
+2024-01-01 00:00:00	30.00
+2024-02-01 00:00:00	100.00
+
+# by name
+query II
+SELECT segment, AGG(revenue) FROM shop GROUP BY segment ORDER BY 1 NULLS LAST;
+----
+pro	101.00
+retail	35.50
+NULL	7.00
+
+# COUNT(DISTINCT) cannot be rolled up: answered from the materialization only at its own grain
+query IIII
+SELECT * FROM SEMANTIC_VIEW(shop DIMENSIONS c.segment, c.country, o.day METRICS o.distinct_customers) ORDER BY ALL;
+----
+pro	FR	2024-02-01	1
+pro	NULL	2024-02-02	1
+retail	FR	2024-01-01	1
+retail	FR	2024-01-02	1
+retail	US	2024-01-01	1
+NULL	NULL	2024-02-03	1
+
+query II
+SELECT * FROM SEMANTIC_VIEW(shop DIMENSIONS c.segment METRICS o.distinct_customers) ORDER BY 1 NULLS LAST;
+----
+pro	2
+retail	2
+NULL	1
+
+# the customers block of a derived metric is computed from the sources
+query II
+SELECT * FROM SEMANTIC_VIEW(shop DIMENSIONS c.segment METRICS revenue_per_customer) ORDER BY 1 NULLS LAST;
+----
+pro	50.5
+retail	17.75
+NULL	NULL
+
+endloop
+
+statement ok
+RESET semantic_view_materializations;
+
+query II
+SELECT sql ILIKE '%shop__fine__0%', sql ILIKE '%GROUP BY __sv_mat.__sv_d0, __sv_mat.__sv_d1, __sv_mat.__sv_d2%' FROM semantic_view_sql('SELECT * FROM SEMANTIC_VIEW(shop DIMENSIONS c.segment, c.country, o.day METRICS o.distinct_customers)');
+----
+true	true
+
+query I
+SELECT sql NOT ILIKE '%__semantic_materializations%' FROM semantic_view_sql('SELECT * FROM SEMANTIC_VIEW(shop DIMENSIONS c.segment METRICS o.distinct_customers)');
+----
+true
+
+# a filter on something that is not a stored dimension reads the sources
+query I
+SELECT sql NOT ILIKE '%__semantic_materializations%' FROM semantic_view_sql('SELECT * FROM SEMANTIC_VIEW(shop DIMENSIONS c.segment METRICS o.revenue WHERE o.qty > 1)');
+----
+true
+
+# a second materialization for the customers block: both blocks of the derived metric are read from materializations
+statement ok
+ALTER SEMANTIC VIEW shop ADD MATERIALIZATION customers_by_segment AS DIMENSIONS c.segment METRICS c.customer_count;
+
+query I
+SELECT sql ILIKE '%shop__fine__0%shop__customers_by_segment__0%' OR sql ILIKE '%shop__customers_by_segment__0%shop__fine__0%' FROM semantic_view_sql('SELECT * FROM SEMANTIC_VIEW(shop DIMENSIONS c.segment METRICS revenue_per_customer)');
+----
+true
+
+query II
+SELECT * FROM SEMANTIC_VIEW(shop DIMENSIONS c.segment METRICS revenue_per_customer) ORDER BY 1 NULLS LAST;
+----
+pro	50.5
+retail	17.75
+NULL	NULL
+
+# within MAX_STALENESS a changed source is not seen until the next refresh (the contract MAX_STALENESS sets)
+statement ok
+INSERT INTO orders VALUES (7, 2, 4.50, 1, '2024-01-01');
+
+query I
+SELECT revenue FROM SEMANTIC_VIEW(shop DIMENSIONS c.segment METRICS o.revenue) WHERE segment = 'retail';
+----
+35.50
+
+statement error
+ALTER SEMANTIC VIEW shop REFRESH MATERIALIZATION fine INCREMENTAL;
+----
+cannot be refreshed incrementally: logical table "o" reads memory.main.orders, which is not a DuckLake table
+
+query I
+ALTER SEMANTIC VIEW shop REFRESH MATERIALIZATION fine;
+----
+Materialization fine refreshed (FULL: logical table "o" reads memory.main.orders, which is not a DuckLake table).
+
+query I
+SELECT revenue FROM SEMANTIC_VIEW(shop DIMENSIONS c.segment METRICS o.revenue) WHERE segment = 'retail';
+----
+40.00
+
+# without MAX_STALENESS the sources are read again
+statement ok
+INSERT INTO orders VALUES (8, 2, 1.00, 1, '2024-01-01');
+
+statement ok
+ALTER SEMANTIC VIEW shop UNSET MAX_STALENESS;
+
+query I
+SELECT revenue FROM SEMANTIC_VIEW(shop DIMENSIONS c.segment METRICS o.revenue) WHERE segment = 'retail';
+----
+41.00
+
+# renaming the view keeps its materializations
+statement ok
+ALTER SEMANTIC VIEW shop SET MAX_STALENESS = 3600;
+
+statement ok
+ALTER SEMANTIC VIEW shop REFRESH MATERIALIZATION fine FULL;
+
+statement ok
+ALTER SEMANTIC VIEW shop RENAME TO store;
+
+query I
+SELECT sql ILIKE '%shop__fine__0%' FROM semantic_view_sql('SELECT * FROM SEMANTIC_VIEW(store DIMENSIONS c.segment METRICS o.revenue)');
+----
+true
+
+query I
+SELECT revenue FROM SEMANTIC_VIEW(store DIMENSIONS c.segment METRICS o.revenue) WHERE segment = 'retail';
+----
+41.00
+
+# errors
+statement error
+ALTER SEMANTIC VIEW store ADD MATERIALIZATION fine AS DIMENSIONS c.segment METRICS o.revenue;
+----
+Materialization "fine" already exists in semantic view "store"
+
+statement ok
+ALTER SEMANTIC VIEW store ADD MATERIALIZATION IF NOT EXISTS fine AS DIMENSIONS c.segment METRICS o.revenue;
+
+statement error
+ALTER SEMANTIC VIEW store ADD MATERIALIZATION bad AS DIMENSIONS o.day METRICS c.customer_count;
+----
+Invalid materialization "bad": Invalid dimension specified: The dimension entity 'o' must be related to
+
+statement error
+ALTER SEMANTIC VIEW store ADD MATERIALIZATION bad AS DIMENSIONS o.day METRICS o.last_day_revenue;
+----
+semi-additive metric "o.last_day_revenue" (NON ADDITIVE BY) cannot be materialized
+
+statement error
+ALTER SEMANTIC VIEW store ADD MATERIALIZATION bad AS DIMENSIONS c.segment;
+----
+a materialization needs at least one metric
+
+statement error
+ALTER SEMANTIC VIEW store ADD MATERIALIZATION bad AS DIMENSIONS c.segment METRICS o.revenue WHERE c.country = 'FR';
+----
+ADD MATERIALIZATION does not accept a WHERE clause
+
+statement error
+ALTER SEMANTIC VIEW store REFRESH MATERIALIZATION nope;
+----
+Materialization "nope" does not exist in semantic view "store"
+
+statement error
+ALTER SEMANTIC VIEW store DROP MATERIALIZATION nope;
+----
+Materialization "nope" does not exist in semantic view "store"
+
+statement ok
+ALTER SEMANTIC VIEW store DROP MATERIALIZATION IF EXISTS nope;
+
+# dropping a materialization drops its table; dropping the view drops the rest
+statement ok
+ALTER SEMANTIC VIEW store DROP MATERIALIZATION customers_by_segment;
+
+query I
+SELECT regexp_replace(table_name, '__[0-9a-f]{32}$', '') FROM duckdb_tables() WHERE schema_name = '__semantic_materializations' ORDER BY 1;
+----
+__sv_materializations
+shop__fine__0
+
+# the metadata records every materialization (definition, tables, watermark), under the view's current name
+query III
+SELECT view_name, name, list_transform(tables, t -> regexp_replace(t, '__[0-9a-f]{32}$', '')) FROM __semantic_materializations.__sv_materializations;
+----
+store	fine	[shop__fine__0]
+
+statement ok
+DROP SEMANTIC VIEW store;
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE schema_name = '__semantic_materializations' AND table_name <> '__sv_materializations';
+----
+0
+
+query I
+SELECT count(*) FROM __semantic_materializations.__sv_materializations;
+----
+0

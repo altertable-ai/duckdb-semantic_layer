@@ -1,0 +1,319 @@
+# name: test/sql/semantic_views/materializations_persistence.test
+# description: materializations stored in DuckDB databases and DuckLake catalogs survive restarts and reattach to their tables
+# group: [semantic_views]
+
+require semantic_views
+
+require parquet
+
+require ducklake
+
+load __TEST_DIR__/materializations_persistence.db
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/persistence.ducklake' AS lake (DATA_PATH '__TEST_DIR__/persistence_data');
+
+statement ok
+ATTACH ':memory:' AS mem;
+
+statement ok
+CREATE TABLE lake.customers (id INTEGER, segment VARCHAR);
+
+statement ok
+INSERT INTO lake.customers VALUES (1, 'retail'), (2, 'pro');
+
+statement ok
+CREATE TABLE lake.orders (id INTEGER, customer_id INTEGER, amount INTEGER);
+
+statement ok
+INSERT INTO lake.orders VALUES (1, 1, 10), (2, 1, 20), (3, 2, 5);
+
+statement ok
+CREATE SEMANTIC VIEW shop
+  TABLES (o AS lake.orders PRIMARY KEY (id), c AS lake.customers PRIMARY KEY (id))
+  RELATIONSHIPS (o (customer_id) REFERENCES c)
+  DIMENSIONS (c.segment AS segment)
+  METRICS (o.revenue AS SUM(amount), o.order_count AS COUNT(*));
+
+# storage targets: the view's database (default), a DuckLake catalog, a schema of it, an in-memory database
+statement ok
+ALTER SEMANTIC VIEW shop ADD MATERIALIZATION local_copy AS DIMENSIONS c.segment METRICS o.revenue;
+
+statement ok
+ALTER SEMANTIC VIEW shop ADD MATERIALIZATION lake_copy IN lake AS DIMENSIONS c.segment METRICS o.order_count;
+
+statement ok
+ALTER SEMANTIC VIEW shop ADD MATERIALIZATION totals IN lake.analytics AS METRICS o.revenue, o.order_count;
+
+statement ok
+SET VARIABLE shop__totals__0 = (SELECT tables[1] FROM (SHOW SEMANTIC MATERIALIZATIONS IN shop) WHERE name = 'totals');
+
+statement ok
+ALTER SEMANTIC VIEW shop ADD MATERIALIZATION mem_copy IN mem AS DIMENSIONS c.segment METRICS o.revenue, o.order_count;
+
+query IIII
+SELECT name, storage, list_transform(tables, t -> regexp_replace(t, '__[0-9a-f]{32}$', '')), usable FROM (SHOW SEMANTIC MATERIALIZATIONS IN shop) ORDER BY name;
+----
+lake_copy	lake.__semantic_materializations	[lake.__semantic_materializations.shop__lake_copy__0]	true
+local_copy	materializations_persistence.__semantic_materializations	[materializations_persistence.__semantic_materializations.shop__local_copy__0]	true
+mem_copy	mem.__semantic_materializations	[mem.__semantic_materializations.shop__mem_copy__0]	true
+totals	lake.analytics	[lake.analytics.shop__totals__0]	true
+
+# every target is written the same way: the tables, and a metadata row next to them
+query II
+SELECT name, list_transform(tables, t -> regexp_replace(t, '__[0-9a-f]{32}$', '')) FROM lake.__semantic_materializations.__sv_materializations ORDER BY name;
+----
+lake_copy	[shop__lake_copy__0]
+totals	[shop__totals__0]
+
+query III
+SELECT __sv_rows, s0_sum, s1_cnt FROM query_table(getvariable('shop__totals__0'));
+----
+3	35	3
+
+# bad targets
+statement error
+ALTER SEMANTIC VIEW shop ADD MATERIALIZATION bad IN nowhere AS METRICS o.revenue;
+----
+database "nowhere" does not exist
+
+statement error
+ALTER SEMANTIC VIEW shop ADD MATERIALIZATION bad IN temp AS METRICS o.revenue;
+----
+materializations cannot be stored in the temp database
+
+statement error
+ALTER SEMANTIC VIEW shop ADD MATERIALIZATION bad IN system AS METRICS o.revenue;
+----
+materializations cannot be stored in the system database
+
+statement ok
+ATTACH '__TEST_DIR__/materializations_read_only.db' AS ro;
+
+statement ok
+DETACH ro;
+
+statement ok
+ATTACH '__TEST_DIR__/materializations_read_only.db' AS ro (READ_ONLY);
+
+statement error
+ALTER SEMANTIC VIEW shop ADD MATERIALIZATION bad IN ro AS METRICS o.revenue;
+----
+database "ro" is read-only
+
+statement error
+ALTER SEMANTIC VIEW shop ADD MATERIALIZATION bad IN lake.analytics.too_deep AS METRICS o.revenue;
+----
+IN expects <database> or <database>.<schema>
+
+statement ok
+INSERT INTO lake.orders VALUES (4, 2, 100);
+
+statement ok
+ALTER SEMANTIC VIEW shop REFRESH MATERIALIZATION totals;
+
+query III
+SELECT __sv_rows, s0_sum, s1_cnt FROM query_table(getvariable('shop__totals__0'));
+----
+4	135	4
+
+restart
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/persistence.ducklake' AS lake (DATA_PATH '__TEST_DIR__/persistence_data');
+
+statement ok
+ATTACH ':memory:' AS mem;
+
+# semantic views are not persisted: re-creating the view brings back its stored materializations (the in-memory one is gone)
+statement ok
+CREATE SEMANTIC VIEW shop
+  TABLES (o AS lake.orders PRIMARY KEY (id), c AS lake.customers PRIMARY KEY (id))
+  RELATIONSHIPS (o (customer_id) REFERENCES c)
+  DIMENSIONS (c.segment AS segment)
+  METRICS (o.revenue AS SUM(amount), o.order_count AS COUNT(*));
+
+query IIIII
+SELECT name, storage, last_refresh, last_refresh_detail, usable FROM (SHOW SEMANTIC MATERIALIZATIONS IN shop) ORDER BY name;
+----
+lake_copy	lake.__semantic_materializations	FULL	initial build	false
+local_copy	materializations_persistence.__semantic_materializations	FULL	initial build	false
+totals	lake.analytics	INCREMENTAL	1 group(s) changed	true
+
+# reads come from the reattached tables
+query I
+SELECT sql ILIKE '%shop__totals__0%' FROM semantic_view_sql('SELECT * FROM SEMANTIC_VIEW(shop METRICS o.revenue)');
+----
+true
+
+query I
+SELECT * FROM SEMANTIC_VIEW(shop METRICS o.revenue);
+----
+135
+
+# refreshes continue from the stored watermark
+statement ok
+INSERT INTO lake.orders VALUES (5, 1, 1000);
+
+query I
+ALTER SEMANTIC VIEW shop REFRESH MATERIALIZATION lake_copy;
+----
+Materialization lake_copy refreshed (INCREMENTAL: 2 group(s) changed).
+
+query II
+SELECT * FROM SEMANTIC_VIEW(shop DIMENSIONS c.segment METRICS o.order_count) ORDER BY ALL;
+----
+pro	2
+retail	3
+
+query I
+ALTER SEMANTIC VIEW shop REFRESH MATERIALIZATION local_copy;
+----
+Materialization local_copy refreshed (INCREMENTAL: 2 group(s) changed).
+
+query II
+SELECT * FROM SEMANTIC_VIEW(shop DIMENSIONS c.segment METRICS o.revenue) ORDER BY ALL;
+----
+pro	105
+retail	1030
+
+restart
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/persistence.ducklake' AS lake (DATA_PATH '__TEST_DIR__/persistence_data');
+
+# a changed definition keeps the materializations it can still serve (rebuilt by their next refresh) and drops the rest
+statement ok
+CREATE SEMANTIC VIEW shop
+  TABLES (o AS lake.orders PRIMARY KEY (id), c AS lake.customers PRIMARY KEY (id))
+  RELATIONSHIPS (o (customer_id) REFERENCES c)
+  DIMENSIONS (c.segment AS segment)
+  METRICS (o.revenue AS SUM(amount * 2));
+
+query IIIII
+SELECT name, storage, last_refresh_detail, usable, not_usable_reason FROM (SHOW SEMANTIC MATERIALIZATIONS IN shop) ORDER BY name;
+----
+local_copy	materializations_persistence.__semantic_materializations	its definition changed since it was built	false	it has not been built yet (refresh it)
+
+query I
+SELECT count(*) FROM lake.__semantic_materializations.__sv_materializations;
+----
+0
+
+query I
+SELECT regexp_replace(table_name, '__[0-9a-f]{32}$', '') FROM duckdb_tables() WHERE schema_name IN ('__semantic_materializations', 'analytics') ORDER BY ALL;
+----
+__sv_materializations
+__sv_materializations
+shop__local_copy__0
+
+query I
+SELECT * FROM SEMANTIC_VIEW(shop METRICS o.revenue);
+----
+2270
+
+query I
+ALTER SEMANTIC VIEW shop REFRESH MATERIALIZATION local_copy;
+----
+Materialization local_copy refreshed (FULL: its definition changed since it was built).
+
+query II
+SELECT * FROM SEMANTIC_VIEW(shop DIMENSIONS c.segment METRICS o.revenue) ORDER BY ALL;
+----
+pro	210
+retail	2060
+
+query I
+SELECT sql ILIKE '%shop__local_copy__0%' FROM semantic_view_sql('SELECT * FROM SEMANTIC_VIEW(shop DIMENSIONS c.segment METRICS o.revenue)');
+----
+true
+
+# renaming the view keeps its materializations; a view of the old name no longer finds them
+statement ok
+ALTER SEMANTIC VIEW shop RENAME TO store;
+
+query II
+SELECT view_name, name FROM __semantic_materializations.__sv_materializations;
+----
+store	local_copy
+
+restart
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/persistence.ducklake' AS lake2 (DATA_PATH '__TEST_DIR__/persistence_data');
+
+statement ok
+CREATE SEMANTIC VIEW store
+  TABLES (o AS lake2.orders PRIMARY KEY (id), c AS lake2.customers PRIMARY KEY (id))
+  RELATIONSHIPS (o (customer_id) REFERENCES c)
+  DIMENSIONS (c.segment AS segment)
+  METRICS (o.revenue AS SUM(amount * 2));
+
+query II
+SELECT name, last_refresh_detail FROM (SHOW SEMANTIC MATERIALIZATIONS IN store);
+----
+local_copy	its definition changed since it was built
+
+# a materialization stored in a DuckLake catalog attached under another name is found there
+statement ok
+ALTER SEMANTIC VIEW store ADD MATERIALIZATION lake_totals IN lake2 AS METRICS o.revenue;
+
+restart
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/persistence.ducklake' AS other_name (DATA_PATH '__TEST_DIR__/persistence_data');
+
+statement ok
+CREATE SEMANTIC VIEW store
+  TABLES (o AS other_name.orders PRIMARY KEY (id), c AS other_name.customers PRIMARY KEY (id))
+  RELATIONSHIPS (o (customer_id) REFERENCES c)
+  DIMENSIONS (c.segment AS segment)
+  METRICS (o.revenue AS SUM(amount * 2));
+
+query III
+SELECT name, storage, last_refresh_detail FROM (SHOW SEMANTIC MATERIALIZATIONS IN store) ORDER BY name;
+----
+lake_totals	other_name.__semantic_materializations	its definition changed since it was built
+local_copy	materializations_persistence.__semantic_materializations	its definition changed since it was built
+
+# dropping the view drops its stored materializations, wherever they are
+statement ok
+DROP SEMANTIC VIEW store;
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE table_name LIKE 'shop__%' OR table_name LIKE 'store__%';
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM __semantic_materializations.__sv_materializations) + (SELECT count(*) FROM other_name.__semantic_materializations.__sv_materializations);
+----
+0
+
+# CREATE OR REPLACE keeps the materializations the new definition can still serve, and drops the others
+statement ok
+CREATE SEMANTIC VIEW v TABLES (o AS other_name.orders PRIMARY KEY (id)) METRICS (o.revenue AS SUM(amount), o.order_count AS COUNT(*));
+
+statement ok
+ALTER SEMANTIC VIEW v ADD MATERIALIZATION kept AS METRICS o.revenue;
+
+statement ok
+ALTER SEMANTIC VIEW v ADD MATERIALIZATION gone AS METRICS o.order_count;
+
+statement ok
+CREATE OR REPLACE SEMANTIC VIEW v TABLES (o AS other_name.orders PRIMARY KEY (id)) METRICS (o.revenue AS SUM(amount));
+
+query III
+SELECT name, last_refresh_detail, usable FROM (SHOW SEMANTIC MATERIALIZATIONS IN v);
+----
+kept	initial build	true
+
+query I
+SELECT regexp_replace(table_name, '__[0-9a-f]{32}$', '') FROM duckdb_tables() WHERE table_name LIKE 'v\_\_%' ESCAPE '\';
+----
+v__kept__0
+
+query I
+SELECT name FROM __semantic_materializations.__sv_materializations WHERE view_name = 'v';
+----
+kept
