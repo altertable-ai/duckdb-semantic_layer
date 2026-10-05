@@ -39,5 +39,8 @@ CREATE OR REPLACE SEMANTIC VIEW sales_sv
     c.customer_count AS COUNT(*),
     c.avg_lifetime_revenue AS AVG(c.lifetime_revenue),
     s.last_day_revenue NON ADDITIVE BY (s.sale_day) AS SUM(amount),
+    s.revenue_ytd CUMULATIVE (s.sale_day TO YEAR) AS SUM(amount),
+    s.revenue_running CUMULATIVE (s.sale_day) AS SUM(amount),
+    s.active_products_7d CUMULATIVE (s.sale_day OVER INTERVAL 7 DAYS) AS COUNT(DISTINCT product_id),
     revenue_per_customer AS s.revenue / c.customer_count
   );

@@ -59,3 +59,27 @@ SELECT f.name AS fiscal_quarter, SUM(s.amount) AS revenue FROM sales s LEFT JOIN
 SELECT * FROM SEMANTIC_VIEW(sales_sv DIMENSIONS p.category METRICS c.customer_count)
 -- handwritten
 SELECT p.category, COUNT(DISTINCT s.customer_id) AS customer_count FROM sales s LEFT JOIN products p ON s.product_id = p.id GROUP BY 1
+
+-- name: q_cumulative_ytd_by_month
+-- semantic
+SELECT * FROM SEMANTIC_VIEW(sales_sv DIMENSIONS s.sale_month METRICS s.revenue_ytd)
+-- handwritten
+WITH d AS (SELECT sale_date, SUM(amount) AS v FROM sales GROUP BY 1),
+a AS (SELECT t.sale_date AS t, SUM(d.v) AS v FROM d t JOIN d ON d.sale_date <= t.sale_date AND d.sale_date >= DATE_TRUNC('year', t.sale_date) GROUP BY 1)
+SELECT DATE_TRUNC('month', t) AS sale_month, arg_max(v, t) AS revenue_ytd FROM a GROUP BY 1
+
+-- name: q_cumulative_running_total_by_year
+-- semantic
+SELECT * FROM SEMANTIC_VIEW(sales_sv DIMENSIONS s.sale_year METRICS s.revenue_running)
+-- handwritten
+WITH d AS (SELECT sale_date, SUM(amount) AS v FROM sales GROUP BY 1),
+a AS (SELECT t.sale_date AS t, SUM(d.v) AS v FROM d t JOIN d ON d.sale_date <= t.sale_date GROUP BY 1)
+SELECT YEAR(t) AS sale_year, arg_max(v, t) AS revenue_running FROM a GROUP BY 1
+
+-- name: q_cumulative_active_products_7d_by_month
+-- semantic
+SELECT * FROM SEMANTIC_VIEW(sales_sv DIMENSIONS s.sale_month METRICS s.active_products_7d)
+-- handwritten
+WITH t AS (SELECT DISTINCT sale_date FROM sales), d AS (SELECT DISTINCT sale_date, product_id FROM sales),
+a AS (SELECT t.sale_date AS t, COUNT(DISTINCT d.product_id) AS v FROM t JOIN d ON d.sale_date <= t.sale_date AND d.sale_date > t.sale_date - INTERVAL 7 DAY GROUP BY 1)
+SELECT DATE_TRUNC('month', t) AS sale_month, arg_max(v, t) AS active_products_7d FROM a GROUP BY 1
