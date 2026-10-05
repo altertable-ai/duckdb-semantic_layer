@@ -34,8 +34,6 @@ struct SemanticMetricContext {
 	vector<idx_t> offsets;
 	//! CUMULATIVE (SemanticModel::cumulatives) that applies, or INVALID_INDEX
 	idx_t cumulative = DConstants::INVALID_INDEX;
-	//! The metric of that CUMULATIVE (error messages only, not compared)
-	idx_t cumulative_member = DConstants::INVALID_INDEX;
 
 	bool operator==(const SemanticMetricContext &other) const {
 		return table == other.table && using_relationships == other.using_relationships &&
@@ -143,7 +141,7 @@ private:
 	//! from its home table, and moves the FILTERs out of the context, AND-ed into its aggregate (or into its row
 	//! filters when it is semi-additive)
 	void ApplyMetricContext(SemanticAtom &atom, const string &what);
-	SemanticMetricContext MetricContext(idx_t metric, const SemanticMetricContext &outer, const string &what) const;
+	SemanticMetricContext MetricContext(idx_t metric, const SemanticMetricContext &outer) const;
 
 	const SemanticModel &model;
 	ClientContext &context;

@@ -15,8 +15,9 @@ public:
 	                                            unique_ptr<ParsedExpression> compiled) {
 		return compiled;
 	}
-	//! `compiled`: a child aggregation (correlated scalar subquery, or an expression over several)
-	virtual unique_ptr<ParsedExpression> ChildAggregation(unique_ptr<ParsedExpression> compiled) {
+	//! `compiled`: a value whose column reads the map does not see: a child aggregation (correlated scalar subquery, or
+	//! an expression over several), or a dimension read through a many-to-many bridge
+	virtual unique_ptr<ParsedExpression> Opaque(unique_ptr<ParsedExpression> compiled) {
 		return compiled;
 	}
 };

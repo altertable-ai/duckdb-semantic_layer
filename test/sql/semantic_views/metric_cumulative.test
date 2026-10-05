@@ -258,6 +258,23 @@ CREATE SEMANTIC VIEW bad TABLES (dates PRIMARY KEY (day), events PRIMARY KEY (ev
 ----
 CUMULATIVE metrics cannot use window functions
 
+# the nesting rules hold through intermediate metrics
+statement error
+CREATE SEMANTIC VIEW bad TABLES (dates PRIMARY KEY (day), events PRIMARY KEY (event_id)) RELATIONSHIPS (events (event_date) REFERENCES dates)
+  DIMENSIONS (dates.day AS day)
+  METRICS (events.revenue_lm OFFSET (dates.day BY INTERVAL 1 MONTH) AS SUM(amount), events.mid AS revenue_lm + 1,
+           events.x CUMULATIVE (dates.day) AS mid);
+----
+uses CUMULATIVE and cannot reference metric "events.revenue_lm", which uses OFFSET
+
+statement error
+CREATE SEMANTIC VIEW bad TABLES (dates PRIMARY KEY (day), events PRIMARY KEY (event_id)) RELATIONSHIPS (events (event_date) REFERENCES dates)
+  DIMENSIONS (dates.day AS day)
+  METRICS (events.total CUMULATIVE (dates.day) AS SUM(amount), events.mid AS total + 1,
+           events.x NON ADDITIVE BY (dates.day) AS mid);
+----
+is semi-additive and cannot reference metric "events.total", which uses CUMULATIVE
+
 # cumulative metrics cannot be materialized
 statement error
 ALTER SEMANTIC VIEW activity ADD MATERIALIZATION bad AS DIMENSIONS dates.month METRICS events.revenue_total;
@@ -319,6 +336,22 @@ SELECT * FROM SEMANTIC_VIEW(activity DIMENSIONS dates.day METRICS events.revenue
 2026-01-07	100	100
 2026-01-08	150	140
 2026-01-09	150	90
+
+# another dimension defined as the date column is the anchor too: one anchor per dimension tuple
+statement ok
+CREATE SEMANTIC VIEW activity_days TABLES (dates PRIMARY KEY (day), events PRIMARY KEY (event_id))
+  RELATIONSHIPS (events (event_date) REFERENCES dates)
+  DIMENSIONS (dates.day AS day, dates.same_day AS day)
+  METRICS (events.wau_first CUMULATIVE (dates.day OVER INTERVAL 7 DAYS FIRST) AS COUNT(DISTINCT user_id),
+           events.wau_avg CUMULATIVE (dates.day OVER INTERVAL 7 DAYS AVERAGE) AS COUNT(DISTINCT user_id));
+
+query III
+SELECT * FROM SEMANTIC_VIEW(activity_days DIMENSIONS dates.same_day METRICS events.wau_first, events.wau_avg
+  WHERE dates.same_day BETWEEN DATE '2026-01-07' AND DATE '2026-01-09') ORDER BY same_day;
+----
+2026-01-07	2	2
+2026-01-08	3	3
+2026-01-09	2	2
 
 # a WHERE on another dimension filters the rows; anchors stop at their latest date (2026-02-03 for FR)
 query II

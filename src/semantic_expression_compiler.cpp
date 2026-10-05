@@ -66,7 +66,7 @@ unique_ptr<ParsedExpression> SemanticExpressionCompiler::CompileRow(const Parsed
 		// a metric in a row-level expression: aggregate the finer rows belonging to the current row
 		vector<SemanticAtom> atoms;
 		auto post = analyzer.DecomposeMetric(ref.index, atoms, what);
-		result = map.ChildAggregation(
+		result = map.Opaque(
 		    ReplaceAtoms(*post, [&](idx_t atom) { return ChildAggregate(atoms[atom], context_table, scope, what); }));
 	} else if (analyzer.IsAggregate(expr)) {
 		SemanticAtom atom;
@@ -74,7 +74,7 @@ unique_ptr<ParsedExpression> SemanticExpressionCompiler::CompileRow(const Parsed
 		atom.aggregate = expr.Copy();
 		atom.context.table = context_table;
 		atom.context.using_relationships = scope.UsingRelationships();
-		result = map.ChildAggregation(ChildAggregate(atom, context_table, scope, what));
+		result = map.Opaque(ChildAggregate(atom, context_table, scope, what));
 	} else {
 		result = expr.Copy();
 		ParsedExpressionIterator::EnumerateChildren(*result, [&](unique_ptr<ParsedExpression> &child) {

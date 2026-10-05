@@ -1,18 +1,84 @@
 #include "semantic_cumulative.hpp"
 
+#include "duckdb/common/enums/date_part_specifier.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/to_string.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
+#include "duckdb/parser/expression/operator_expression.hpp"
 #include "duckdb/parser/expression/star_expression.hpp"
 #include "duckdb/parser/expression/window_expression.hpp"
+#include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/tableref/joinref.hpp"
-#include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "semantic_ast_helpers.hpp"
 #include "semantic_materialization_internal.hpp"
 
 namespace duckdb {
+
+//===--------------------------------------------------------------------===//
+// Window
+//===--------------------------------------------------------------------===//
+static unique_ptr<ParsedExpression> Call(const string &name, vector<unique_ptr<ParsedExpression>> children,
+                                         bool is_operator = false) {
+	return make_uniq<FunctionExpression>(name, std::move(children), nullptr, nullptr, false, is_operator);
+}
+
+unique_ptr<ParsedExpression> SemanticCumulativeWindow(const SemanticCumulative &cumulative,
+                                                      unique_ptr<ParsedExpression> date,
+                                                      unique_ptr<ParsedExpression> anchor) {
+	vector<unique_ptr<ParsedExpression>> children;
+	unique_ptr<ParsedExpression> start;
+	switch (cumulative.kind) {
+	case SemanticCumulativeKind::WINDOW:
+		// anchor - window < date
+		children.push_back(anchor->Copy());
+		children.push_back(cumulative.window->Copy());
+		start = Compare(ExpressionType::COMPARE_GREATERTHAN, date->Copy(), Call("-", std::move(children), true));
+		break;
+	case SemanticCumulativeKind::GRAIN:
+		// date_trunc(part, anchor) <= date
+		children.push_back(make_uniq<ConstantExpression>(Value(cumulative.part)));
+		children.push_back(anchor->Copy());
+		start = Compare(ExpressionType::COMPARE_GREATERTHANOREQUALTO, date->Copy(),
+		                Call("date_trunc", std::move(children)));
+		break;
+	default:
+		break;
+	}
+	vector<unique_ptr<ParsedExpression>> conditions;
+	conditions.push_back(Compare(ExpressionType::COMPARE_LESSTHANOREQUALTO, std::move(date), std::move(anchor)));
+	if (start) {
+		conditions.push_back(std::move(start));
+	}
+	return AndAll(std::move(conditions));
+}
+
+bool SemanticIsTruncationPart(const string &part) {
+	DatePartSpecifier specifier;
+	if (!TryGetDatePartSpecifier(part, specifier)) {
+		return false;
+	}
+	switch (specifier) {
+	case DatePartSpecifier::MILLENNIUM:
+	case DatePartSpecifier::CENTURY:
+	case DatePartSpecifier::DECADE:
+	case DatePartSpecifier::YEAR:
+	case DatePartSpecifier::QUARTER:
+	case DatePartSpecifier::MONTH:
+	case DatePartSpecifier::WEEK:
+	case DatePartSpecifier::ISOYEAR:
+	case DatePartSpecifier::DAY:
+	case DatePartSpecifier::HOUR:
+	case DatePartSpecifier::MINUTE:
+	case DatePartSpecifier::SECOND:
+	case DatePartSpecifier::MILLISECONDS:
+	case DatePartSpecifier::MICROSECONDS:
+		return true;
+	default:
+		return false;
+	}
+}
 
 //===--------------------------------------------------------------------===//
 // Anchor map
@@ -31,14 +97,10 @@ unique_ptr<ParsedExpression> SemanticAnchorMap::Column(idx_t table, const string
 	if (table == cumulative.table && StringUtil::CIEquals(column, cumulative.column)) {
 		return offsets.Column(table, column, ColumnRef(CUMULATIVE_ANCHOR_COLUMN));
 	}
-	return Leaf(offsets.Column(table, column, std::move(compiled)));
+	return Opaque(offsets.Column(table, column, std::move(compiled)));
 }
 
-unique_ptr<ParsedExpression> SemanticAnchorMap::ChildAggregation(unique_ptr<ParsedExpression> compiled) {
-	return Leaf(std::move(compiled));
-}
-
-unique_ptr<ParsedExpression> SemanticAnchorMap::Leaf(unique_ptr<ParsedExpression> compiled) {
+unique_ptr<ParsedExpression> SemanticAnchorMap::Opaque(unique_ptr<ParsedExpression> compiled) {
 	compiled->alias.clear();
 	for (idx_t i = 0; i < leaves.size(); i++) {
 		if (leaves[i]->Equals(*compiled)) {
@@ -62,10 +124,6 @@ vector<unique_ptr<ParsedExpression>> SemanticAnchorMap::TakeLeaves() {
 // Block
 //===--------------------------------------------------------------------===//
 namespace {
-
-unique_ptr<ParsedExpression> Call(const string &name, vector<unique_ptr<ParsedExpression>> children) {
-	return make_uniq<FunctionExpression>(name, std::move(children));
-}
 
 //! max(__sv_c) OVER (): the latest date of the block's rows
 unique_ptr<ParsedExpression> LatestDate() {
@@ -133,7 +191,7 @@ unique_ptr<SelectNode> PreAggregate(ClientContext &context, SemanticCumulativePa
 	};
 	group_by(CUMULATIVE_DATE_COLUMN);
 	for (auto &leaf : parts.leaves) {
-		group_by(leaf);
+		group_by(leaf->alias);
 	}
 	for (idx_t k = 0; k < parts.aggregates.size(); k++) {
 		auto &function = parts.aggregates[k]->Cast<FunctionExpression>();
@@ -159,34 +217,27 @@ unique_ptr<SelectNode> PreAggregate(ClientContext &context, SemanticCumulativePa
 }
 
 //! The date __sv_c lies in the window of anchor __sv_t, which does not come after the latest date
-unique_ptr<ParsedExpression> WindowCondition(const SemanticCumulative &cumulative) {
+unique_ptr<ParsedExpression> AnchorJoinCondition(const SemanticCumulative &cumulative) {
 	vector<unique_ptr<ParsedExpression>> conditions;
-	conditions.push_back(Compare(ExpressionType::COMPARE_LESSTHANOREQUALTO, ColumnRef(CUMULATIVE_DATE_COLUMN),
-	                             ColumnRef(CUMULATIVE_ANCHOR_COLUMN)));
-	switch (cumulative.kind) {
-	case SemanticCumulativeKind::WINDOW: {
-		vector<unique_ptr<ParsedExpression>> children;
-		children.push_back(ColumnRef(CUMULATIVE_ANCHOR_COLUMN));
-		children.push_back(cumulative.window->Copy());
-		auto start = make_uniq<FunctionExpression>("-", std::move(children), nullptr, nullptr, false, true);
-		conditions.push_back(
-		    Compare(ExpressionType::COMPARE_GREATERTHAN, ColumnRef(CUMULATIVE_DATE_COLUMN), std::move(start)));
-		break;
-	}
-	case SemanticCumulativeKind::GRAIN: {
-		vector<unique_ptr<ParsedExpression>> children;
-		children.push_back(make_uniq<ConstantExpression>(Value(cumulative.part)));
-		children.push_back(ColumnRef(CUMULATIVE_ANCHOR_COLUMN));
-		conditions.push_back(Compare(ExpressionType::COMPARE_GREATERTHANOREQUALTO, ColumnRef(CUMULATIVE_DATE_COLUMN),
-		                             Call("date_trunc", std::move(children))));
-		break;
-	}
-	default:
-		break;
-	}
+	conditions.push_back(
+	    SemanticCumulativeWindow(cumulative, ColumnRef(CUMULATIVE_DATE_COLUMN), ColumnRef(CUMULATIVE_ANCHOR_COLUMN)));
 	conditions.push_back(Compare(ExpressionType::COMPARE_LESSTHANOREQUALTO, ColumnRef(CUMULATIVE_ANCHOR_COLUMN),
 	                             ColumnRef(CUMULATIVE_BOUND_COLUMN)));
 	return AndAll(std::move(conditions));
+}
+
+//! The anchor dates: SELECT DISTINCT c AS __sv_t FROM <c's table> WHERE c IS NOT NULL
+unique_ptr<QueryNode> Anchors(const SemanticModel &model, SemanticAliasGenerator &aliases,
+                              optional_ptr<const SemanticTableSources> sources, const SemanticCumulative &cumulative) {
+	SemanticJoinScope scope(model, aliases, cumulative.table, {}, aliases.NestedPrefix(), sources);
+	auto node = make_uniq<SelectNode>();
+	auto anchor = scope.ColumnReference(cumulative.table, cumulative.column);
+	node->where_clause = make_uniq<OperatorExpression>(ExpressionType::OPERATOR_IS_NOT_NULL, anchor->Copy());
+	anchor->alias = CUMULATIVE_ANCHOR_COLUMN;
+	node->select_list.push_back(std::move(anchor));
+	node->modifiers.push_back(make_uniq<DistinctModifier>());
+	node->from_table = scope.BuildFrom();
+	return std::move(node);
 }
 
 //! The value of `column` for a group of anchors
@@ -200,11 +251,31 @@ unique_ptr<ParsedExpression> Period(SemanticCumulativePeriod period, const strin
 	return Call(period == SemanticCumulativePeriod::FIRST ? "arg_min_null" : "arg_max_null", std::move(children));
 }
 
+//! Stage 4's column of aggregate `k`
+string ValueColumn(idx_t k) {
+	return "__sv_v" + to_string(k);
+}
+
 } // namespace
 
-unique_ptr<SelectNode> BuildSemanticCumulativeBlock(ClientContext &context, const SemanticCumulative &cumulative,
-                                                    SemanticCumulativeParts parts, const vector<string> &atom_columns) {
+SemanticCumulativeBlock BuildSemanticCumulativeBlock(ClientContext &context, const SemanticModel &model,
+                                                     SemanticAliasGenerator &aliases,
+                                                     optional_ptr<const SemanticTableSources> sources,
+                                                     const SemanticCumulative &cumulative,
+                                                     SemanticCumulativeParts parts) {
+	// stage 1: the rows read the date and the leaves
+	parts.date->alias = CUMULATIVE_DATE_COLUMN;
+	parts.rows->select_list.push_back(std::move(parts.date));
+	for (auto &leaf : parts.leaves) {
+		parts.rows->select_list.push_back(leaf->Copy());
+	}
+	// one anchor per dimension tuple when a dimension is the anchor itself (not shifted by an OFFSET): no period
+	auto anchor = ColumnRef(CUMULATIVE_ANCHOR_COLUMN);
+	auto one_anchor =
+	    std::any_of(parts.dimensions.begin(), parts.dimensions.end(),
+	                [&](const unique_ptr<ParsedExpression> &dimension) { return dimension->Equals(*anchor); });
 	auto dimension_count = parts.dimensions.size();
+	auto value_count = parts.aggregates.size();
 	// stage 2: the pre-aggregated or raw rows, with the latest date
 	auto dated = PreAggregate(context, parts);
 	if (!dated) {
@@ -214,8 +285,8 @@ unique_ptr<SelectNode> BuildSemanticCumulativeBlock(ClientContext &context, cons
 	auto join = make_uniq<JoinRef>(JoinRefType::REGULAR);
 	join->type = JoinType::INNER;
 	join->left = MakeSubqueryRef(std::move(dated), "__sv_dated");
-	join->right = MakeSubqueryRef(std::move(parts.anchors), "__sv_anchors");
-	join->condition = WindowCondition(cumulative);
+	join->right = MakeSubqueryRef(Anchors(model, aliases, sources, cumulative), "__sv_anchors");
+	join->condition = AnchorJoinCondition(cumulative);
 	// stage 4: per dimension tuple and anchor
 	auto anchored = make_uniq<SelectNode>();
 	for (idx_t d = 0; d < dimension_count; d++) {
@@ -225,28 +296,27 @@ unique_ptr<SelectNode> BuildSemanticCumulativeBlock(ClientContext &context, cons
 	}
 	anchored->groups.group_expressions.push_back(ColumnRef(CUMULATIVE_ANCHOR_COLUMN));
 	anchored->select_list.push_back(ColumnRef(CUMULATIVE_ANCHOR_COLUMN));
-	for (idx_t k = 0; k < parts.aggregates.size(); k++) {
-		parts.aggregates[k]->alias = atom_columns[k];
+	for (idx_t k = 0; k < value_count; k++) {
+		parts.aggregates[k]->alias = ValueColumn(k);
 		anchored->select_list.push_back(std::move(parts.aggregates[k]));
 	}
 	anchored->where_clause = std::move(parts.anchor_where);
 	anchored->from_table = std::move(join);
 	GroupByAll(*anchored);
 	// stage 5: per dimension tuple
-	auto result = make_uniq<SelectNode>();
+	SemanticCumulativeBlock result;
+	result.node = make_uniq<SelectNode>();
 	for (idx_t d = 0; d < dimension_count; d++) {
-		result->select_list.push_back(ColumnRef(SemanticDimensionColumn(d)));
-		if (!parts.dimension_is_anchor) {
-			result->groups.group_expressions.push_back(ColumnRef(SemanticDimensionColumn(d)));
+		result.node->select_list.push_back(ColumnRef(SemanticDimensionColumn(d)));
+		if (!one_anchor) {
+			result.node->groups.group_expressions.push_back(ColumnRef(SemanticDimensionColumn(d)));
 		}
 	}
-	for (auto &column : atom_columns) {
-		auto value = parts.dimension_is_anchor ? ColumnRef(column) : Period(cumulative.period, column);
-		value->alias = column;
-		result->select_list.push_back(std::move(value));
+	for (idx_t k = 0; k < value_count; k++) {
+		result.values.push_back(one_anchor ? ColumnRef(ValueColumn(k)) : Period(cumulative.period, ValueColumn(k)));
 	}
-	result->from_table = MakeSubqueryRef(std::move(anchored), "__sv_anchored");
-	GroupByAll(*result);
+	result.node->from_table = MakeSubqueryRef(std::move(anchored), "__sv_anchored");
+	GroupByAll(*result.node);
 	return result;
 }
 

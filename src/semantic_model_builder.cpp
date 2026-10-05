@@ -22,10 +22,7 @@
 #include "semantic_analysis.hpp"
 #include "semantic_model.hpp"
 #include "semantic_materialization.hpp"
-#include "semantic_offsets.hpp"
-#include "semantic_ast_helpers.hpp"
-#include "duckdb/parser/expression/function_expression.hpp"
-#include "duckdb/common/enums/date_part_specifier.hpp"
+#include "semantic_cumulative.hpp"
 #include "semantic_query_compiler.hpp"
 
 namespace duckdb {
@@ -83,6 +80,7 @@ public:
 		ResolveOffsets();
 		ResolveCumulatives();
 		CheckMemberCycles();
+		CheckCumulativeComposition();
 		CheckMemberKinds();
 		ProbeSemanticModelTypes(context, *model);
 		PlanSemanticMaterializations(context, *model);
@@ -425,6 +423,10 @@ private:
 		}
 	}
 
+	static bool IsConstant(SemanticAnalyzer &analyzer, const ParsedExpression &expr) {
+		return expr.IsScalar() && !analyzer.ContainsAggregateOrMetric(expr) && !SemanticAnalyzer::ContainsWindow(expr);
+	}
+
 	//! The dimension of a metric's OFFSET / CUMULATIVE clause: a dimension defined as a column (returned)
 	SemanticRef ResolveColumnDimension(const vector<string> &name_parts, idx_t m, const string &what,
 	                                   idx_t &dimension) {
@@ -462,8 +464,7 @@ private:
 			idx_t dimension;
 			auto column = ResolveColumnDimension(parsed.offset_dimension, m, what, dimension);
 			auto &interval = *parsed.offset_interval;
-			if (!interval.IsScalar() || analyzer.ContainsAggregateOrMetric(interval) ||
-			    SemanticAnalyzer::ContainsWindow(interval)) {
+			if (!IsConstant(analyzer, interval)) {
 				Fail("%s: the interval must be a constant expression", what);
 			}
 			auto &table = model->tables[column.index];
@@ -511,8 +512,8 @@ private:
 		}
 	}
 
-	//! CUMULATIVE dimensions resolve like OFFSET dimensions; the OVER window is constant and subtracts from the
-	//! column, the TO part truncates it. Equal clauses are stored once.
+	//! CUMULATIVE dimensions resolve like OFFSET dimensions; the OVER window is constant and the window condition
+	//! binds over the column's type. Equal clauses are stored once.
 	void ResolveCumulatives() {
 		SemanticAnalyzer analyzer(*model, context);
 		for (idx_t m = 0; m < model->members.size(); m++) {
@@ -529,56 +530,25 @@ private:
 			cumulative.column = column.column;
 			cumulative.type = table.column_types[table.columns.at(column.column)];
 			cumulative.period = parsed.cumulative_period;
-			auto column_name = table.name + "." + column.column;
-			auto value = [&]() {
-				return make_uniq<CastExpression>(cumulative.type, make_uniq<ConstantExpression>(Value()));
-			};
-			string error;
+			cumulative.kind = SemanticCumulativeKind::ALL;
 			if (parsed.cumulative_window) {
-				auto &window = *parsed.cumulative_window;
-				if (!window.IsScalar() || analyzer.ContainsAggregateOrMetric(window) ||
-				    SemanticAnalyzer::ContainsWindow(window)) {
+				if (!IsConstant(analyzer, *parsed.cumulative_window)) {
 					Fail("%s: the window must be a constant expression", what);
 				}
 				cumulative.kind = SemanticCumulativeKind::WINDOW;
-				cumulative.window = window.Copy();
-				vector<unique_ptr<ParsedExpression>> children;
-				children.push_back(value());
-				children.push_back(window.Copy());
-				error = BindError(
-				    Compare(ExpressionType::COMPARE_GREATERTHAN, value(),
-				            make_uniq<FunctionExpression>("-", std::move(children), nullptr, nullptr, false, true)));
-				if (!error.empty()) {
-					Fail("%s: cannot use %s as the window of column \"%s\" (%s): %s", what, window.ToString(),
-					     column_name, cumulative.type.ToString(), error);
-				}
+				cumulative.window = parsed.cumulative_window->Copy();
 			} else if (!parsed.cumulative_part.empty()) {
-				DatePartSpecifier specifier;
-				if (!TryGetDatePartSpecifier(parsed.cumulative_part, specifier) || !IsTruncationPart(specifier)) {
+				if (!SemanticIsTruncationPart(parsed.cumulative_part)) {
 					Fail("%s: \"%s\" is not a date part to truncate to (e.g. day, week, month, quarter, year)", what,
 					     parsed.cumulative_part);
 				}
 				cumulative.kind = SemanticCumulativeKind::GRAIN;
 				cumulative.part = parsed.cumulative_part;
-				vector<unique_ptr<ParsedExpression>> children;
-				children.push_back(make_uniq<ConstantExpression>(Value(cumulative.part)));
-				children.push_back(value());
-				error = BindError(make_uniq<FunctionExpression>("date_trunc", std::move(children)));
-				if (!error.empty()) {
-					Fail("%s: cannot truncate column \"%s\" (%s) to %s: %s", what, column_name,
-					     cumulative.type.ToString(), cumulative.part, error);
-				}
-			} else {
-				cumulative.kind = SemanticCumulativeKind::ALL;
-				error = BindError(Compare(ExpressionType::COMPARE_LESSTHANOREQUALTO, value(), value()));
-				if (!error.empty()) {
-					Fail("%s: column \"%s\" (%s) cannot be ordered: %s", what, column_name, cumulative.type.ToString(),
-					     error);
-				}
 			}
 			auto existing = std::find_if(model->cumulatives.begin(), model->cumulatives.end(),
 			                             [&](const SemanticCumulative &other) { return other.Equals(cumulative); });
 			if (existing == model->cumulatives.end()) {
+				CheckCumulativeType(cumulative, what);
 				model->cumulatives.push_back(std::move(cumulative));
 				existing = model->cumulatives.end() - 1;
 			}
@@ -586,26 +556,24 @@ private:
 		}
 	}
 
-	//! The parts date_trunc truncates to (others, like dow, are accepted by date_trunc but are not periods)
-	static bool IsTruncationPart(DatePartSpecifier specifier) {
-		switch (specifier) {
-		case DatePartSpecifier::MILLENNIUM:
-		case DatePartSpecifier::CENTURY:
-		case DatePartSpecifier::DECADE:
-		case DatePartSpecifier::YEAR:
-		case DatePartSpecifier::QUARTER:
-		case DatePartSpecifier::MONTH:
-		case DatePartSpecifier::WEEK:
-		case DatePartSpecifier::ISOYEAR:
-		case DatePartSpecifier::DAY:
-		case DatePartSpecifier::HOUR:
-		case DatePartSpecifier::MINUTE:
-		case DatePartSpecifier::SECOND:
-		case DatePartSpecifier::MILLISECONDS:
-		case DatePartSpecifier::MICROSECONDS:
-			return true;
+	//! Binds SELECT <window condition over CAST(NULL AS <type>)>
+	void CheckCumulativeType(const SemanticCumulative &cumulative, const string &what) {
+		auto null = [&]() {
+			return make_uniq<CastExpression>(cumulative.type, make_uniq<ConstantExpression>(Value()));
+		};
+		auto error = BindError(SemanticCumulativeWindow(cumulative, null(), null()));
+		if (error.empty()) {
+			return;
+		}
+		auto column = "column \"" + model->tables[cumulative.table].name + "." + cumulative.column + "\" (" +
+		              cumulative.type.ToString() + ")";
+		switch (cumulative.kind) {
+		case SemanticCumulativeKind::WINDOW:
+			Fail("%s: cannot use %s as the window of %s: %s", what, cumulative.window->ToString(), column, error);
+		case SemanticCumulativeKind::GRAIN:
+			Fail("%s: cannot truncate %s to %s: %s", what, column, cumulative.part, error);
 		default:
-			return false;
+			Fail("%s: %s cannot be ordered: %s", what, column, error);
 		}
 	}
 
@@ -635,6 +603,57 @@ private:
 				names.push_back(model->MemberDisplayName(member));
 			}
 			Fail("Circular reference between semantic expressions: %s", StringUtil::Join(names, " -> "));
+		}
+	}
+
+	//! The metrics `metric` builds on: those its expression references, directly or through other metrics
+	vector<idx_t> MetricsBelow(idx_t metric) {
+		vector<idx_t> result;
+		vector<idx_t> pending {metric};
+		while (!pending.empty()) {
+			vector<idx_t> references;
+			CollectMemberRefs(*model->members[pending.back()].resolved, references);
+			pending.pop_back();
+			for (auto reference : references) {
+				if (model->members[reference].Kind() == SemanticMemberKind::METRIC &&
+				    std::find(result.begin(), result.end(), reference) == result.end()) {
+					result.push_back(reference);
+					pending.push_back(reference);
+				}
+			}
+		}
+		return result;
+	}
+
+	//! CUMULATIVE metrics build on plain metrics only (no OFFSET, CUMULATIVE or NON ADDITIVE BY below them), and
+	//! semi-additive ones on no CUMULATIVE metric
+	void CheckCumulativeComposition() {
+		for (idx_t m = 0; m < model->members.size(); m++) {
+			auto &member = model->members[m];
+			auto cumulative = member.cumulative.IsValid();
+			auto semi_additive = !member.non_additive.empty();
+			if (cumulative && semi_additive) {
+				Fail("%s cannot combine CUMULATIVE and NON ADDITIVE BY", What(m));
+			}
+			if (!cumulative && !semi_additive) {
+				continue;
+			}
+			for (auto below : MetricsBelow(m)) {
+				auto &other = model->members[below];
+				if (cumulative) {
+					const char *clause = other.offset.IsValid()        ? "OFFSET"
+					                     : other.cumulative.IsValid()  ? "CUMULATIVE"
+					                     : !other.non_additive.empty() ? "NON ADDITIVE BY"
+					                                                   : nullptr;
+					if (clause) {
+						Fail("%s uses CUMULATIVE and cannot reference metric \"%s\", which uses %s", What(m),
+						     model->MemberDisplayName(below), clause);
+					}
+				} else if (other.cumulative.IsValid()) {
+					Fail("%s is semi-additive and cannot reference metric \"%s\", which uses CUMULATIVE", What(m),
+					     model->MemberDisplayName(below));
+				}
+			}
 		}
 	}
 
