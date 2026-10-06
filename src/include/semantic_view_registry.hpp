@@ -12,6 +12,7 @@
 #include <functional>
 
 #include "duckdb/common/mutex.hpp"
+#include "duckdb/common/set.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "semantic_model.hpp"
 
@@ -40,6 +41,8 @@ public:
 	//! is taken by another view. Returns false when `expected` is no longer registered (dropped or altered meanwhile).
 	bool Replace(const SemanticModel &expected, shared_ptr<SemanticModel> model,
 	             const std::function<void()> &prepare = {});
+	//! Makes every registered view immutable for the lifetime of the instance; throws when called twice
+	void Protect();
 
 	shared_ptr<SemanticModel> Get(const QualifiedName &fully_qualified) const;
 	//! Looks up a name as used in a query (unqualified names follow the search path); nullptr when missing
@@ -51,11 +54,14 @@ public:
 
 private:
 	static string Key(const QualifiedName &name);
+	void CheckMutable(const QualifiedName &name) const;
 
 	mutable mutex lock;
 	//! Serializes DDL preparation/publication without blocking lookups from internally compiled SQL.
 	mutex ddl_lock;
 	map<string, shared_ptr<SemanticModel>> views;
+	set<string> protected_names;
+	bool protection_applied = false;
 };
 
 //! Extension state shared by all functions of the extension

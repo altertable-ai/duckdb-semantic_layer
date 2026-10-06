@@ -329,6 +329,21 @@ static unique_ptr<FunctionData> SemanticRefreshMaterializationBind(ClientContext
 	return std::move(result);
 }
 
+struct SemanticProtectData : public SemanticDDLData {
+	using SemanticDDLData::SemanticDDLData;
+
+	string Execute(ClientContext &) const override {
+		state->registry.Protect();
+		return "Semantic views are protected.";
+	}
+};
+
+static unique_ptr<FunctionData> SemanticProtectBind(ClientContext &, TableFunctionBindInput &input,
+                                                    vector<LogicalType> &return_types, vector<string> &names) {
+	StatusColumn(return_types, names);
+	return make_uniq<SemanticProtectData>(input.info->Cast<SemanticViewsFunctionInfo>().state, QualifiedName());
+}
+
 void RegisterSemanticDDLFunctions(ExtensionLoader &loader, shared_ptr<SemanticViewsState> state) {
 	auto name_and = [](vector<LogicalType> extra) {
 		vector<LogicalType> result(3, LogicalType::VARCHAR);
@@ -361,6 +376,8 @@ void RegisterSemanticDDLFunctions(ExtensionLoader &loader, shared_ptr<SemanticVi
 	    SemanticViewsTableFunction(SEMANTIC_VIEW_REFRESH_MATERIALIZATION_FUNCTION,
 	                               name_and({LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::VARCHAR}),
 	                               SemanticDDLScan, SemanticRefreshMaterializationBind, SemanticDDLInit, state));
+	loader.RegisterFunction(SemanticViewsTableFunction("semantic_views_protect", {}, SemanticDDLScan,
+	                                                   SemanticProtectBind, SemanticDDLInit, state));
 }
 
 } // namespace duckdb

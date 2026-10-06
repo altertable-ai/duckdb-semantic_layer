@@ -73,6 +73,7 @@ bool SemanticViewRegistry::Create(shared_ptr<SemanticModel> model, bool replace,
 			}
 			previous = current->second;
 		}
+		CheckMutable(model->Name());
 	}
 	if (prepare) {
 		prepare(previous);
@@ -85,6 +86,10 @@ bool SemanticViewRegistry::Create(shared_ptr<SemanticModel> model, bool replace,
 bool SemanticViewRegistry::Drop(const QualifiedName &name,
                                 const std::function<void(shared_ptr<SemanticModel>)> &prepare) {
 	lock_guard<mutex> writing(ddl_lock);
+	{
+		lock_guard<mutex> guard(lock);
+		CheckMutable(name);
+	}
 	auto previous = Get(name);
 	if (prepare) {
 		prepare(previous);
@@ -100,6 +105,7 @@ bool SemanticViewRegistry::Replace(const SemanticModel &expected, shared_ptr<Sem
 	auto new_key = Key(model->Name());
 	{
 		lock_guard<mutex> guard(lock);
+		CheckMutable(expected.Name());
 		auto current = views.find(old_key);
 		if (current == views.end() || current->second.get() != &expected) {
 			return false;
@@ -115,6 +121,24 @@ bool SemanticViewRegistry::Replace(const SemanticModel &expected, shared_ptr<Sem
 	views.erase(old_key);
 	views[new_key] = std::move(model);
 	return true;
+}
+
+void SemanticViewRegistry::Protect() {
+	lock_guard<mutex> writing(ddl_lock);
+	lock_guard<mutex> guard(lock);
+	if (protection_applied) {
+		throw CatalogException("Semantic views are already protected");
+	}
+	for (auto &entry : views) {
+		protected_names.insert(entry.first);
+	}
+	protection_applied = true;
+}
+
+void SemanticViewRegistry::CheckMutable(const QualifiedName &name) const {
+	if (protected_names.find(Key(name)) != protected_names.end()) {
+		throw CatalogException("Semantic view \"%s\" is protected", name.name);
+	}
 }
 
 shared_ptr<SemanticModel> SemanticViewRegistry::Get(const QualifiedName &fully_qualified) const {

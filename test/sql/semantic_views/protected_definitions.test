@@ -1,0 +1,50 @@
+# name: test/sql/semantic_views/protected_definitions.test
+# description: protected definitions stay authoritative across connections and prepared statements
+# group: [semantic_views]
+
+require semantic_views
+
+statement ok publisher
+CREATE TABLE events (amount INTEGER);
+INSERT INTO events VALUES (10), (30);
+CREATE SEMANTIC VIEW business TABLES (events AS events) METRICS (events.total AS SUM(amount));
+
+statement ok reader
+PREPARE drop_business AS DROP SEMANTIC VIEW business;
+
+statement ok publisher
+SELECT * FROM semantic_views_protect();
+
+statement error reader
+EXECUTE drop_business;
+----
+is protected
+
+statement error reader
+CREATE OR REPLACE SEMANTIC VIEW MEMORY.MAIN.BUSINESS TABLES (events AS events) METRICS (events.total AS SUM(amount) * 100);
+----
+is protected
+
+statement error reader
+ALTER SEMANTIC VIEW business SET COMMENT = 'changed';
+----
+is protected
+
+statement error reader
+SELECT * FROM semantic_views_protect();
+----
+already protected
+
+statement ok reader
+CREATE SEMANTIC VIEW IF NOT EXISTS business TABLES (events AS events) METRICS (events.total AS SUM(amount) * 100);
+
+statement ok reader
+CREATE SEMANTIC VIEW candidate TABLES (events AS events) METRICS (events.total AS SUM(amount) * 2);
+
+statement ok reader
+DROP SEMANTIC VIEW candidate;
+
+query I publisher
+SELECT * FROM SEMANTIC_VIEW(business METRICS events.total);
+----
+40

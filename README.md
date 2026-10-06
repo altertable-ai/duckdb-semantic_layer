@@ -533,6 +533,16 @@ or dimensions reached through a many-to-many bridge.
 
 Every statement can be used as a table expression: `SELECT name FROM (SHOW SEMANTIC METRICS IN sales)`.
 
+After restoring published views, call this before accepting user SQL to keep shared definitions unchanged:
+
+```sql
+SELECT * FROM semantic_views_protect();
+```
+
+Call once per database instance, even with no views. Protection cannot be undone and applies across connections,
+including prepared statements. Later views remain editable. Queries and materialization refreshes still work.
+Catalog placeholders and source tables remain unprotected.
+
 ## BI tools and the catalog
 
 Every semantic view is also listed as a view of the same name in `information_schema.tables` and `.columns`,
