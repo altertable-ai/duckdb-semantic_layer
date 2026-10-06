@@ -22,7 +22,7 @@
 #include "semantic_analysis.hpp"
 #include "semantic_model.hpp"
 #include "semantic_materialization.hpp"
-#include "semantic_offsets.hpp"
+#include "semantic_cumulative.hpp"
 #include "semantic_query_compiler.hpp"
 
 namespace duckdb {
@@ -78,7 +78,9 @@ public:
 		BuildMembers();
 		ResolveMembers();
 		ResolveOffsets();
+		ResolveCumulatives();
 		CheckMemberCycles();
+		CheckCumulativeComposition();
 		CheckMemberKinds();
 		ProbeSemanticModelTypes(context, *model);
 		PlanSemanticMaterializations(context, *model);
@@ -370,6 +372,9 @@ private:
 			if (!parsed.offset_dimension.empty() && member.Kind() != SemanticMemberKind::METRIC) {
 				Fail("OFFSET is only allowed on metrics (\"%s\")", parsed.FullName());
 			}
+			if (!parsed.cumulative_dimension.empty() && member.Kind() != SemanticMemberKind::METRIC) {
+				Fail("CUMULATIVE is only allowed on metrics (\"%s\")", parsed.FullName());
+			}
 			model->members.push_back(std::move(member));
 		}
 	}
@@ -418,6 +423,33 @@ private:
 		}
 	}
 
+	static bool IsConstant(SemanticAnalyzer &analyzer, const ParsedExpression &expr) {
+		return expr.IsScalar() && !analyzer.ContainsAggregateOrMetric(expr) && !SemanticAnalyzer::ContainsWindow(expr);
+	}
+
+	//! The dimension of a metric's OFFSET / CUMULATIVE clause: a dimension defined as a column (returned)
+	SemanticRef ResolveColumnDimension(const vector<string> &name_parts, idx_t m, const string &what,
+	                                   idx_t &dimension) {
+		auto name = StringUtil::Join(name_parts, ".");
+		SemanticResolveContext resolve_context;
+		resolve_context.owner_table = model->members[m].table;
+		resolve_context.what = what;
+		string error;
+		auto ref = model->Lookup(name_parts, resolve_context, error);
+		if (ref.Is(SemanticRefKind::NONE)) {
+			Fail("%s: %s", what, error.empty() ? "unknown dimension \"" + name + "\"" : error);
+		}
+		if (!ref.Is(SemanticRefKind::MEMBER) || model->members[ref.index].Kind() != SemanticMemberKind::DIMENSION) {
+			Fail("%s: \"%s\" is not a dimension", what, name);
+		}
+		auto column = SemanticMarkers::Classify(*model->members[ref.index].resolved);
+		if (!column.Is(SemanticRefKind::COLUMN)) {
+			Fail("%s: dimension \"%s\" must be defined as a column of its logical table", what, name);
+		}
+		dimension = ref.index;
+		return column;
+	}
+
 	//! OFFSET dimensions resolve to a dimension defined as a column; the interval must be constant and shift the
 	//! column's type. Equal offsets are stored once.
 	void ResolveOffsets() {
@@ -429,30 +461,15 @@ private:
 				continue;
 			}
 			auto what = What(m) + " OFFSET";
-			auto name = StringUtil::Join(parsed.offset_dimension, ".");
-			SemanticResolveContext resolve_context;
-			resolve_context.owner_table = member.table;
-			resolve_context.what = what;
-			string error;
-			auto ref = model->Lookup(parsed.offset_dimension, resolve_context, error);
-			if (ref.Is(SemanticRefKind::NONE)) {
-				Fail("%s: %s", what, error.empty() ? "unknown dimension \"" + name + "\"" : error);
-			}
-			if (!ref.Is(SemanticRefKind::MEMBER) || model->members[ref.index].Kind() != SemanticMemberKind::DIMENSION) {
-				Fail("%s: \"%s\" is not a dimension", what, name);
-			}
-			auto column = SemanticMarkers::Classify(*model->members[ref.index].resolved);
-			if (!column.Is(SemanticRefKind::COLUMN)) {
-				Fail("%s: dimension \"%s\" must be defined as a column of its logical table", what, name);
-			}
+			idx_t dimension;
+			auto column = ResolveColumnDimension(parsed.offset_dimension, m, what, dimension);
 			auto &interval = *parsed.offset_interval;
-			if (!interval.IsScalar() || analyzer.ContainsAggregateOrMetric(interval) ||
-			    SemanticAnalyzer::ContainsWindow(interval)) {
+			if (!IsConstant(analyzer, interval)) {
 				Fail("%s: the interval must be a constant expression", what);
 			}
 			auto &table = model->tables[column.index];
 			SemanticOffset offset;
-			offset.dimension = ref.index;
+			offset.dimension = dimension;
 			offset.table = column.index;
 			offset.column = column.column;
 			offset.type = table.column_types[table.columns.at(column.column)];
@@ -468,11 +485,10 @@ private:
 		}
 	}
 
-	//! Binds SELECT CAST(CAST(NULL AS <type>) + <interval> AS <type>)
-	void CheckOffsetType(const SemanticOffset &offset, const string &what) {
+	//! Binds SELECT <expr>; the binder's error message, or empty
+	string BindError(unique_ptr<ParsedExpression> expr) {
 		auto node = make_uniq<SelectNode>();
-		node->select_list.push_back(SemanticShiftColumn(
-		    make_uniq<CastExpression>(offset.type, make_uniq<ConstantExpression>(Value())), offset));
+		node->select_list.push_back(std::move(expr));
 		node->from_table = make_uniq<EmptyTableRef>();
 		auto statement = make_uniq<SelectStatement>();
 		statement->node = std::move(node);
@@ -481,8 +497,83 @@ private:
 			binder->Bind(statement->Cast<SQLStatement>());
 		} catch (std::exception &ex) {
 			ErrorData error(ex);
+			return error.RawMessage();
+		}
+		return string();
+	}
+
+	//! Binds SELECT CAST(CAST(NULL AS <type>) + <interval> AS <type>)
+	void CheckOffsetType(const SemanticOffset &offset, const string &what) {
+		auto error = BindError(SemanticShiftColumn(
+		    make_uniq<CastExpression>(offset.type, make_uniq<ConstantExpression>(Value())), offset));
+		if (!error.empty()) {
 			Fail("%s: cannot shift column \"%s.%s\" (%s) by %s: %s", what, model->tables[offset.table].name,
-			     offset.column, offset.type.ToString(), offset.interval->ToString(), error.RawMessage());
+			     offset.column, offset.type.ToString(), offset.interval->ToString(), error);
+		}
+	}
+
+	//! CUMULATIVE dimensions resolve like OFFSET dimensions; the OVER window is constant and the window condition
+	//! binds over the column's type. Equal clauses are stored once.
+	void ResolveCumulatives() {
+		SemanticAnalyzer analyzer(*model, context);
+		for (idx_t m = 0; m < model->members.size(); m++) {
+			auto &member = model->members[m];
+			auto &parsed = *member.parsed;
+			if (parsed.cumulative_dimension.empty()) {
+				continue;
+			}
+			auto what = What(m) + " CUMULATIVE";
+			SemanticCumulative cumulative;
+			auto column = ResolveColumnDimension(parsed.cumulative_dimension, m, what, cumulative.dimension);
+			auto &table = model->tables[column.index];
+			cumulative.table = column.index;
+			cumulative.column = column.column;
+			cumulative.type = table.column_types[table.columns.at(column.column)];
+			cumulative.period = parsed.cumulative_period;
+			cumulative.kind = SemanticCumulativeKind::ALL;
+			if (parsed.cumulative_window) {
+				if (!IsConstant(analyzer, *parsed.cumulative_window)) {
+					Fail("%s: the window must be a constant expression", what);
+				}
+				cumulative.kind = SemanticCumulativeKind::WINDOW;
+				cumulative.window = parsed.cumulative_window->Copy();
+			} else if (!parsed.cumulative_part.empty()) {
+				if (!SemanticIsTruncationPart(parsed.cumulative_part)) {
+					Fail("%s: \"%s\" is not a date part to truncate to (e.g. day, week, month, quarter, year)", what,
+					     parsed.cumulative_part);
+				}
+				cumulative.kind = SemanticCumulativeKind::GRAIN;
+				cumulative.part = parsed.cumulative_part;
+			}
+			auto existing = std::find_if(model->cumulatives.begin(), model->cumulatives.end(),
+			                             [&](const SemanticCumulative &other) { return other.Equals(cumulative); });
+			if (existing == model->cumulatives.end()) {
+				CheckCumulativeType(cumulative, what);
+				model->cumulatives.push_back(std::move(cumulative));
+				existing = model->cumulatives.end() - 1;
+			}
+			member.cumulative = NumericCast<idx_t>(existing - model->cumulatives.begin());
+		}
+	}
+
+	//! Binds SELECT <window condition over CAST(NULL AS <type>)>
+	void CheckCumulativeType(const SemanticCumulative &cumulative, const string &what) {
+		auto null = [&]() {
+			return make_uniq<CastExpression>(cumulative.type, make_uniq<ConstantExpression>(Value()));
+		};
+		auto error = BindError(SemanticCumulativeWindow(cumulative, null(), null()));
+		if (error.empty()) {
+			return;
+		}
+		auto column = "column \"" + model->tables[cumulative.table].name + "." + cumulative.column + "\" (" +
+		              cumulative.type.ToString() + ")";
+		switch (cumulative.kind) {
+		case SemanticCumulativeKind::WINDOW:
+			Fail("%s: cannot use %s as the window of %s: %s", what, cumulative.window->ToString(), column, error);
+		case SemanticCumulativeKind::GRAIN:
+			Fail("%s: cannot truncate %s to %s: %s", what, column, cumulative.part, error);
+		default:
+			Fail("%s: %s cannot be ordered: %s", what, column, error);
 		}
 	}
 
@@ -515,6 +606,57 @@ private:
 		}
 	}
 
+	//! The metrics `metric` builds on: those its expression references, directly or through other metrics
+	vector<idx_t> MetricsBelow(idx_t metric) {
+		vector<idx_t> result;
+		vector<idx_t> pending {metric};
+		while (!pending.empty()) {
+			vector<idx_t> references;
+			CollectMemberRefs(*model->members[pending.back()].resolved, references);
+			pending.pop_back();
+			for (auto reference : references) {
+				if (model->members[reference].Kind() == SemanticMemberKind::METRIC &&
+				    std::find(result.begin(), result.end(), reference) == result.end()) {
+					result.push_back(reference);
+					pending.push_back(reference);
+				}
+			}
+		}
+		return result;
+	}
+
+	//! CUMULATIVE metrics build on plain metrics only (no OFFSET, CUMULATIVE or NON ADDITIVE BY below them), and
+	//! semi-additive ones on no CUMULATIVE metric
+	void CheckCumulativeComposition() {
+		for (idx_t m = 0; m < model->members.size(); m++) {
+			auto &member = model->members[m];
+			auto cumulative = member.cumulative.IsValid();
+			auto semi_additive = !member.non_additive.empty();
+			if (cumulative && semi_additive) {
+				Fail("%s cannot combine CUMULATIVE and NON ADDITIVE BY", What(m));
+			}
+			if (!cumulative && !semi_additive) {
+				continue;
+			}
+			for (auto below : MetricsBelow(m)) {
+				auto &other = model->members[below];
+				if (cumulative) {
+					const char *clause = other.offset.IsValid()        ? "OFFSET"
+					                     : other.cumulative.IsValid()  ? "CUMULATIVE"
+					                     : !other.non_additive.empty() ? "NON ADDITIVE BY"
+					                                                   : nullptr;
+					if (clause) {
+						Fail("%s uses CUMULATIVE and cannot reference metric \"%s\", which uses %s", What(m),
+						     model->MemberDisplayName(below), clause);
+					}
+				} else if (other.cumulative.IsValid()) {
+					Fail("%s is semi-additive and cannot reference metric \"%s\", which uses CUMULATIVE", What(m),
+					     model->MemberDisplayName(below));
+				}
+			}
+		}
+	}
+
 	//! Child aggregations in a row-level expression on `table` must aggregate rows of finer tables
 	void CheckChildAggregations(SemanticAnalyzer &analyzer, const ParsedExpression &expr, idx_t table,
 	                            const string &what) {
@@ -536,6 +678,10 @@ private:
 				for (auto &atom : atoms) {
 					if (!atom.context.offsets.empty()) {
 						Fail("%s cannot reference metric \"%s\", which uses OFFSET", what,
+						     model->MemberDisplayName(member));
+					}
+					if (atom.context.cumulative != DConstants::INVALID_INDEX) {
+						Fail("%s cannot reference metric \"%s\", which uses CUMULATIVE", what,
 						     model->MemberDisplayName(member));
 					}
 					if (atom.home == table || !model->Reaches(atom.home, table) || model->Reaches(table, atom.home)) {
@@ -593,6 +739,9 @@ private:
 
 	void CheckMetric(SemanticAnalyzer &analyzer, idx_t m, const string &what) {
 		auto &member = model->members[m];
+		if (member.cumulative.IsValid() && SemanticAnalyzer::ContainsWindow(*member.resolved)) {
+			Fail("%s: CUMULATIVE metrics cannot use window functions", what);
+		}
 		if (member.filter &&
 		    (analyzer.ContainsAggregateOrMetric(*member.filter) || SemanticAnalyzer::ContainsWindow(*member.filter))) {
 			Fail("%s: FILTER must be a row-level condition (dimensions, facts and columns only)", what);
@@ -621,7 +770,15 @@ private:
 			}
 		}
 		vector<SemanticAtom> atoms;
-		analyzer.DecomposeMetric(m, atoms, what);
+		auto post = analyzer.DecomposeMetric(m, atoms, what);
+		// AVERAGE averages each aggregate: only a metric that is a single aggregate has its value averaged
+		if (member.cumulative.IsValid() &&
+		    model->cumulatives[member.cumulative.GetIndex()].period == SemanticCumulativePeriod::AVERAGE &&
+		    (atoms.size() != 1 || !SemanticMarkers::Classify(*post).Is(SemanticRefKind::ATOM))) {
+			Fail("%s: CUMULATIVE ... AVERAGE requires a metric computed from a single aggregate (averaging each "
+			     "aggregate of an expression would not average its value)",
+			     what);
+		}
 		if (member.IsDerived()) {
 			return;
 		}

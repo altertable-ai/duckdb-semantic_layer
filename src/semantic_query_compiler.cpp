@@ -23,7 +23,9 @@
 #include "semantic_ast_helpers.hpp"
 #include "semantic_expression_compiler.hpp"
 #include "semantic_bridge.hpp"
+#include "semantic_cumulative.hpp"
 #include "semantic_join_scope.hpp"
+#include "semantic_time_reads.hpp"
 
 namespace duckdb {
 
@@ -348,7 +350,7 @@ public:
 		SemanticJoinScope scope(model, aliases, block.key.home, block.key.using_relationships, string(),
 		                        options.sources);
 		BlockBridges bridges(model, analyzer, compiler, aliases, block.key, options.sources);
-		auto parts = BuildRows(block, scope, bridges);
+		auto parts = BuildDimensionRows(block, scope, bridges);
 		auto aggregate = make_uniq<SelectNode>();
 		for (idx_t d = 0; d < dimensions.size(); d++) {
 			aggregate->select_list.push_back(ColumnRef(DimensionColumn(d)));
@@ -369,15 +371,29 @@ public:
 	}
 
 private:
-	//! The rows of a block: its dimensions and the arguments of its aggregates, filtered by the query's WHERE (and the
-	//! state query's row filter); `aggregates` holds the compiled aggregate of each atom of the block, reading the rows
+	static constexpr const char *WHERE_WHAT = "Invalid WHERE clause";
+
+	//! The rows of a block: the arguments of its aggregates, filtered by conjuncts of the query's WHERE (shifted by the
+	//! block's OFFSETs), the block's row filters and the state query's row filter. `dimensions` holds the query's
+	//! dimensions, compiled over the rows' scope through a column map; `aggregates` the compiled aggregate of each atom
+	//! of the block, reading the rows.
 	struct BlockRows {
 		unique_ptr<SelectNode> rows;
-		vector<unique_ptr<ParsedExpression>> groups;
+		vector<unique_ptr<ParsedExpression>> dimensions;
 		vector<unique_ptr<ParsedExpression>> aggregates;
 	};
 
-	BlockRows BuildRows(const Block &block, SemanticJoinScope &scope, BlockBridges &bridges) {
+	//! The conjuncts of the query's WHERE
+	vector<const ParsedExpression *> WhereConjuncts() const {
+		vector<const ParsedExpression *> result;
+		if (spec.where) {
+			SplitConjuncts(*spec.where, result);
+		}
+		return result;
+	}
+
+	BlockRows BuildRows(const Block &block, SemanticJoinScope &scope, BlockBridges &bridges, SemanticColumnMap &map,
+	                    const vector<const ParsedExpression *> &where) {
 		BlockRows result;
 		result.rows = make_uniq<SelectNode>();
 		auto &rows = *result.rows;
@@ -386,21 +402,19 @@ private:
 			dependencies->in_dimension = true;
 		}
 		for (idx_t d = 0; d < dimensions.size(); d++) {
+			auto &resolved = *dimensions[d]->resolved;
 			auto what = SemanticItemWhat(*dimensions[d]);
-			auto expr = bridges.Dimension(*dimensions[d]->resolved, DimensionColumn(d), what);
-			if (expr && dependencies) {
+			auto bridged = bridges.Dimension(resolved, DimensionColumn(d), what);
+			if (bridged && dependencies) {
 				throw SemanticDefinitionException("%s: many-to-many bridges cannot be materialized", what);
 			}
-			if (!expr) {
-				expr = compiler.ShiftedRow(*dimensions[d]->resolved, scope, what, block.key.offsets);
-			}
-			result.groups.push_back(expr->Copy());
-			expr->alias = DimensionColumn(d);
-			rows.select_list.push_back(std::move(expr));
+			result.dimensions.push_back(bridged ? map.Opaque(std::move(bridged))
+			                                    : compiler.MappedRow(resolved, scope, what, map));
 		}
 		if (dependencies) {
 			dependencies->in_dimension = false;
 		}
+		// the aggregates read their arguments, FILTERs and ORDER BYs from the rows, as __sv_x<n>
 		idx_t argument_count = 0;
 		auto extract = [&](unique_ptr<ParsedExpression> &argument) {
 			auto name = "__sv_x" + to_string(argument_count++);
@@ -425,31 +439,44 @@ private:
 			result.aggregates.push_back(std::move(expr));
 		}
 		vector<unique_ptr<ParsedExpression>> conditions;
-		if (spec.where) {
-			vector<const ParsedExpression *> conjuncts;
-			SplitConjuncts(*spec.where, conjuncts);
-			vector<unique_ptr<ParsedExpression>> local_conjuncts;
-			for (auto *conjunct : conjuncts) {
-				if (!bridges.Condition(*conjunct)) {
-					local_conjuncts.push_back(conjunct->Copy());
-				}
+		vector<unique_ptr<ParsedExpression>> local_conjuncts;
+		for (auto *conjunct : where) {
+			if (!bridges.Condition(*conjunct)) {
+				local_conjuncts.push_back(conjunct->Copy());
 			}
-			if (!local_conjuncts.empty()) {
-				conditions.push_back(compiler.ShiftedRow(*AndAll(std::move(local_conjuncts)), scope,
-				                                         "Invalid WHERE clause", block.key.offsets));
-			}
+		}
+		if (!local_conjuncts.empty()) {
+			conditions.push_back(
+			    compiler.ShiftedRow(*AndAll(std::move(local_conjuncts)), scope, WHERE_WHAT, block.key.offsets));
 		}
 		for (auto metric : block.key.row_filters) {
 			conditions.push_back(
 			    compiler.Row(*model.members[metric].filter, scope, DConstants::INVALID_INDEX, "Invalid metric"));
 		}
 		if (options.row_filter) {
-			auto filter = options.row_filter(scope, result.groups);
+			auto filter = options.row_filter(scope, result.dimensions);
 			if (filter) {
 				conditions.push_back(std::move(filter));
 			}
 		}
 		rows.where_clause = AndAll(std::move(conditions));
+		return result;
+	}
+
+	//! The rows of a block that groups them by the query's dimensions: those shifted by the block's OFFSETs, and
+	//! read by the rows as __sv_d<i>
+	BlockRows BuildDimensionRows(const Block &block, SemanticJoinScope &scope, BlockBridges &bridges) {
+		SemanticOffsetMap map(model, block.key.offsets);
+		auto result = BuildRows(block, scope, bridges, map, WhereConjuncts());
+		vector<unique_ptr<ParsedExpression>> select_list;
+		for (idx_t d = 0; d < result.dimensions.size(); d++) {
+			select_list.push_back(result.dimensions[d]->Copy());
+			select_list.back()->alias = DimensionColumn(d);
+		}
+		for (auto &expr : result.rows->select_list) {
+			select_list.push_back(std::move(expr));
+		}
+		result.rows->select_list = std::move(select_list);
 		return result;
 	}
 
@@ -466,6 +493,9 @@ private:
 	//! (optionally restricted to the last snapshot); the outer select aggregates them by dimension. With `tag`,
 	//! every atom of the query gets a column (NULL when not owned) plus the block tag, for the UNION ALL merge.
 	unique_ptr<SelectNode> BuildBlock(const Block &block, optional_idx tag) {
+		if (block.key.cumulative != DConstants::INVALID_INDEX) {
+			return BuildCumulativeBlock(block, tag);
+		}
 		if (options.materializations) {
 			vector<const ParsedExpression *> dimension_exprs;
 			for (auto *dimension : dimensions) {
@@ -485,31 +515,18 @@ private:
 		SemanticJoinScope scope(model, aliases, block.key.home, block.key.using_relationships, string(),
 		                        options.sources, dependencies);
 		BlockBridges bridges(model, analyzer, compiler, aliases, block.key, options.sources);
-		auto parts = BuildRows(block, scope, bridges);
+		auto parts = BuildDimensionRows(block, scope, bridges);
 		auto aggregate = make_uniq<SelectNode>();
 		for (idx_t d = 0; d < dimensions.size(); d++) {
 			aggregate->select_list.push_back(ColumnRef(DimensionColumn(d)));
 			aggregate->groups.group_expressions.push_back(ColumnRef(DimensionColumn(d)));
 		}
-		idx_t owned = 0;
-		for (idx_t a = 0; a < atoms.size(); a++) {
-			unique_ptr<ParsedExpression> expr;
-			if (block.Owns(a)) {
-				expr = std::move(parts.aggregates[owned++]);
-			} else if (tag.IsValid()) {
-				expr = make_uniq<ConstantExpression>(Value());
-			} else {
-				continue;
-			}
-			expr->alias = AtomColumn(a);
-			aggregate->select_list.push_back(std::move(expr));
-		}
+		AddAtomColumns(*aggregate, block, std::move(parts.aggregates), tag);
 		if (block.key.non_additive_member != DConstants::INVALID_INDEX) {
 			aggregate->where_clause = LastSnapshotFilter(model.members[block.key.non_additive_member], scope,
-			                                             std::move(parts.groups), *parts.rows);
+			                                             std::move(parts.dimensions), *parts.rows);
 		}
 		FinishRows(*parts.rows, scope, bridges);
-		AddTag(*aggregate, tag);
 		GroupByAll(*aggregate);
 		aggregate->from_table = MakeSubqueryRef(std::move(parts.rows), "__sv_rows");
 		return aggregate;
@@ -524,27 +541,63 @@ private:
 			read.dimensions[d]->alias = DimensionColumn(d);
 			node->select_list.push_back(std::move(read.dimensions[d]));
 		}
-		idx_t owned = 0;
+		AddAtomColumns(*node, block, std::move(read.aggregates), tag);
+		node->where_clause = std::move(read.where);
+		node->from_table = std::move(read.table);
+		GroupByAll(*node);
+		return node;
+	}
+
+	//! A block of CUMULATIVE aggregates (semantic_cumulative.hpp): its rows read the stored date, the query's
+	//! dimensions and WHERE conditions on the date read the anchor
+	unique_ptr<SelectNode> BuildCumulativeBlock(const Block &block, optional_idx tag) {
+		auto &cumulative = model.cumulatives[block.key.cumulative];
+		SemanticJoinScope scope(model, aliases, block.key.home, block.key.using_relationships, string(),
+		                        options.sources);
+		BlockBridges bridges(model, analyzer, compiler, aliases, block.key, options.sources);
+		SemanticAnchorMap anchor_map(model, cumulative, block.key.offsets);
+		// the WHERE conjuncts reading the date filter the anchors, the others the rows
+		SemanticCumulativeParts parts;
+		vector<const ParsedExpression *> row_where;
+		vector<unique_ptr<ParsedExpression>> anchor_where;
+		for (auto *conjunct : WhereConjuncts()) {
+			if (SemanticReadsColumn(model, analyzer, *conjunct, cumulative.table, cumulative.column)) {
+				anchor_where.push_back(compiler.MappedRow(*conjunct, scope, WHERE_WHAT, anchor_map));
+			} else {
+				row_where.push_back(conjunct);
+			}
+		}
+		auto rows = BuildRows(block, scope, bridges, anchor_map, row_where);
+		parts.date = scope.ColumnReference(cumulative.table, cumulative.column);
+		FinishRows(*rows.rows, scope, bridges);
+		parts.rows = std::move(rows.rows);
+		parts.leaves = anchor_map.TakeLeaves();
+		parts.dimensions = std::move(rows.dimensions);
+		parts.anchor_where = AndAll(std::move(anchor_where));
+		parts.aggregates = std::move(rows.aggregates);
+		auto result = BuildSemanticCumulativeBlock(analyzer.Context(), model, aliases, options.sources, cumulative,
+		                                           std::move(parts));
+		AddAtomColumns(*result.node, block, std::move(result.values), tag);
+		return std::move(result.node);
+	}
+
+	//! Selects every atom of `block` (`owned`, in block order) as its atom column; merged with other blocks (`tag`),
+	//! every other atom of the query as NULL, and the block tag
+	void AddAtomColumns(SelectNode &node, const Block &block, vector<unique_ptr<ParsedExpression>> owned,
+	                    optional_idx tag) {
+		idx_t next = 0;
 		for (idx_t a = 0; a < atoms.size(); a++) {
 			unique_ptr<ParsedExpression> expr;
 			if (block.Owns(a)) {
-				expr = std::move(read.aggregates[owned++]);
+				expr = std::move(owned[next++]);
 			} else if (tag.IsValid()) {
 				expr = make_uniq<ConstantExpression>(Value());
 			} else {
 				continue;
 			}
 			expr->alias = AtomColumn(a);
-			node->select_list.push_back(std::move(expr));
+			node.select_list.push_back(std::move(expr));
 		}
-		node->where_clause = std::move(read.where);
-		node->from_table = std::move(read.table);
-		AddTag(*node, tag);
-		GroupByAll(*node);
-		return node;
-	}
-
-	static void AddTag(SelectNode &node, optional_idx tag) {
 		if (tag.IsValid()) {
 			auto tag_value = make_uniq<ConstantExpression>(Value::BIGINT(NumericCast<int64_t>(tag.GetIndex())));
 			tag_value->alias = BLOCK_COLUMN;

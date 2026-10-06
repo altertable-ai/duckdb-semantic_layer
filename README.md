@@ -200,6 +200,7 @@ table's primary key, or to its only unique key. Unnamed relationships get a gene
   [ NON ADDITIVE BY ( <dimension> [ ASC | DESC ] [ NULLS { FIRST | LAST } ] [, ...] ) ]
   [ FILTER ( WHERE <condition> ) ]
   [ OFFSET ( <dimension> BY <interval> ) ]
+  [ CUMULATIVE ( <dimension> [ OVER <interval> | TO <date part> ] [ FIRST | LAST | AVERAGE ] ) ]
   AS <expression> [ WITH SYNONYMS ( ... ) ] [ COMMENT = '<text>' ]
 ```
 
@@ -355,6 +356,41 @@ instead). The metric's own definition (its aggregates and filters) reads the sto
 add up. Offset metrics cannot be materialized (the other metrics of a query still read materializations) or referenced
 by facts and dimensions.
 
+### Cumulative metrics (`CUMULATIVE`)
+
+```sql
+METRICS (
+  events.revenue_total CUMULATIVE (dates.day)                      AS SUM(amount),             -- running total
+  events.revenue_mtd   CUMULATIVE (dates.day TO MONTH)             AS SUM(amount),             -- month to date
+  events.wau           CUMULATIVE (dates.day OVER INTERVAL 7 DAYS) AS COUNT(DISTINCT user_id), -- trailing window
+  events.wau_ly        OFFSET (dates.day BY INTERVAL 1 YEAR)       AS wau
+)
+```
+
+For a group dated *t* (the *anchor*), a cumulative metric aggregates the rows dated up to *t*: all of them, those of
+the last `OVER` interval (*t − interval < date ≤ t*), or those since the start of *t*'s `TO` period (`week`, `month`,
+`quarter`, `year`, ...). It is computed from the rows themselves, so distinct counts are exact and days without data
+do not shorten a window. As with `OFFSET`, the dimension must be defined as a column (typically the day of a date
+table), dimensions and `WHERE` conditions computed from it read the anchor (`WHERE dates.day >= '2024-01-01'` selects
+anchors whose windows still read 2023), and other columns of a date table cannot be read in the same query.
+
+- Anchors are the dates of the dimension's table that have rows in their window, up to the latest date of the
+  metric's rows (after the query's other `WHERE` conditions). A metric `FILTER` does not remove anchors: a filtered
+  metric is 0 or NULL where its window only holds filtered-out rows.
+- At a coarser grain (`dates.month`) or without a time dimension, the value is the one at each group's last anchor
+  (`LAST`, the default: month-end month-to-date), its first anchor (`FIRST`), or the average over its anchors
+  (`AVERAGE`, for metrics computed from a single aggregate). MetricFlow's `period_agg` defaults to `first`.
+- In a derived cumulative metric over several tables, each table's anchors stop at its own latest row.
+- `OFFSET` and `FILTER` can be applied to a cumulative metric. Not supported: cumulative metrics of metrics that use
+  `OFFSET`, `CUMULATIVE` or `NON ADDITIVE BY`, window functions in a cumulative metric, and facts or dimensions that
+  reference one. Cumulative metrics cannot be materialized (the other metrics of a query still read
+  materializations).
+- Decomposable aggregates (`SUM`, `COUNT`, `AVG`, `MIN`, `MAX`) and `DISTINCT` aggregates are pre-aggregated by date
+  before the windows are joined; other aggregates (`MEDIAN`, ...) read every row once per anchor in its window.
+  Anchors are the distinct values of the column: over a fine-grained column (a timestamp of a large fact table), a
+  running total or to-date window joins each value to every later one, which grows quadratically. Use the day of a
+  date table, or a day-grain dimension, for those windows.
+
 ### Time-dependent and range relationships
 
 - `ASOF` relationships join each row to the latest referenced row at or before its value:
@@ -479,8 +515,8 @@ requires writable storage. DDL stages its storage changes before publishing the 
 build or storage update leaves the registered view intact. Tables and metadata change together in each storage
 database. Changes spanning multiple databases prepare all operations before committing each database separately.
 
-Materializations cannot include semi-additive metrics, offset metrics (`OFFSET`) or dimensions reached through a
-many-to-many bridge.
+Materializations cannot include semi-additive metrics, offset metrics (`OFFSET`), cumulative metrics (`CUMULATIVE`)
+or dimensions reached through a many-to-many bridge.
 
 ## Managing and inspecting semantic views
 
@@ -619,8 +655,8 @@ SERVICE`, `AI_SQL_GENERATION`, `AI_QUESTION_CATEGORIZATION`, `AI_VERIFIED_QUERIE
 - `REFRESH MATERIALIZATION` accepts an explicit `AUTO`, `FULL` or `INCREMENTAL` mode, and `ADD MATERIALIZATION` a
   storage database (`IN`).
 - Expressions may reference physical columns of other logical tables directly (Snowflake requires a fact).
-- Metric `FILTER (WHERE ...)` and `OFFSET (<dimension> BY <interval>)` clauses are extensions; adjacent string literals
-  in DDL are concatenated.
+- Metric `FILTER (WHERE ...)`, `OFFSET (<dimension> BY <interval>)` and `CUMULATIVE (...)` clauses are extensions;
+  adjacent string literals in DDL are concatenated.
 
 ## License
 

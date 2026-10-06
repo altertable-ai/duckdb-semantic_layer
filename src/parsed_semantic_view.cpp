@@ -1,3 +1,4 @@
+#include "duckdb/common/string_util.hpp"
 #include "parsed_semantic_view.hpp"
 
 #include "duckdb/common/exception.hpp"
@@ -21,6 +22,27 @@ string SemanticMemberKindToString(SemanticMemberKind kind) {
 
 string ParsedSemanticMember::FullName() const {
 	return table.empty() ? name : table + "." + name;
+}
+
+string SemanticCumulativePeriodToString(SemanticCumulativePeriod period) {
+	switch (period) {
+	case SemanticCumulativePeriod::FIRST:
+		return "FIRST";
+	case SemanticCumulativePeriod::AVERAGE:
+		return "AVERAGE";
+	default:
+		return "LAST";
+	}
+}
+
+string ParsedSemanticMember::CumulativeToString() const {
+	auto result = StringUtil::Join(cumulative_dimension, ".");
+	if (cumulative_window) {
+		result += " OVER " + cumulative_window->ToString();
+	} else if (!cumulative_part.empty()) {
+		result += " TO " + StringUtil::Upper(cumulative_part);
+	}
+	return result + " " + SemanticCumulativePeriodToString(cumulative_period);
 }
 
 unique_ptr<ParsedSemanticView> ParsedSemanticView::Copy() const {
@@ -144,6 +166,10 @@ void ParsedSemanticMember::Serialize(Serializer &serializer) const {
 	serializer.WritePropertyWithDefault(115, "filter", filter);
 	serializer.WritePropertyWithDefault(116, "offset_dimension", offset_dimension);
 	serializer.WritePropertyWithDefault(117, "offset_interval", offset_interval);
+	serializer.WritePropertyWithDefault(118, "cumulative_dimension", cumulative_dimension);
+	serializer.WritePropertyWithDefault(119, "cumulative_window", cumulative_window);
+	serializer.WritePropertyWithDefault(120, "cumulative_part", cumulative_part);
+	serializer.WritePropertyWithDefault<uint8_t>(121, "cumulative_period", static_cast<uint8_t>(cumulative_period), 0);
 }
 
 ParsedSemanticMember ParsedSemanticMember::Deserialize(Deserializer &deserializer) {
@@ -166,6 +192,12 @@ ParsedSemanticMember ParsedSemanticMember::Deserialize(Deserializer &deserialize
 	result.filter = deserializer.ReadPropertyWithDefault<unique_ptr<ParsedExpression>>(115, "filter");
 	result.offset_dimension = deserializer.ReadPropertyWithDefault<vector<string>>(116, "offset_dimension");
 	result.offset_interval = deserializer.ReadPropertyWithDefault<unique_ptr<ParsedExpression>>(117, "offset_interval");
+	result.cumulative_dimension = deserializer.ReadPropertyWithDefault<vector<string>>(118, "cumulative_dimension");
+	result.cumulative_window =
+	    deserializer.ReadPropertyWithDefault<unique_ptr<ParsedExpression>>(119, "cumulative_window");
+	result.cumulative_part = deserializer.ReadPropertyWithDefault<string>(120, "cumulative_part");
+	result.cumulative_period = static_cast<SemanticCumulativePeriod>(
+	    deserializer.ReadPropertyWithExplicitDefault<uint8_t>(121, "cumulative_period", 0));
 	return result;
 }
 

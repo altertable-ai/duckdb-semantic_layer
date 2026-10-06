@@ -9,9 +9,9 @@
 #include "duckdb/planner/binder.hpp"
 #include "semantic_lowering.hpp"
 #include "semantic_materialization.hpp"
-#include "semantic_offsets.hpp"
 #include "semantic_query_compiler.hpp"
 #include "semantic_sql_rewrite.hpp"
+#include "semantic_time_reads.hpp"
 #include "semantic_statement_visitor.hpp"
 #include "semantic_view_registry.hpp"
 #include "semantic_views_functions.hpp"
@@ -30,7 +30,7 @@ static unique_ptr<TableRef> CompileSemanticQuery(ClientContext &context, Semanti
 	SemanticCompileOptions options;
 	options.materializations = &materializations;
 	auto compiled = compiler.Compile(spec, options);
-	CheckSemanticOffsetReads(*model, compiler.Analyzer(), spec);
+	CheckSemanticTimeReads(*model, compiler.Analyzer(), spec);
 	if (materializations.UsedMaterialization() && binder) {
 		// a prepared statement reading a materialization is planned again (freshness checked) at every execution
 		binder->SetAlwaysRequireRebind();

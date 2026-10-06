@@ -11,16 +11,24 @@
 
 #pragma once
 
-#include "semantic_query_compiler.hpp"
+#include "semantic_expression_compiler.hpp"
 
 namespace duckdb {
 
+//! Reads the columns of `offsets` (SemanticModel::offsets) shifted, in order
+class SemanticOffsetMap : public SemanticColumnMap {
+public:
+	SemanticOffsetMap(const SemanticModel &model, const vector<idx_t> &offsets) : model(model), offsets(offsets) {
+	}
+	unique_ptr<ParsedExpression> Column(idx_t table, const string &column,
+	                                    unique_ptr<ParsedExpression> compiled) override;
+
+private:
+	const SemanticModel &model;
+	const vector<idx_t> &offsets;
+};
+
 //! `CAST(<column> + <interval> AS <type>)`: `column` read shifted by `offset`
 unique_ptr<ParsedExpression> SemanticShiftColumn(unique_ptr<ParsedExpression> column, const SemanticOffset &offset);
-
-//! An OFFSET only shifts its column: a query of an offset metric must read that column in its dimensions or WHERE
-//! (otherwise the offset has no effect), and no other column of its table unless it is the metric's home table (a
-//! stored year of a date table would not be shifted with the date)
-void CheckSemanticOffsetReads(const SemanticModel &model, SemanticAnalyzer &analyzer, const SemanticQuerySpec &spec);
 
 } // namespace duckdb

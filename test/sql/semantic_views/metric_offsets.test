@@ -395,3 +395,25 @@ CREATE SEMANTIC VIEW bad TABLES (account AS accounts PRIMARY KEY (account_id), t
   METRICS (invoices.revenue AS SUM(amount), invoices.revenue_ly OFFSET (t.day BY INTERVAL 1 YEAR) AS revenue);
 ----
 which uses OFFSET
+
+# tables reached through the offset column's table are not shifted: reading them is an error
+statement ok
+CREATE TABLE off_months (month_start DATE, label VARCHAR);
+
+statement ok
+INSERT INTO off_months VALUES ('2025-09-01', 'Sep 25'), ('2026-09-01', 'Sep 26');
+
+statement ok
+CREATE TABLE off_days AS SELECT range::DATE AS day, date_trunc('month', range)::DATE AS month_start FROM range(DATE '2024-01-01', DATE '2028-01-01', INTERVAL 1 DAY);
+
+statement ok
+CREATE SEMANTIC VIEW off_calendar
+  TABLES (months AS off_months PRIMARY KEY (month_start), t AS off_days PRIMARY KEY (day), invoices PRIMARY KEY (invoice_id))
+  RELATIONSHIPS (invoices (invoiced_at) REFERENCES t, t (month_start) REFERENCES months)
+  DIMENSIONS (t.day AS day, months.label AS label)
+  METRICS (invoices.revenue AS SUM(amount), invoices.revenue_ly OFFSET (t.day BY INTERVAL 1 YEAR) AS revenue);
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(off_calendar DIMENSIONS t.day, months.label METRICS invoices.revenue_ly);
+----
+would not be shifted by the OFFSET of metric "revenue_ly"

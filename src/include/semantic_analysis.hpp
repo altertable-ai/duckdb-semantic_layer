@@ -32,15 +32,19 @@ struct SemanticMetricContext {
 	vector<idx_t> filters;
 	//! Offsets (SemanticModel::offsets) that apply, in the order the shifts are applied (innermost metric first)
 	vector<idx_t> offsets;
+	//! CUMULATIVE (SemanticModel::cumulatives) that applies, or INVALID_INDEX
+	idx_t cumulative = DConstants::INVALID_INDEX;
 
 	bool operator==(const SemanticMetricContext &other) const {
 		return table == other.table && using_relationships == other.using_relationships &&
-		       non_additive_member == other.non_additive_member && filters == other.filters && offsets == other.offsets;
+		       non_additive_member == other.non_additive_member && filters == other.filters &&
+		       offsets == other.offsets && cumulative == other.cumulative;
 	}
 };
 
 //! What atoms aggregated together (one aggregation block) share: the rows of the same home table, joined through the
-//! same USING relationships, filtered, picked (NON ADDITIVE BY) and shifted (OFFSET) the same way
+//! same USING relationships, filtered, picked (NON ADDITIVE BY), shifted (OFFSET) and windowed (CUMULATIVE) the same
+//! way
 struct SemanticBlockKey {
 	idx_t home;
 	vector<idx_t> using_relationships;
@@ -50,11 +54,13 @@ struct SemanticBlockKey {
 	vector<idx_t> row_filters;
 	//! Offsets (SemanticModel::offsets) shifting the query's dimensions and WHERE, in application order
 	vector<idx_t> offsets;
+	//! CUMULATIVE (SemanticModel::cumulatives) of the block, or INVALID_INDEX
+	idx_t cumulative;
 
 	bool operator==(const SemanticBlockKey &other) const {
 		return home == other.home && using_relationships == other.using_relationships &&
 		       non_additive_member == other.non_additive_member && row_filters == other.row_filters &&
-		       offsets == other.offsets;
+		       offsets == other.offsets && cumulative == other.cumulative;
 	}
 };
 
@@ -89,8 +95,12 @@ struct SemanticAtom {
 		       row_filters == other.row_filters;
 	}
 	SemanticBlockKey BlockKey() const {
-		return SemanticBlockKey {home, context.using_relationships, context.non_additive_member, row_filters,
-		                         context.offsets};
+		return SemanticBlockKey {home,
+		                         context.using_relationships,
+		                         context.non_additive_member,
+		                         row_filters,
+		                         context.offsets,
+		                         context.cumulative};
 	}
 };
 

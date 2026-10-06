@@ -181,6 +181,7 @@ SemanticMetricContext SemanticAnalyzer::MetricContext(idx_t metric, const Semant
 		result.offsets.push_back(member.offset.GetIndex());
 	}
 	result.offsets.insert(result.offsets.end(), outer.offsets.begin(), outer.offsets.end());
+	result.cumulative = member.cumulative.IsValid() ? member.cumulative.GetIndex() : outer.cumulative;
 	return result;
 }
 
@@ -191,6 +192,14 @@ void SemanticAnalyzer::ApplyMetricContext(SemanticAtom &atom, const string &what
 			throw SemanticDefinitionException("%s: OFFSET dimension \"%s\" is not reachable from logical table \"%s\"",
 			                                  what, model.MemberDisplayName(offset.dimension),
 			                                  model.tables[atom.home].name);
+		}
+	}
+	if (atom.context.cumulative != DConstants::INVALID_INDEX) {
+		auto &cumulative = model.cumulatives[atom.context.cumulative];
+		if (!model.Reaches(atom.home, cumulative.table)) {
+			throw SemanticDefinitionException(
+			    "%s: CUMULATIVE dimension \"%s\" is not reachable from logical table \"%s\"", what,
+			    model.MemberDisplayName(cumulative.dimension), model.tables[atom.home].name);
 		}
 	}
 	auto &aggregate = atom.aggregate->Cast<FunctionExpression>();

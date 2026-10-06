@@ -264,6 +264,9 @@ static unique_ptr<FunctionData> DescribeBind(ClientContext &context, TableFuncti
 			add(kind, object, parent, "OFFSET",
 			    StringUtil::Join(parsed.offset_dimension, ".") + " BY " + parsed.offset_interval->ToString());
 		}
+		if (!parsed.cumulative_dimension.empty()) {
+			add(kind, object, parent, "CUMULATIVE", parsed.CumulativeToString());
+		}
 		if (member.type.id() != LogicalTypeId::UNKNOWN) {
 			add(kind, object, parent, "DATA_TYPE", member.type.ToString());
 		}
