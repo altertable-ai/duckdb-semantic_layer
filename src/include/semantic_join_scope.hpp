@@ -80,6 +80,9 @@ private:
 	string AliasOf(idx_t table) const;
 	unique_ptr<TableRef> Source(idx_t table) const;
 	bool BelongsToOuter(idx_t table) const;
+	//! metric_time.day: the TIME column of the table whose relationship enters the spine (joined like any of its
+	//! columns), cast to DATE. The spine itself is never joined.
+	unique_ptr<ParsedExpression> TimeColumn(idx_t spine);
 	unique_ptr<ParsedExpression> RangeLookup(const vector<SemanticEdge> &path, idx_t range_at, idx_t table,
 	                                         const string &column);
 

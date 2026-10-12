@@ -9,7 +9,9 @@
 //      arguments __sv_x<n>, filtered by the WHERE conjuncts that do not read the date
 //   2. pre-aggregated by date and leaves when every aggregate allows it, with the latest date __sv_cmax (anchors
 //      never come after it)
-//   3. joined to the anchors __sv_t (distinct dates of the cumulative column's table) whose window holds __sv_c
+//   3. joined to the anchors __sv_t whose window holds __sv_c. Anchors are the distinct dates of the cumulative
+//      column's table, or, for the built-in time spine, every day from the rows' minimum date to their maximum
+//      (the dated rows are materialized, so the fact table is scanned once)
 //   4. aggregated per dimension tuple and anchor (the dimensions read __sv_t)
 //   5. one row per dimension tuple: the value at its last / first anchor, or the average over its anchors
 //

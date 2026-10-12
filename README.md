@@ -341,17 +341,17 @@ For semi-additive metrics, the filter applies before the last snapshot is picked
 
 ```sql
 METRICS (
-  margin_ly OFFSET (dates.day BY INTERVAL 1 YEAR) AS margin,
+  margin_ly OFFSET (metric_time.day BY INTERVAL 1 YEAR) AS margin,
   margin_growth AS (margin - margin_ly) / NULLIF(margin_ly, 0)
 )
 ```
 
 For a group dated *t*, an offset metric is computed from the rows dated *t − interval* (a negative interval looks
-forward). The dimension must be defined as a column of its table (typically the day of a date table that every fact
-table references); every dimension computed from that column moves with it, so the offset works at any grain
-(`dates.month`, `dates.year`, ...), and a `WHERE` on time selects the previous period's rows. Only that column is
-shifted, so a query with an offset metric must have a dimension or `WHERE` condition computed from it, and cannot read
-other columns of a date table (a stored `d_year` would not move with the date: define `dates.year AS year(day)`
+forward). The dimension must be defined as a column of its table (typically `metric_time.day`, from [`TIME`](#time-spine-time));
+every dimension computed from that column moves with it, so the offset works at any grain (`metric_time.month`,
+`metric_time.year`, ...), and a `WHERE` on time selects the previous period's rows. Only that column is shifted, so a
+query with an offset metric must have a dimension or `WHERE` condition computed from it, and cannot read other columns
+of a date table (a stored `d_year` would not move with the date: define `metric_time.year`, or `dates.year AS year(day)`,
 instead). The metric's own definition (its aggregates and filters) reads the stored values. Offsets of nested metrics
 add up. Offset metrics cannot be materialized (the other metrics of a query still read materializations) or referenced
 by facts and dimensions.
@@ -360,24 +360,24 @@ by facts and dimensions.
 
 ```sql
 METRICS (
-  events.revenue_total CUMULATIVE (dates.day)                      AS SUM(amount),             -- running total
-  events.revenue_mtd   CUMULATIVE (dates.day TO MONTH)             AS SUM(amount),             -- month to date
-  events.wau           CUMULATIVE (dates.day OVER INTERVAL 7 DAYS) AS COUNT(DISTINCT user_id), -- trailing window
-  events.wau_ly        OFFSET (dates.day BY INTERVAL 1 YEAR)       AS wau
+  events.revenue_total CUMULATIVE (metric_time.day)                      AS SUM(amount),             -- running total
+  events.revenue_mtd   CUMULATIVE (metric_time.day TO MONTH)             AS SUM(amount),             -- month to date
+  events.wau           CUMULATIVE (metric_time.day OVER INTERVAL 7 DAYS) AS COUNT(DISTINCT user_id), -- trailing window
+  events.wau_ly        OFFSET (metric_time.day BY INTERVAL 1 YEAR)       AS wau
 )
 ```
 
 For a group dated *t* (the *anchor*), a cumulative metric aggregates the rows dated up to *t*: all of them, those of
 the last `OVER` interval (*t − interval < date ≤ t*), or those since the start of *t*'s `TO` period (`week`, `month`,
 `quarter`, `year`, ...). It is computed from the rows themselves, so distinct counts are exact and days without data
-do not shorten a window. As with `OFFSET`, the dimension must be defined as a column (typically the day of a date
-table), dimensions and `WHERE` conditions computed from it read the anchor (`WHERE dates.day >= '2024-01-01'` selects
+do not shorten a window. As with `OFFSET`, the dimension must be defined as a column (typically `metric_time.day`),
+dimensions and `WHERE` conditions computed from it read the anchor (`WHERE metric_time.day >= '2024-01-01'` selects
 anchors whose windows still read 2023), and other columns of a date table cannot be read in the same query.
 
 - Anchors are the dates of the dimension's table that have rows in their window, up to the latest date of the
   metric's rows (after the query's other `WHERE` conditions). A metric `FILTER` does not remove anchors: a filtered
   metric is 0 or NULL where its window only holds filtered-out rows.
-- At a coarser grain (`dates.month`) or without a time dimension, the value is the one at each group's last anchor
+- At a coarser grain (`metric_time.month`) or without a time dimension, the value is the one at each group's last anchor
   (`LAST`, the default: month-end month-to-date), its first anchor (`FIRST`), or the average over its anchors
   (`AVERAGE`, for metrics computed from a single aggregate). MetricFlow's `period_agg` defaults to `first`.
 - In a derived cumulative metric over several tables, each table's anchors stop at its own latest row.
@@ -388,8 +388,47 @@ anchors whose windows still read 2023), and other columns of a date table cannot
 - Decomposable aggregates (`SUM`, `COUNT`, `AVG`, `MIN`, `MAX`) and `DISTINCT` aggregates are pre-aggregated by date
   before the windows are joined; other aggregates (`MEDIAN`, ...) read every row once per anchor in its window.
   Anchors are the distinct values of the column: over a fine-grained column (a timestamp of a large fact table), a
-  running total or to-date window joins each value to every later one, which grows quadratically. Use the day of a
-  date table, or a day-grain dimension, for those windows.
+  running total or to-date window joins each value to every later one, which grows quadratically. Use `metric_time.day`,
+  or another day-grain dimension, for those windows. Over the built-in time spine, anchors are every day from the
+  rows' earliest date to their latest, so a gap inside that range does not drop a running total.
+
+### Time spine (`TIME`)
+
+```sql
+TABLES (
+  invoices  PRIMARY KEY (invoice_id)  TIME (invoiced_at),
+  shipments PRIMARY KEY (shipment_id) TIME (ordered_at)
+)
+RELATIONSHIPS (
+  shipped AS shipments (shipped_at) REFERENCES metric_time
+)
+DIMENSIONS (
+  metric_time.weekday AS dayofweek(day)
+)
+METRICS (
+  invoices.revenue AS SUM(amount),
+  invoices.revenue_ly OFFSET (metric_time.day BY INTERVAL 1 YEAR) AS revenue,
+  shipments.booked AS SUM(booked),
+  shipments.shipped_amount USING (shipped) AS SUM(booked)
+)
+```
+
+`TIME (<column>)` on a logical table declares its aggregation time: a `DATE`, `TIMESTAMP` or `TIMESTAMPTZ` column.
+The view then has a built-in logical table `metric_time` (its primary key is `day`) and the dimensions `day`, `week`,
+`month`, `quarter` and `year`. `metric_time.day` is `CAST(<column> AS DATE)` (`TIMESTAMPTZ` is cast to `TIMESTAMP`
+first, in the session time zone); the other grains are `DATE_TRUNC` of that day, cast back to `DATE` (weeks start on
+Monday). Further dimensions, such as a fiscal quarter, can be defined on `metric_time` from `day`. Facts and metrics
+cannot.
+
+`metric_time` is never joined or scanned. A query reads the time column of the table that owns it, joining only up to
+that table, so a line item inherits its invoice's time through an ordinary relationship. It is not a source for
+freshness checks or incremental refresh, and a query that would read only the spine (no metric and no fact) is
+rejected: the spine has no rows of its own. Days with no facts are absent from ordinary aggregates.
+
+Each `TIME` is that table's default path to `metric_time`. Another date is an ordinary relationship
+(`shipped AS shipments (shipped_at) REFERENCES metric_time`), chosen with `USING (shipped)`; without `USING`, `TIME`
+wins. A table that reaches two different `TIME` columns and does not choose one is ambiguous, as any other
+relationship is. The name `metric_time` is reserved only in a view that uses `TIME`.
 
 ### Time-dependent and range relationships
 
@@ -655,8 +694,9 @@ SERVICE`, `AI_SQL_GENERATION`, `AI_QUESTION_CATEGORIZATION`, `AI_VERIFIED_QUERIE
 - `REFRESH MATERIALIZATION` accepts an explicit `AUTO`, `FULL` or `INCREMENTAL` mode, and `ADD MATERIALIZATION` a
   storage database (`IN`).
 - Expressions may reference physical columns of other logical tables directly (Snowflake requires a fact).
-- Metric `FILTER (WHERE ...)`, `OFFSET (<dimension> BY <interval>)` and `CUMULATIVE (...)` clauses are extensions;
-  adjacent string literals in DDL are concatenated.
+- Metric `FILTER (WHERE ...)`, `OFFSET (<dimension> BY <interval>)` and `CUMULATIVE (...)` clauses, and the built-in
+  time spine (`TIME (<column>)`, logical table `metric_time`) are extensions; adjacent string literals in DDL are
+  concatenated.
 
 ## License
 

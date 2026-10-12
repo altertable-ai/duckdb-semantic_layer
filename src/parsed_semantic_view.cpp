@@ -105,6 +105,7 @@ void ParsedSemanticTable::Serialize(Serializer &serializer) const {
 	serializer.WriteProperty(105, "synonyms", synonyms);
 	serializer.WriteProperty(106, "comment", comment);
 	serializer.WriteProperty(107, "tags", tags);
+	serializer.WritePropertyWithDefault(108, "time_column", time_column);
 }
 
 ParsedSemanticTable ParsedSemanticTable::Deserialize(Deserializer &deserializer) {
@@ -118,6 +119,7 @@ ParsedSemanticTable ParsedSemanticTable::Deserialize(Deserializer &deserializer)
 	result.synonyms = deserializer.ReadProperty<vector<string>>(105, "synonyms");
 	result.comment = deserializer.ReadProperty<string>(106, "comment");
 	result.tags = deserializer.ReadProperty<vector<ParsedSemanticTag>>(107, "tags");
+	result.time_column = deserializer.ReadPropertyWithDefault<string>(108, "time_column");
 	return result;
 }
 

@@ -108,27 +108,8 @@ optional_idx SemanticModel::FinestTable(const set<idx_t> &tables) const {
 	return optional_idx();
 }
 
-SemanticPathResult SemanticModel::TryPath(idx_t from, idx_t to, const vector<idx_t> &using_relationships,
-                                          vector<SemanticEdge> &result) const {
-	result.clear();
-	if (from == to) {
-		return SemanticPathResult::FOUND;
-	}
-	if (path_count[from][to] == 0) {
-		return SemanticPathResult::UNREACHABLE;
-	}
-	// an edge is allowed unless its target is the target of a USING relationship and it is not one of them
-	auto allowed = [&](const SemanticEdge &edge) {
-		bool target_pinned = false;
-		for (auto rel : using_relationships) {
-			auto &pinned = relationships[rel];
-			if (rel == edge.relationship) {
-				return true;
-			}
-			target_pinned = target_pinned || pinned.to_table == edge.target;
-		}
-		return !target_pinned;
-	};
+vector<vector<SemanticEdge>> SemanticModel::FindPaths(idx_t from, idx_t to,
+                                                      const std::function<bool(const SemanticEdge &)> &allowed) const {
 	vector<vector<SemanticEdge>> found;
 	vector<SemanticEdge> path;
 	vector<bool> visited(tables.size(), false);
@@ -152,11 +133,51 @@ SemanticPathResult SemanticModel::TryPath(idx_t from, idx_t to, const vector<idx
 		visited[node] = false;
 	};
 	dfs(from);
+	return found;
+}
+
+SemanticPathResult SemanticModel::TryPath(idx_t from, idx_t to, const vector<idx_t> &using_relationships,
+                                          vector<SemanticEdge> &result) const {
+	result.clear();
+	if (from == to) {
+		return SemanticPathResult::FOUND;
+	}
+	if (path_count[from][to] == 0) {
+		return SemanticPathResult::UNREACHABLE;
+	}
+	// an edge is allowed unless its target is the target of a USING relationship and it is not one of them
+	auto allowed = [&](const SemanticEdge &edge) {
+		bool target_pinned = false;
+		for (auto rel : using_relationships) {
+			auto &pinned = relationships[rel];
+			if (rel == edge.relationship) {
+				return true;
+			}
+			target_pinned = target_pinned || pinned.to_table == edge.target;
+		}
+		return !target_pinned;
+	};
+	auto found = FindPaths(from, to, allowed);
 	if (found.empty()) {
 		return SemanticPathResult::EXCLUDED_BY_USING;
 	}
 	if (found.size() > 1) {
-		return SemanticPathResult::AMBIGUOUS;
+		// Default relationships (TIME) settle it: the table's own wins, then the only path entering `to` through one
+		auto is_default = [&](const SemanticEdge &edge) {
+			return !edge.reversed && relationships[edge.relationship].is_default;
+		};
+		for (auto &edge : edges[from]) {
+			if (edge.target == to && is_default(edge) && allowed(edge)) {
+				result.push_back(edge);
+				return SemanticPathResult::FOUND;
+			}
+		}
+		found = FindPaths(from, to, [&](const SemanticEdge &edge) {
+			return allowed(edge) && (edge.target != to || is_default(edge));
+		});
+		if (found.size() != 1) {
+			return SemanticPathResult::AMBIGUOUS;
+		}
 	}
 	result = std::move(found[0]);
 	return SemanticPathResult::FOUND;

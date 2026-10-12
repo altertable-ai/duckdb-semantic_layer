@@ -3,12 +3,15 @@
 #include "duckdb/common/enums/date_part_specifier.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/to_string.hpp"
+#include "duckdb/parser/expression/cast_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/expression/operator_expression.hpp"
 #include "duckdb/parser/expression/star_expression.hpp"
 #include "duckdb/parser/expression/window_expression.hpp"
+#include "duckdb/parser/common_table_expression_info.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
+#include "duckdb/parser/tableref/basetableref.hpp"
 #include "duckdb/parser/tableref/joinref.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "semantic_ast_helpers.hpp"
@@ -19,11 +22,6 @@ namespace duckdb {
 //===--------------------------------------------------------------------===//
 // Window
 //===--------------------------------------------------------------------===//
-static unique_ptr<ParsedExpression> Call(const string &name, vector<unique_ptr<ParsedExpression>> children,
-                                         bool is_operator = false) {
-	return make_uniq<FunctionExpression>(name, std::move(children), nullptr, nullptr, false, is_operator);
-}
-
 unique_ptr<ParsedExpression> SemanticCumulativeWindow(const SemanticCumulative &cumulative,
                                                       unique_ptr<ParsedExpression> date,
                                                       unique_ptr<ParsedExpression> anchor) {
@@ -226,9 +224,58 @@ unique_ptr<ParsedExpression> AnchorJoinCondition(const SemanticCumulative &cumul
 	return AndAll(std::move(conditions));
 }
 
-//! The anchor dates: SELECT DISTINCT c AS __sv_t FROM <c's table> WHERE c IS NOT NULL
+static constexpr const char *DATED_CTE = "__sv_dated";
+static constexpr const char *ANCHORS_CTE = "__sv_anchors";
+
+unique_ptr<TableRef> CteRef(const string &name) {
+	auto ref = make_uniq<BaseTableRef>();
+	ref->table_name = name;
+	ref->alias = name;
+	return std::move(ref);
+}
+
+unique_ptr<CommonTableExpressionInfo> Cte(unique_ptr<QueryNode> query, CTEMaterialize materialized) {
+	auto cte = make_uniq<CommonTableExpressionInfo>();
+	cte->query = MakeSelectStatement(std::move(query));
+	cte->materialized = materialized;
+	return cte;
+}
+
+//! The time spine's anchors: every day from the dated rows' minimum to their maximum, inclusive
+//! (SELECT CAST(unnest(generate_series(lo, hi, INTERVAL 1 DAY)) AS DATE) FROM (SELECT min(c) lo, max(c) hi FROM dated))
+unique_ptr<QueryNode> SpineAnchors() {
+	auto bound = [](const string &aggregate, const string &alias) {
+		vector<unique_ptr<ParsedExpression>> arguments;
+		arguments.push_back(ColumnRef(CUMULATIVE_DATE_COLUMN));
+		auto result = Call(aggregate, std::move(arguments));
+		result->alias = alias;
+		return result;
+	};
+	auto bounds = make_uniq<SelectNode>();
+	bounds->select_list.push_back(bound("min", "lo"));
+	bounds->select_list.push_back(bound("max", "hi"));
+	bounds->from_table = CteRef(DATED_CTE);
+	vector<unique_ptr<ParsedExpression>> series;
+	series.push_back(ColumnRef("lo"));
+	series.push_back(ColumnRef("hi"));
+	series.push_back(make_uniq<ConstantExpression>(Value::INTERVAL(0, 1, 0)));
+	vector<unique_ptr<ParsedExpression>> unnest;
+	unnest.push_back(Call("generate_series", std::move(series)));
+	auto node = make_uniq<SelectNode>();
+	auto day = make_uniq<CastExpression>(LogicalType::DATE, Call("unnest", std::move(unnest)));
+	day->alias = CUMULATIVE_ANCHOR_COLUMN;
+	node->select_list.push_back(std::move(day));
+	node->from_table = MakeSubqueryRef(std::move(bounds), "__sv_bounds");
+	node->where_clause = make_uniq<OperatorExpression>(ExpressionType::OPERATOR_IS_NOT_NULL, ColumnRef("lo"));
+	return std::move(node);
+}
+
+//! The anchor dates: SELECT DISTINCT c AS __sv_t FROM <c's table> WHERE c IS NOT NULL, or the time spine's days
 unique_ptr<QueryNode> Anchors(const SemanticModel &model, SemanticAliasGenerator &aliases,
                               optional_ptr<const SemanticTableSources> sources, const SemanticCumulative &cumulative) {
+	if (model.IsTimeSpine(cumulative.table)) {
+		return SpineAnchors();
+	}
 	SemanticJoinScope scope(model, aliases, cumulative.table, {}, aliases.NestedPrefix(), sources);
 	auto node = make_uniq<SelectNode>();
 	auto anchor = scope.ColumnReference(cumulative.table, cumulative.column);
@@ -281,11 +328,12 @@ SemanticCumulativeBlock BuildSemanticCumulativeBlock(ClientContext &context, con
 	if (!dated) {
 		dated = BoundRows(std::move(parts.rows));
 	}
-	// stage 3: joined to the anchors whose window holds their date
+	// stage 3: joined to the anchors whose window holds their date. The time spine's anchors read the dated rows
+	// too, which are then materialized so that the fact table is scanned once.
 	auto join = make_uniq<JoinRef>(JoinRefType::REGULAR);
 	join->type = JoinType::INNER;
-	join->left = MakeSubqueryRef(std::move(dated), "__sv_dated");
-	join->right = MakeSubqueryRef(Anchors(model, aliases, sources, cumulative), "__sv_anchors");
+	join->left = CteRef(DATED_CTE);
+	join->right = CteRef(ANCHORS_CTE);
 	join->condition = AnchorJoinCondition(cumulative);
 	// stage 4: per dimension tuple and anchor
 	auto anchored = make_uniq<SelectNode>();
@@ -302,6 +350,11 @@ SemanticCumulativeBlock BuildSemanticCumulativeBlock(ClientContext &context, con
 	}
 	anchored->where_clause = std::move(parts.anchor_where);
 	anchored->from_table = std::move(join);
+	auto dated_materialized = model.IsTimeSpine(cumulative.table) ? CTEMaterialize::CTE_MATERIALIZE_ALWAYS
+	                                                              : CTEMaterialize::CTE_MATERIALIZE_NEVER;
+	anchored->cte_map.map.insert(DATED_CTE, Cte(std::move(dated), dated_materialized));
+	anchored->cte_map.map.insert(
+	    ANCHORS_CTE, Cte(Anchors(model, aliases, sources, cumulative), CTEMaterialize::CTE_MATERIALIZE_NEVER));
 	GroupByAll(*anchored);
 	// stage 5: per dimension tuple
 	SemanticCumulativeBlock result;
