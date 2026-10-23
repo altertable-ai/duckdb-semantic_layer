@@ -130,7 +130,7 @@ unique_ptr<ParsedExpression> SemanticJoinScope::RangeLookup(const vector<Semanti
 
 unique_ptr<TableRef> SemanticJoinScope::BuildFrom() const {
 	auto result = Source(base);
-	result->alias = AliasOf(base);
+	result->alias = Identifier(AliasOf(base));
 	for (auto &join : joins) {
 		auto &rel = model.relationships[join.edge.relationship];
 		auto &parent_columns = join.edge.reversed ? rel.to_columns : rel.from_columns;
@@ -148,7 +148,7 @@ unique_ptr<TableRef> SemanticJoinScope::BuildFrom() const {
 		join_ref->type = JoinType::LEFT;
 		join_ref->left = std::move(result);
 		join_ref->right = Source(join.table);
-		join_ref->right->alias = AliasOf(join.table);
+		join_ref->right->alias = Identifier(AliasOf(join.table));
 		join_ref->condition = AndAll(std::move(conditions));
 		result = std::move(join_ref);
 	}

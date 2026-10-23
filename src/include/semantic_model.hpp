@@ -242,7 +242,7 @@ public:
 	vector<vector<idx_t>> path_count;
 
 public:
-	const QualifiedName &Name() const {
+	const SemanticQualifiedName &Name() const {
 		return definition->name;
 	}
 	const string &Comment() const {
@@ -256,22 +256,27 @@ public:
 	optional_idx FindMember(idx_t table, const string &member_name) const;
 	vector<idx_t> FindMembersByName(const string &member_name) const;
 
-	//! Whether `to` is at an equal or lower granularity than `from` and reachable from it
+	//! Whether `to` is at an equal or lower granularity than `from` and reachable
+	//! from it
 	bool Reaches(idx_t from, idx_t to) const {
 		return path_count[from][to] > 0;
 	}
-	//! The table of `tables` from which every other one is reachable; invalid when there is none (or `tables` is empty)
+	//! The table of `tables` from which every other one is reachable; invalid
+	//! when there is none (or `tables` is empty)
 	optional_idx FinestTable(const set<idx_t> &tables) const;
 	//! The unique path from -> to (empty when from == to), or why there is none
 	SemanticPathResult TryPath(idx_t from, idx_t to, const vector<idx_t> &using_relationships,
 	                           vector<SemanticEdge> &path) const;
-	//! The unique path from -> to (empty when from == to); throws when there are several paths or none.
-	//! `using_relationships` (USING on metrics) restricts how the tables they reference are reached.
+	//! The unique path from -> to (empty when from == to); throws when there are
+	//! several paths or none. `using_relationships` (USING on metrics) restricts
+	//! how the tables they reference are reached.
 	vector<SemanticEdge> Path(idx_t from, idx_t to, const vector<idx_t> &using_relationships = {}) const;
 
-	//! Looks up a (possibly qualified) name: a member or a column; NONE with `error` set when unknown or ambiguous
+	//! Looks up a (possibly qualified) name: a member or a column; NONE with
+	//! `error` set when unknown or ambiguous
 	SemanticRef Lookup(const vector<string> &names, const SemanticResolveContext &context, string &error) const;
-	//! Resolves every column reference of `expr` to a marker reference (semantic_markers.hpp)
+	//! Resolves every column reference of `expr` to a marker reference
+	//! (semantic_markers.hpp)
 	unique_ptr<ParsedExpression> Resolve(const ParsedExpression &expr, const SemanticResolveContext &context) const;
 
 	string MemberDisplayName(idx_t member) const;
@@ -285,6 +290,6 @@ private:
 
 //! Builds and validates a model from a parsed definition (catalog lookups through `context`)
 shared_ptr<SemanticModel> BuildSemanticModel(ClientContext &context, const ParsedSemanticView &definition,
-                                             const QualifiedName &resolved_name);
+                                             const SemanticQualifiedName &resolved_name);
 
 } // namespace duckdb

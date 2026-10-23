@@ -23,7 +23,7 @@ struct SemanticMaterializationRecord {
 
 bool HasMetadata(ClientContext &context, const string &catalog);
 vector<SemanticMaterializationRecord> ReadStoredMaterializations(Connection &connection, const string &catalog,
-                                                                 const QualifiedName &view);
+                                                                 const SemanticQualifiedName &view);
 bool ReattachStoredMaterialization(SemanticMaterialization &materialization,
                                    const SemanticMaterializationRecord &record);
 void WriteMetadata(Connection &connection, const SemanticModel &model, const SemanticMaterialization &materialization,
@@ -49,6 +49,6 @@ SemanticMaterializationRefreshResult BuildSemanticMaterialization(ClientContext 
 void DropSemanticMaterializationTables(Connection &connection, const SemanticMaterialization &materialization);
 void DropStoredMaterialization(Connection &connection, const SemanticStoredMaterialization &stored);
 void RenameStoredMaterializations(Connection &connection, const SemanticModel &model,
-                                  const QualifiedName &previous_name, const string &storage_catalog);
+                                  const SemanticQualifiedName &previous_name, const string &storage_catalog);
 
 } // namespace duckdb

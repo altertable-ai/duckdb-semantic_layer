@@ -17,6 +17,7 @@
 #include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
 #include "semantic_ast_helpers.hpp"
+#include "semantic_catalog_lookup.hpp"
 #include "semantic_change_tracking.hpp"
 #include "semantic_markers.hpp"
 #include "semantic_materialization_internal.hpp"
@@ -142,20 +143,22 @@ shared_ptr<SemanticMaterialization> PlanSemanticMaterialization(ClientContext &c
 	}
 	// storage: a writable DuckDB database or DuckLake catalog (default: the semantic view's database)
 	auto storage = parsed.storage_catalog.empty() ? model.Name().catalog : parsed.storage_catalog;
-	auto catalog = Catalog::GetCatalogEntry(context, storage);
+	auto catalog = Catalog::GetCatalogEntry(context, Identifier(storage));
 	if (!catalog) {
 		throw BinderException("%s: database \"%s\" does not exist", what, storage);
 	}
 	if (catalog->IsSystemCatalog() || catalog->IsTemporaryCatalog()) {
-		throw BinderException("%s: materializations cannot be stored in the %s database", what, catalog->GetName());
+		throw BinderException("%s: materializations cannot be stored in the %s database", what,
+		                      catalog->GetName().GetIdentifierName());
 	}
 	auto type = catalog->GetCatalogType();
 	if (type != "duckdb" && type != "ducklake") {
-		throw BinderException("%s: materializations are stored in DuckDB databases or DuckLake catalogs, not in "
+		throw BinderException("%s: materializations are stored in DuckDB "
+		                      "databases or DuckLake catalogs, not in "
 		                      "\"%s\" (%s)",
-		                      what, catalog->GetName(), type);
+		                      what, catalog->GetName().GetIdentifierName(), type);
 	}
-	result->storage_catalog = catalog->GetName();
+	result->storage_catalog = catalog->GetName().GetIdentifierName();
 	result->storage_schema = parsed.storage_schema.empty() ? SEMANTIC_MATERIALIZATION_SCHEMA : parsed.storage_schema;
 	// the fingerprint: the queries that build the tables (same queries, same content at the same snapshots)
 	string queries;
@@ -262,8 +265,7 @@ SemanticMaterializationStatus GetMaterializationStatus(ClientContext &context, c
 		verified_at = state.verified_at;
 		// a table created by a refresh committed after this transaction started is not visible to it
 		for (auto &table : state.tables) {
-			EntryLookupInfo lookup(CatalogType::TABLE_ENTRY, table);
-			if (!Catalog::GetEntry(context, state.catalog, state.schema, lookup, OnEntryNotFound::RETURN_NULL)) {
+			if (!LookupCatalogEntry(context, CatalogType::TABLE_ENTRY, state.catalog, state.schema, table)) {
 				status.reason = "its table " + table + " is not visible in this transaction";
 				return status;
 			}
@@ -349,7 +351,7 @@ static unique_ptr<ParsedExpression> RewriteOverDimensions(const ParsedExpression
 			failed = true;
 			return;
 		}
-		rewritten->alias = child->alias;
+		rewritten->SetAlias(child->GetAlias());
 		child = std::move(rewritten);
 	});
 	return failed ? nullptr : std::move(result);
@@ -448,9 +450,8 @@ unique_ptr<SemanticMaterializedRead> SemanticMaterializationMatcher::Find(
 			auto table = make_uniq<BaseTableRef>();
 			{
 				lock_guard<mutex> guard(materialization->state->lock);
-				table->catalog_name = materialization->state->catalog;
-				table->schema_name = materialization->state->schema;
-				table->table_name = materialization->state->tables[b];
+				auto &state = *materialization->state;
+				table->SetQualifiedName(MakeQualifiedName(state.catalog, state.schema, state.tables[b]));
 			}
 			table->alias = MATERIALIZATION_ALIAS;
 			read->table = std::move(table);

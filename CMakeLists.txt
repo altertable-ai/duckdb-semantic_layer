@@ -11,8 +11,6 @@ set(CMAKE_CXX_STANDARD "17" CACHE STRING "C++ standard to enforce")
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 include_directories(src/include)
-include_directories(BEFORE third_party/duckdb_peg_parser/include)
-include_directories(third_party/duckdb_peg_parser)
 
 set(EXTENSION_SOURCES
     src/semantic_layer_extension.cpp
@@ -45,10 +43,7 @@ set(EXTENSION_SOURCES
     src/semantic_time_spine.cpp
     src/semantic_statement_visitor.cpp
     src/semantic_layer_registry.cpp
-    src/parser/semantic_views_parser.cpp)
-
-# Vendored DuckDB PEG parser (appends to EXTENSION_SOURCES)
-add_subdirectory(third_party/duckdb_peg_parser)
+    src/parser/semantic_layer_grammar.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})

@@ -39,14 +39,15 @@ unique_ptr<ParsedExpression> SemanticExpressionCompiler::CompileRow(const Parsed
 	}
 	if (dependencies && expr.GetExpressionClass() == ExpressionClass::FUNCTION) {
 		auto &function = expr.Cast<FunctionExpression>();
-		EntryLookupInfo lookup(CatalogType::SCALAR_FUNCTION_ENTRY, function.function_name);
-		auto catalog = function.catalog;
-		auto schema = function.schema;
-		Binder::BindSchemaOrCatalog(analyzer.Context(), catalog, schema);
-		auto entry = Catalog::GetEntry(analyzer.Context(), catalog, schema, lookup, OnEntryNotFound::RETURN_NULL);
-		if (!entry && !schema.empty()) {
-			// DuckDB also accepts receiver-style calls, e.g. amount.scale().
-			entry = Catalog::GetEntry(analyzer.Context(), INVALID_CATALOG, INVALID_SCHEMA, lookup,
+		auto name = function.GetQualifiedName();
+		Binder::BindSchemaOrCatalog(analyzer.Context(), name);
+		auto entry = Catalog::GetEntry(analyzer.Context(), EntryLookupInfo(CatalogType::SCALAR_FUNCTION_ENTRY, name),
+		                               OnEntryNotFound::RETURN_NULL);
+		if (!entry && !name.Schema().empty()) {
+			// DuckDB also accepts receiver-style calls, e.g.
+			// amount.scale().
+			entry = Catalog::GetEntry(analyzer.Context(),
+			                          EntryLookupInfo(CatalogType::SCALAR_FUNCTION_ENTRY, QualifiedName(name.Name())),
 			                          OnEntryNotFound::RETURN_NULL);
 		}
 		if (entry && entry->type == CatalogType::MACRO_ENTRY && !entry->internal) {
@@ -82,7 +83,7 @@ unique_ptr<ParsedExpression> SemanticExpressionCompiler::CompileRow(const Parsed
 		});
 		return result;
 	}
-	result->alias = expr.alias;
+	result->SetAlias(expr.GetAlias());
 	return result;
 }
 

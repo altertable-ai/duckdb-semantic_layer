@@ -52,7 +52,7 @@ statement ok
 ALTER SEMANTIC VIEW shop ADD MATERIALIZATION mem_copy IN mem AS DIMENSIONS c.segment METRICS o.revenue, o.order_count;
 
 query IIII
-SELECT name, storage, list_transform(tables, t -> regexp_replace(t, '__[0-9a-f]{32}$', '')), usable FROM (SHOW SEMANTIC MATERIALIZATIONS IN shop) ORDER BY name;
+SELECT name, storage, list_transform(tables, lambda t: regexp_replace(t, '__[0-9a-f]{32}$', '')), usable FROM (SHOW SEMANTIC MATERIALIZATIONS IN shop) ORDER BY name;
 ----
 lake_copy	lake.__semantic_materializations	[lake.__semantic_materializations.shop__lake_copy__0]	true
 local_copy	materializations_persistence.__semantic_materializations	[materializations_persistence.__semantic_materializations.shop__local_copy__0]	true
@@ -61,7 +61,7 @@ totals	lake.analytics	[lake.analytics.shop__totals__0]	true
 
 # every target is written the same way: the tables, and a metadata row next to them
 query II
-SELECT name, list_transform(tables, t -> regexp_replace(t, '__[0-9a-f]{32}$', '')) FROM lake.__semantic_materializations.__sv_materializations ORDER BY name;
+SELECT name, list_transform(tables, lambda t: regexp_replace(t, '__[0-9a-f]{32}$', '')) FROM lake.__semantic_materializations.__sv_materializations ORDER BY name;
 ----
 lake_copy	[shop__lake_copy__0]
 totals	[shop__totals__0]

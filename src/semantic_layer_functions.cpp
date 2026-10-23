@@ -9,7 +9,7 @@ namespace duckdb {
 TableFunction SemanticViewsTableFunction(const string &name, vector<LogicalType> arguments, table_function_t scan,
                                          table_function_bind_t bind, table_function_init_global_t init,
                                          shared_ptr<SemanticViewsState> state) {
-	TableFunction function(name, std::move(arguments), scan, bind, init);
+	TableFunction function(Identifier(name), std::move(arguments), scan, bind, init);
 	function.function_info = make_shared_ptr<SemanticViewsFunctionInfo>(std::move(state));
 	return function;
 }
@@ -23,8 +23,8 @@ string StringArgument(const TableFunctionBindInput &input, idx_t index) {
 	return value.IsNull() ? string() : StringValue::Get(value);
 }
 
-QualifiedName NameArguments(const TableFunctionBindInput &input, idx_t first) {
-	QualifiedName name;
+SemanticQualifiedName NameArguments(const TableFunctionBindInput &input, idx_t first) {
+	SemanticQualifiedName name;
 	name.catalog = StringArgument(input, first);
 	name.schema = StringArgument(input, first + 1);
 	name.name = StringArgument(input, first + 2);

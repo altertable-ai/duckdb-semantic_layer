@@ -13,6 +13,7 @@
 #include "duckdb.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/parser/qualified_name.hpp"
+#include "parsed_semantic_view.hpp"
 
 namespace duckdb {
 
@@ -32,7 +33,7 @@ TableFunction SemanticViewsTableFunction(const string &name, vector<LogicalType>
 SemanticViewsState &GetSemanticViewsState(TableFunctionBindInput &input);
 string StringArgument(const TableFunctionBindInput &input, idx_t index);
 //! (catalog, schema, name) arguments starting at `first`
-QualifiedName NameArguments(const TableFunctionBindInput &input, idx_t first);
+SemanticQualifiedName NameArguments(const TableFunctionBindInput &input, idx_t first);
 
 //! Bind data / scan for table functions whose rows are computed at bind time
 struct RowsFunctionData : public TableFunctionData {

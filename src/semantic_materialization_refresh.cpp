@@ -1,26 +1,27 @@
-#include "semantic_definition_exception.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/entry_lookup_info.hpp"
-#include "duckdb/parser/expression/star_expression.hpp"
-#include "duckdb/parser/query_node/set_operation_node.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/to_string.hpp"
 #include "duckdb/common/types/uuid.hpp"
+#include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/database_manager.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/expression/operator_expression.hpp"
+#include "duckdb/parser/expression/star_expression.hpp"
 #include "duckdb/parser/expression/subquery_expression.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/query_node/set_operation_node.hpp"
 #include "duckdb/parser/statement/create_statement.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
-#include "semantic_ast_helpers.hpp"
 #include "semantic_aggregate_state.hpp"
+#include "semantic_ast_helpers.hpp"
+#include "semantic_catalog_lookup.hpp"
+#include "semantic_definition_exception.hpp"
 #include "semantic_lowering.hpp"
-#include "duckdb/main/attached_database.hpp"
-#include "duckdb/main/database_manager.hpp"
 #include "semantic_materialization_internal.hpp"
 #include "semantic_materialization_storage.hpp"
 
@@ -57,7 +58,7 @@ private:
 };
 
 string Literal(const string &value) {
-	return KeywordHelper::WriteQuoted(value, '\'');
+	return SQLString::ToString(value);
 }
 
 //! The rows among the changed rows `changes` (a temp table: rowid, snapshot_id, change_type, columns) as of after the
@@ -71,7 +72,7 @@ unique_ptr<TableRef> ChangedRowImages(const string &changes, bool new_images) {
 	auto sql = "SELECT * EXCLUDE (snapshot_id, change_type, __sv_rn) FROM (SELECT *, row_number() OVER (PARTITION BY "
 	           "rowid ORDER BY " +
 	           string(order) + ") AS __sv_rn FROM " + changes + ") WHERE __sv_rn = 1 AND change_type = '" + kind + "'";
-	Parser parser;
+	auto parser = Parser::GetBuiltinParser();
 	parser.ParseQuery(sql);
 	auto select = unique_ptr_cast<SQLStatement, SelectStatement>(std::move(parser.statements[0]));
 	return make_uniq<SubqueryRef>(std::move(select));
@@ -79,8 +80,8 @@ unique_ptr<TableRef> ChangedRowImages(const string &changes, bool new_images) {
 
 unique_ptr<ParsedExpression> Exists(unique_ptr<SelectNode> node) {
 	auto subquery = make_uniq<SubqueryExpression>();
-	subquery->subquery_type = SubqueryType::EXISTS;
-	subquery->subquery = MakeSelectStatement(std::move(node));
+	subquery->GetSubqueryTypeMutable() = SubqueryType::EXISTS;
+	subquery->SubqueryMutable() = MakeSelectStatement(std::move(node));
 	return std::move(subquery);
 }
 
@@ -88,9 +89,9 @@ unique_ptr<ParsedExpression> Exists(unique_ptr<SelectNode> node) {
 unique_ptr<ParsedExpression> ExistsIn(const string &temp_table, const vector<string> &columns,
                                       vector<unique_ptr<ParsedExpression>> values, bool null_safe) {
 	auto node = make_uniq<SelectNode>();
-	node->select_list.push_back(make_uniq<ConstantExpression>(Value::INTEGER(1)));
+	node->select_list.push_back(ConstantExpression::FromValue(Value::INTEGER(1)));
 	auto ref = make_uniq<BaseTableRef>();
-	ref->table_name = temp_table;
+	ref->SetTable(Identifier(temp_table));
 	ref->alias = "__sv_k";
 	node->from_table = std::move(ref);
 	vector<unique_ptr<ParsedExpression>> conditions;
@@ -224,9 +225,8 @@ private:
 			}
 		}
 		for (idx_t b = 0; b < materialization.blocks.size(); b++) {
-			EntryLookupInfo lookup(CatalogType::TABLE_ENTRY, state.tables[b]);
-			if (!Catalog::GetEntry(*connection.context, state.catalog, state.schema, lookup,
-			                       OnEntryNotFound::RETURN_NULL)) {
+			if (!LookupCatalogEntry(*connection.context, CatalogType::TABLE_ENTRY, state.catalog, state.schema,
+			                        state.tables[b])) {
 				return "its table " + state.tables[b] + " is missing";
 			}
 		}
@@ -242,7 +242,7 @@ private:
 		return string();
 	}
 
-	unique_ptr<MaterializedQueryResult> Execute(const string &sql) {
+	unique_ptr<QueryResult> Execute(const string &sql) {
 		auto result = connection.Query(sql);
 		if (result->HasError()) {
 			result->ThrowError("semantic view materialization: ");
@@ -251,20 +251,20 @@ private:
 	}
 
 	void Execute(unique_ptr<SQLStatement> statement) {
-		auto result = connection.context->Query(std::move(statement), false);
+		auto result = connection.context->Query(std::move(statement), QueryParameters());
 		if (result->HasError()) {
 			result->ThrowError("semantic view materialization: ");
 		}
 	}
 
 	idx_t Count(const string &table) {
-		return Execute("SELECT count(*) FROM " + table)->GetValue(0, 0).GetValue<idx_t>();
+		return Execute("SELECT count(*) FROM " + table)->Collection().GetValue(0, 0).GetValue<idx_t>();
 	}
 
 	//! CREATE OR REPLACE [TEMP] TABLE <catalog>.<schema>.<table> AS <select>
 	void CreateTableAs(const string &catalog, const string &schema, const string &table,
 	                   unique_ptr<SelectStatement> select, bool temporary) {
-		auto info = make_uniq<CreateTableInfo>(catalog, schema, table);
+		auto info = make_uniq<CreateTableInfo>(MakeQualifiedName(catalog, schema, table));
 		info->on_conflict = OnCreateConflict::REPLACE_ON_CONFLICT;
 		info->temporary = temporary;
 		info->query = std::move(select);
@@ -475,7 +475,7 @@ private:
 			delta->select_list.push_back(ColumnRef(dimension));
 			delta->groups.group_expressions.push_back(ColumnRef(dimension));
 		}
-		for (auto &expr : Parser::ParseExpressionList(Join(delta_columns, ", "))) {
+		for (auto &expr : Parser::GetBuiltinParser().ParseExpressionList(Join(delta_columns, ", "))) {
 			delta->select_list.push_back(std::move(expr));
 		}
 		auto unions = make_uniq<SetOperationNode>();
@@ -484,10 +484,10 @@ private:
 		for (auto &part : parts) {
 			auto signed_part = make_uniq<SelectNode>();
 			signed_part->select_list.push_back(make_uniq<StarExpression>());
-			auto sign = make_uniq<ConstantExpression>(Value::INTEGER(part.second));
-			sign->alias = "__sv_sign";
+			auto sign = ConstantExpression::FromValue(Value::INTEGER(part.second));
+			sign->SetAlias(Identifier("__sv_sign"));
 			signed_part->select_list.push_back(std::move(sign));
-			signed_part->from_table = make_uniq<SubqueryRef>(std::move(part.first), "__sv_part");
+			signed_part->from_table = make_uniq<SubqueryRef>(std::move(part.first), Identifier("__sv_part"));
 			unions->children.push_back(std::move(signed_part));
 		}
 		GroupByAll(*delta);
@@ -519,7 +519,7 @@ private:
 		    Execute("MERGE INTO " + table + " AS __sv_m USING __sv_delta AS __sv_d ON " + match +
 		            " WHEN MATCHED THEN UPDATE SET " + Join(updates, ", ") + " WHEN NOT MATCHED THEN INSERT (" +
 		            Join(stored_columns, ", ") + ") VALUES (" + Join(inserted, ", ") + ")");
-		auto changed_groups = merged->GetValue(0, 0).GetValue<idx_t>();
+		auto changed_groups = merged->Collection().GetValue(0, 0).GetValue<idx_t>();
 		if (grouped) {
 			// groups without rows disappear (the only group of an ungrouped block stays)
 			Execute("DELETE FROM " + table + " WHERE " + MATERIALIZED_ROWS_COLUMN + " = 0");
@@ -604,7 +604,7 @@ SemanticMaterializationRefreshResult BuildSemanticMaterialization(ClientContext 
                                                                   const SemanticModel &model,
                                                                   SemanticMaterialization &materialization) {
 	auto &state = *materialization.state;
-	if (Catalog::GetCatalog(context, materialization.storage_catalog).GetAttached().IsReadOnly()) {
+	if (Catalog::GetCatalog(context, Identifier(materialization.storage_catalog)).GetAttached().IsReadOnly()) {
 		throw BinderException("database \"%s\" is read-only", materialization.storage_catalog);
 	}
 	{
@@ -628,9 +628,8 @@ SemanticMaterializationRefreshResult BuildSemanticMaterialization(ClientContext 
 		if (state.built) {
 			bool exists = true;
 			for (auto &table : state.tables) {
-				EntryLookupInfo lookup(CatalogType::TABLE_ENTRY, table);
-				exists = exists && Catalog::GetEntry(*connection.context, state.catalog, state.schema, lookup,
-				                                     OnEntryNotFound::RETURN_NULL);
+				exists = exists && LookupCatalogEntry(*connection.context, CatalogType::TABLE_ENTRY, state.catalog,
+				                                      state.schema, table);
 			}
 			if (exists) {
 				return {state.watermark, state.verified_at, state.last_refresh, state.last_refresh_detail};

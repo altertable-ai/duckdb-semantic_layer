@@ -36,7 +36,7 @@ unique_ptr<ParsedExpression> SemanticCumulativeWindow(const SemanticCumulative &
 		break;
 	case SemanticCumulativeKind::GRAIN:
 		// date_trunc(part, anchor) <= date
-		children.push_back(make_uniq<ConstantExpression>(Value(cumulative.part)));
+		children.push_back(ConstantExpression::FromValue(Value(cumulative.part)));
 		children.push_back(anchor->Copy());
 		start = Compare(ExpressionType::COMPARE_GREATERTHANOREQUALTO, date->Copy(),
 		                Call("date_trunc", std::move(children)));
@@ -99,7 +99,7 @@ unique_ptr<ParsedExpression> SemanticAnchorMap::Column(idx_t table, const string
 }
 
 unique_ptr<ParsedExpression> SemanticAnchorMap::Opaque(unique_ptr<ParsedExpression> compiled) {
-	compiled->alias.clear();
+	compiled->ClearAlias();
 	for (idx_t i = 0; i < leaves.size(); i++) {
 		if (leaves[i]->Equals(*compiled)) {
 			return ColumnRef(LeafColumn(i));
@@ -113,7 +113,7 @@ vector<unique_ptr<ParsedExpression>> SemanticAnchorMap::TakeLeaves() {
 	auto result = std::move(leaves);
 	leaves.clear();
 	for (idx_t i = 0; i < result.size(); i++) {
-		result[i]->alias = LeafColumn(i);
+		result[i]->SetAlias(Identifier(LeafColumn(i)));
 	}
 	return result;
 }
@@ -125,11 +125,11 @@ namespace {
 
 //! max(__sv_c) OVER (): the latest date of the block's rows
 unique_ptr<ParsedExpression> LatestDate() {
-	auto result = make_uniq<WindowExpression>(ExpressionType::WINDOW_AGGREGATE, INVALID_CATALOG, INVALID_SCHEMA, "max");
-	result->children.push_back(ColumnRef(CUMULATIVE_DATE_COLUMN));
-	result->start = WindowBoundary::UNBOUNDED_PRECEDING;
-	result->end = WindowBoundary::UNBOUNDED_FOLLOWING;
-	result->alias = CUMULATIVE_BOUND_COLUMN;
+	auto result = make_uniq<WindowExpression>(INVALID_CATALOG, INVALID_SCHEMA, "max");
+	result->GetArgumentsMutable().emplace_back(ColumnRef(CUMULATIVE_DATE_COLUMN));
+	result->WindowStartMutable() = WindowBoundary::UNBOUNDED_PRECEDING;
+	result->WindowEndMutable() = WindowBoundary::UNBOUNDED_FOLLOWING;
+	result->SetAlias(Identifier(CUMULATIVE_BOUND_COLUMN));
 	return std::move(result);
 }
 
@@ -171,9 +171,9 @@ unique_ptr<SelectNode> PreAggregate(ClientContext &context, SemanticCumulativePa
 		states[k].kind = ClassifySemanticAggregate(function, types[k]);
 		states[k].type = types[k];
 		states[k].prefix = "__sv_s" + to_string(k);
-		auto ordered = function.order_bys && !function.order_bys->orders.empty();
+		auto ordered = function.OrderBy() && !function.OrderBy()->orders.empty();
 		if (states[k].kind == SemanticAggregateKind::OPAQUE &&
-		    (!function.distinct || ordered || function.export_state)) {
+		    (!function.Distinct() || ordered || function.ExportState())) {
 			return nullptr;
 		}
 	}
@@ -189,17 +189,17 @@ unique_ptr<SelectNode> PreAggregate(ClientContext &context, SemanticCumulativePa
 	};
 	group_by(CUMULATIVE_DATE_COLUMN);
 	for (auto &leaf : parts.leaves) {
-		group_by(leaf->alias);
+		group_by(leaf->GetAlias().GetIdentifierName());
 	}
 	for (idx_t k = 0; k < parts.aggregates.size(); k++) {
 		auto &function = parts.aggregates[k]->Cast<FunctionExpression>();
 		if (states[k].kind == SemanticAggregateKind::OPAQUE) {
 			// DISTINCT: its arguments (columns of the rows) are kept, once per distinct value
-			for (auto &child : function.children) {
-				group_by(child->Cast<ColumnRefExpression>().GetColumnName());
+			for (auto &argument : function.GetArguments()) {
+				group_by(argument.GetExpression().Cast<ColumnRefExpression>().GetColumnName().GetIdentifierName());
 			}
-			if (function.filter) {
-				group_by(function.filter->Cast<ColumnRefExpression>().GetColumnName());
+			if (function.Filter()) {
+				group_by(function.Filter()->Cast<ColumnRefExpression>().GetColumnName().GetIdentifierName());
 			}
 			continue;
 		}
@@ -229,14 +229,14 @@ static constexpr const char *ANCHORS_CTE = "__sv_anchors";
 
 unique_ptr<TableRef> CteRef(const string &name) {
 	auto ref = make_uniq<BaseTableRef>();
-	ref->table_name = name;
-	ref->alias = name;
+	ref->SetTable(Identifier(name));
+	ref->alias = Identifier(name);
 	return std::move(ref);
 }
 
 unique_ptr<CommonTableExpressionInfo> Cte(unique_ptr<QueryNode> query, CTEMaterialize materialized) {
 	auto cte = make_uniq<CommonTableExpressionInfo>();
-	cte->query = MakeSelectStatement(std::move(query));
+	cte->query_node = std::move(query);
 	cte->materialized = materialized;
 	return cte;
 }
@@ -248,7 +248,7 @@ unique_ptr<QueryNode> SpineAnchors() {
 		vector<unique_ptr<ParsedExpression>> arguments;
 		arguments.push_back(ColumnRef(CUMULATIVE_DATE_COLUMN));
 		auto result = Call(aggregate, std::move(arguments));
-		result->alias = alias;
+		result->SetAlias(Identifier(alias));
 		return result;
 	};
 	auto bounds = make_uniq<SelectNode>();
@@ -258,12 +258,12 @@ unique_ptr<QueryNode> SpineAnchors() {
 	vector<unique_ptr<ParsedExpression>> series;
 	series.push_back(ColumnRef("lo"));
 	series.push_back(ColumnRef("hi"));
-	series.push_back(make_uniq<ConstantExpression>(Value::INTERVAL(0, 1, 0)));
+	series.push_back(ConstantExpression::FromValue(Value::INTERVAL(0, 1, 0)));
 	vector<unique_ptr<ParsedExpression>> unnest;
 	unnest.push_back(Call("generate_series", std::move(series)));
 	auto node = make_uniq<SelectNode>();
 	auto day = make_uniq<CastExpression>(LogicalType::DATE, Call("unnest", std::move(unnest)));
-	day->alias = CUMULATIVE_ANCHOR_COLUMN;
+	day->SetAlias(Identifier(CUMULATIVE_ANCHOR_COLUMN));
 	node->select_list.push_back(std::move(day));
 	node->from_table = MakeSubqueryRef(std::move(bounds), "__sv_bounds");
 	node->where_clause = make_uniq<OperatorExpression>(ExpressionType::OPERATOR_IS_NOT_NULL, ColumnRef("lo"));
@@ -280,7 +280,7 @@ unique_ptr<QueryNode> Anchors(const SemanticModel &model, SemanticAliasGenerator
 	auto node = make_uniq<SelectNode>();
 	auto anchor = scope.ColumnReference(cumulative.table, cumulative.column);
 	node->where_clause = make_uniq<OperatorExpression>(ExpressionType::OPERATOR_IS_NOT_NULL, anchor->Copy());
-	anchor->alias = CUMULATIVE_ANCHOR_COLUMN;
+	anchor->SetAlias(Identifier(CUMULATIVE_ANCHOR_COLUMN));
 	node->select_list.push_back(std::move(anchor));
 	node->modifiers.push_back(make_uniq<DistinctModifier>());
 	node->from_table = scope.BuildFrom();
@@ -311,7 +311,7 @@ SemanticCumulativeBlock BuildSemanticCumulativeBlock(ClientContext &context, con
                                                      const SemanticCumulative &cumulative,
                                                      SemanticCumulativeParts parts) {
 	// stage 1: the rows read the date and the leaves
-	parts.date->alias = CUMULATIVE_DATE_COLUMN;
+	parts.date->SetAlias(Identifier(CUMULATIVE_DATE_COLUMN));
 	parts.rows->select_list.push_back(std::move(parts.date));
 	for (auto &leaf : parts.leaves) {
 		parts.rows->select_list.push_back(leaf->Copy());
@@ -339,13 +339,13 @@ SemanticCumulativeBlock BuildSemanticCumulativeBlock(ClientContext &context, con
 	auto anchored = make_uniq<SelectNode>();
 	for (idx_t d = 0; d < dimension_count; d++) {
 		anchored->groups.group_expressions.push_back(parts.dimensions[d]->Copy());
-		parts.dimensions[d]->alias = SemanticDimensionColumn(d);
+		parts.dimensions[d]->SetAlias(Identifier(SemanticDimensionColumn(d)));
 		anchored->select_list.push_back(std::move(parts.dimensions[d]));
 	}
 	anchored->groups.group_expressions.push_back(ColumnRef(CUMULATIVE_ANCHOR_COLUMN));
 	anchored->select_list.push_back(ColumnRef(CUMULATIVE_ANCHOR_COLUMN));
 	for (idx_t k = 0; k < value_count; k++) {
-		parts.aggregates[k]->alias = ValueColumn(k);
+		parts.aggregates[k]->SetAlias(Identifier(ValueColumn(k)));
 		anchored->select_list.push_back(std::move(parts.aggregates[k]));
 	}
 	anchored->where_clause = std::move(parts.anchor_where);

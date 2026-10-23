@@ -7,15 +7,16 @@
 #include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckdb/parser/tableref/table_function_ref.hpp"
 #include "duckdb/planner/binder.hpp"
+#include "semantic_ast_helpers.hpp"
 #include "semantic_lowering.hpp"
 #include "semantic_materialization.hpp"
 #include "semantic_query_compiler.hpp"
 #include "semantic_sql_rewrite.hpp"
-#include "semantic_time_reads.hpp"
 #include "semantic_statement_visitor.hpp"
+#include "semantic_time_reads.hpp"
 #include "semantic_layer_registry.hpp"
 #include "semantic_layer_functions.hpp"
-#include "semantic_views_parser.hpp"
+#include "semantic_layer_grammar.hpp"
 
 namespace duckdb {
 
@@ -35,7 +36,7 @@ static unique_ptr<TableRef> CompileSemanticQuery(ClientContext &context, Semanti
 		// a prepared statement reading a materialization is planned again (freshness checked) at every execution
 		binder->SetAlwaysRequireRebind();
 	}
-	return make_uniq<SubqueryRef>(std::move(compiled), model->Name().name);
+	return make_uniq<SubqueryRef>(std::move(compiled), Identifier(model->Name().name));
 }
 
 static unique_ptr<TableRef> SemanticQueryBindReplace(ClientContext &context, TableFunctionBindInput &input) {
@@ -58,11 +59,10 @@ protected:
 		}
 		auto &function_ref = ref->Cast<TableFunctionRef>();
 		auto &function = function_ref.function->Cast<FunctionExpression>();
-		if (!StringUtil::CIEquals(function.function_name, SEMANTIC_VIEW_QUERY_FUNCTION)) {
+		if (!StringUtil::CIEquals(function.FunctionName().GetIdentifierName(), SEMANTIC_VIEW_QUERY_FUNCTION)) {
 			return;
 		}
-		auto replacement =
-		    CompileSemanticQuery(context, state, function.children[0]->Cast<ConstantExpression>().value, nullptr);
+		auto replacement = CompileSemanticQuery(context, state, ConstantValue(Argument(function, 0)), nullptr);
 		if (!ref->alias.empty()) {
 			replacement->alias = ref->alias;
 		}
@@ -76,7 +76,7 @@ private:
 };
 
 static unique_ptr<FunctionData> SemanticViewSqlBind(ClientContext &context, TableFunctionBindInput &input,
-                                                    vector<LogicalType> &return_types, vector<string> &names) {
+                                                    vector<LogicalType> &return_types, vector<Identifier> &names) {
 	names.emplace_back("sql");
 	return_types.emplace_back(LogicalType::VARCHAR);
 	if (input.inputs[0].IsNull()) {
@@ -85,7 +85,7 @@ static unique_ptr<FunctionData> SemanticViewSqlBind(ClientContext &context, Tabl
 	auto &state = GetSemanticViewsState(input);
 	SemanticQueryExpander expander(context, state);
 	auto result = make_uniq<RowsFunctionData>();
-	for (auto &statement : SemanticViewsParser::Parse(StringValue::Get(input.inputs[0]), context.GetParserOptions())) {
+	for (auto &statement : SemanticViewsGrammarExtension::Parse(context, StringValue::Get(input.inputs[0]))) {
 		RewriteSemanticViewReferences(context, state, *statement);
 		expander.VisitStatement(*statement);
 		result->rows.push_back({Value(statement->ToString())});
@@ -97,14 +97,14 @@ static unique_ptr<FunctionData> SemanticViewSqlBind(ClientContext &context, Tabl
 // semantic_layer_peg_parse(sql) - how the semantic-view parser lowers a statement
 //===--------------------------------------------------------------------===//
 static unique_ptr<FunctionData> PegParseBind(ClientContext &context, TableFunctionBindInput &input,
-                                             vector<LogicalType> &return_types, vector<string> &names) {
+                                             vector<LogicalType> &return_types, vector<Identifier> &names) {
 	names.emplace_back("rewritten_sql");
 	return_types.emplace_back(LogicalType::VARCHAR);
 	if (input.inputs[0].IsNull()) {
 		throw BinderException("semantic_layer_peg_parse: the query cannot be NULL");
 	}
 	auto result = make_uniq<RowsFunctionData>();
-	for (auto &statement : SemanticViewsParser::Parse(StringValue::Get(input.inputs[0]), context.GetParserOptions())) {
+	for (auto &statement : SemanticViewsGrammarExtension::Parse(context, StringValue::Get(input.inputs[0]))) {
 		result->rows.push_back({Value(statement->ToString())});
 	}
 	return std::move(result);

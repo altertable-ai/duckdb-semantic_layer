@@ -18,10 +18,16 @@ static bool IsSet(const string &part, const string &invalid) {
 	return !part.empty() && part != invalid;
 }
 
-QualifiedName SemanticViewRegistry::ResolveSchema(ClientContext &context, const string &catalog_p,
-                                                  const string &schema_p, OnEntryNotFound if_not_found) {
-	string catalog = IsSet(catalog_p, INVALID_CATALOG) ? catalog_p : string();
-	string schema = IsSet(schema_p, INVALID_SCHEMA) ? schema_p : string();
+//! The schema a name qualified only by `catalog` lives in
+static Identifier DefaultSchema(ClientContext &context, CatalogSearchPath &search_path, const Identifier &catalog) {
+	auto schema = search_path.GetDefaultSchema(context, catalog);
+	return schema ? *schema : Identifier(DEFAULT_SCHEMA);
+}
+
+SemanticQualifiedName SemanticViewRegistry::ResolveSchema(ClientContext &context, const string &catalog_p,
+                                                          const string &schema_p, OnEntryNotFound if_not_found) {
+	Identifier catalog(IsSet(catalog_p, INVALID_CATALOG) ? catalog_p : string());
+	Identifier schema(IsSet(schema_p, INVALID_SCHEMA) ? schema_p : string());
 	if (catalog.empty() && !schema.empty()) {
 		// `x.view`: x may be a schema of the default database or a database name
 		Binder::BindSchemaOrCatalog(context, catalog, schema);
@@ -29,32 +35,33 @@ QualifiedName SemanticViewRegistry::ResolveSchema(ClientContext &context, const 
 	auto &search_path = *ClientData::Get(context).catalog_search_path;
 	if (catalog.empty() && schema.empty()) {
 		auto &entry = search_path.GetDefault();
-		catalog = entry.catalog;
-		schema = entry.schema;
+		catalog = entry.GetCatalog();
+		schema = entry.GetSchema();
 	}
-	if (catalog.empty() || catalog == INVALID_CATALOG) {
+	if (catalog.empty()) {
 		catalog = DatabaseManager::GetDefaultDatabase(context);
 	}
-	if (schema.empty() || schema == INVALID_SCHEMA) {
-		schema = search_path.GetDefaultSchema(context, catalog);
+	if (schema.empty()) {
+		schema = DefaultSchema(context, search_path, catalog);
 	}
-	// validates that the database and schema exist (and normalizes the spelling of catalog / schema)
+	// validates that the database and schema exist (and normalizes the spelling
+	// of catalog / schema)
 	Catalog::GetCatalog(context, catalog);
 	auto schema_entry = Catalog::GetSchema(context, catalog, schema, if_not_found);
-	QualifiedName result;
-	result.catalog = schema_entry ? schema_entry->ParentCatalog().GetName() : catalog;
-	result.schema = schema_entry ? schema_entry->name : schema;
+	SemanticQualifiedName result;
+	result.catalog = (schema_entry ? schema_entry->ParentCatalog().GetName() : catalog).GetIdentifierName();
+	result.schema = (schema_entry ? schema_entry->name : schema).GetIdentifierName();
 	return result;
 }
 
-QualifiedName SemanticViewRegistry::ResolveDDLName(ClientContext &context, const QualifiedName &name,
-                                                   OnEntryNotFound if_not_found) {
+SemanticQualifiedName SemanticViewRegistry::ResolveDDLName(ClientContext &context, const SemanticQualifiedName &name,
+                                                           OnEntryNotFound if_not_found) {
 	auto result = ResolveSchema(context, name.catalog, name.schema, if_not_found);
 	result.name = name.name;
 	return result;
 }
 
-string SemanticViewRegistry::Key(const QualifiedName &name) {
+string SemanticViewRegistry::Key(const SemanticQualifiedName &name) {
 	return StringUtil::Lower(name.catalog) + "\x1f" + StringUtil::Lower(name.schema) + "\x1f" +
 	       StringUtil::Lower(name.name);
 }
@@ -82,7 +89,7 @@ bool SemanticViewRegistry::Create(shared_ptr<SemanticModel> model, bool replace,
 	return true;
 }
 
-bool SemanticViewRegistry::Drop(const QualifiedName &name,
+bool SemanticViewRegistry::Drop(const SemanticQualifiedName &name,
                                 const std::function<void(shared_ptr<SemanticModel>)> &prepare) {
 	lock_guard<mutex> writing(ddl_lock);
 	auto previous = Get(name);
@@ -117,37 +124,38 @@ bool SemanticViewRegistry::Replace(const SemanticModel &expected, shared_ptr<Sem
 	return true;
 }
 
-shared_ptr<SemanticModel> SemanticViewRegistry::Get(const QualifiedName &fully_qualified) const {
+shared_ptr<SemanticModel> SemanticViewRegistry::Get(const SemanticQualifiedName &fully_qualified) const {
 	lock_guard<mutex> guard(lock);
 	auto entry = views.find(Key(fully_qualified));
 	return entry == views.end() ? nullptr : entry->second;
 }
 
-shared_ptr<SemanticModel> SemanticViewRegistry::Lookup(ClientContext &context, const QualifiedName &name) const {
+shared_ptr<SemanticModel> SemanticViewRegistry::Lookup(ClientContext &context,
+                                                       const SemanticQualifiedName &name) const {
 	bool has_catalog = IsSet(name.catalog, INVALID_CATALOG);
 	bool has_schema = IsSet(name.schema, INVALID_SCHEMA);
-	vector<QualifiedName> candidates;
+	vector<SemanticQualifiedName> candidates;
 	auto &search_path = *ClientData::Get(context).catalog_search_path;
-	auto default_db = DatabaseManager::GetDefaultDatabase(context);
+	auto default_db = DatabaseManager::GetDefaultDatabase(context).GetIdentifierName();
 	if (has_catalog && has_schema) {
 		candidates.push_back(name);
 	} else if (has_schema) {
 		// x.view: schema x of the search-path databases, or database x
 		for (auto &entry : search_path.Get()) {
-			QualifiedName candidate = name;
-			candidate.catalog = entry.catalog.empty() || entry.catalog == INVALID_CATALOG ? default_db : entry.catalog;
+			SemanticQualifiedName candidate = name;
+			candidate.catalog = entry.GetCatalog().empty() ? default_db : entry.GetCatalog().GetIdentifierName();
 			candidates.push_back(candidate);
 		}
-		QualifiedName as_catalog;
+		SemanticQualifiedName as_catalog;
 		as_catalog.catalog = name.schema;
-		as_catalog.schema = search_path.GetDefaultSchema(context, name.schema);
+		as_catalog.schema = DefaultSchema(context, search_path, Identifier(name.schema)).GetIdentifierName();
 		as_catalog.name = name.name;
 		candidates.push_back(as_catalog);
 	} else {
 		for (auto &entry : search_path.Get()) {
-			QualifiedName candidate;
-			candidate.catalog = entry.catalog.empty() || entry.catalog == INVALID_CATALOG ? default_db : entry.catalog;
-			candidate.schema = entry.schema;
+			SemanticQualifiedName candidate;
+			candidate.catalog = entry.GetCatalog().empty() ? default_db : entry.GetCatalog().GetIdentifierName();
+			candidate.schema = entry.GetSchema().GetIdentifierName();
 			candidate.name = name.name;
 			candidates.push_back(candidate);
 		}
@@ -161,7 +169,8 @@ shared_ptr<SemanticModel> SemanticViewRegistry::Lookup(ClientContext &context, c
 	return nullptr;
 }
 
-shared_ptr<SemanticModel> SemanticViewRegistry::GetOrThrow(ClientContext &context, const QualifiedName &name) const {
+shared_ptr<SemanticModel> SemanticViewRegistry::GetOrThrow(ClientContext &context,
+                                                           const SemanticQualifiedName &name) const {
 	auto result = Lookup(context, name);
 	if (!result) {
 		throw CatalogException("Semantic view with name \"%s\" does not exist!", name.name);

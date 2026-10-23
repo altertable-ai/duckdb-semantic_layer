@@ -44,12 +44,12 @@ vector<SemanticCatalogColumn> SemanticCatalogColumns(const SemanticModel &model)
 //! creates it, an empty `after` name drops it, and both change it (ALTER, possibly renaming it).
 
 //! At bind time: a new name must not belong to a table or view, and the statement declares its catalog modifications
-void BindSemanticViewChange(ClientContext &context, optional_ptr<Binder> binder, const QualifiedName &before,
-                            const QualifiedName &after);
+void BindSemanticViewChange(ClientContext &context, optional_ptr<Binder> binder, const SemanticQualifiedName &before,
+                            const SemanticQualifiedName &after);
 //! At execution, before the registry changes: replaces the placeholder of `before` by the placeholder of `after`
 //! (nullptr when dropped). When the registry change then fails, the statement's rollback undoes this one. Returns
 //! whether a placeholder of `before` was dropped (one left in a database file by a previous session counts too).
-bool ApplySemanticViewChange(ClientContext &context, const QualifiedName &before,
+bool ApplySemanticViewChange(ClientContext &context, const SemanticQualifiedName &before,
                              optional_ptr<const SemanticModel> after);
 //! Whether a catalog entry is the placeholder of a semantic view
 bool IsSemanticPlaceholder(const CatalogEntry &entry);

@@ -39,7 +39,7 @@ static Value TableName(const SemanticModel &model, const SemanticMember &member)
 // SHOW SEMANTIC VIEWS [IN SCHEMA s | IN DATABASE d]
 //===--------------------------------------------------------------------===//
 static unique_ptr<FunctionData> ShowViewsBind(ClientContext &context, TableFunctionBindInput &input,
-                                              vector<LogicalType> &return_types, vector<string> &names) {
+                                              vector<LogicalType> &return_types, vector<Identifier> &names) {
 	names = {"created_on", "name", "database_name", "schema_name", "comment"};
 	return_types = {LogicalType::TIMESTAMP_TZ, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
 	                LogicalType::VARCHAR};
@@ -73,7 +73,7 @@ static bool InDefaultSchema(ClientContext &context, const SemanticModel &model) 
 }
 
 static unique_ptr<FunctionData> ShowMembersBind(ClientContext &context, TableFunctionBindInput &input,
-                                                vector<LogicalType> &return_types, vector<string> &names) {
+                                                vector<LogicalType> &return_types, vector<Identifier> &names) {
 	names = {"database_name", "schema_name", "semantic_view_name", "table_name",
 	         "name",          "data_type",   "synonyms",           "comment"};
 	return_types = {LogicalType::VARCHAR,
@@ -116,7 +116,7 @@ static unique_ptr<FunctionData> ShowMembersBind(ClientContext &context, TableFun
 // SHOW SEMANTIC DIMENSIONS IN view FOR METRIC m: dimensions every aggregate of the metric can be grouped by
 //===--------------------------------------------------------------------===//
 static unique_ptr<FunctionData> ShowForMetricBind(ClientContext &context, TableFunctionBindInput &input,
-                                                  vector<LogicalType> &return_types, vector<string> &names) {
+                                                  vector<LogicalType> &return_types, vector<Identifier> &names) {
 	names = {"table_name", "name", "data_type", "required", "synonyms", "comment"};
 	return_types = {LogicalType::VARCHAR,
 	                LogicalType::VARCHAR,
@@ -141,7 +141,8 @@ static unique_ptr<FunctionData> ShowForMetricBind(ClientContext &context, TableF
 	// dimensions used by window clauses must be part of the query
 	set<idx_t> required;
 	analyzer.WindowDimensions(*SemanticMarkers::Member(ref.index), required);
-	// dimensions reached through a single, unambiguous many-to-many bridge are available too
+	// dimensions reached through a single, unambiguous many-to-many bridge are
+	// available too
 	SemanticBridgeResolver resolver(*model);
 	auto result = make_uniq<RowsFunctionData>();
 	for (idx_t d = 0; d < model->members.size(); d++) {
@@ -180,7 +181,7 @@ static string TagList(const vector<ParsedSemanticTag> &tags) {
 }
 
 static unique_ptr<FunctionData> DescribeBind(ClientContext &context, TableFunctionBindInput &input,
-                                             vector<LogicalType> &return_types, vector<string> &names) {
+                                             vector<LogicalType> &return_types, vector<Identifier> &names) {
 	names = {"object_kind", "object_name", "parent_entity", "property", "property_value"};
 	return_types = vector<LogicalType>(5, LogicalType::VARCHAR);
 	auto model = GetSemanticViewsState(input).registry.GetOrThrow(context, NameArguments(input, 0));
@@ -300,7 +301,7 @@ static unique_ptr<FunctionData> DescribeBind(ClientContext &context, TableFuncti
 // SHOW SEMANTIC MATERIALIZATIONS [IN view]
 //===--------------------------------------------------------------------===//
 static unique_ptr<FunctionData> ShowMaterializationsBind(ClientContext &context, TableFunctionBindInput &input,
-                                                         vector<LogicalType> &return_types, vector<string> &names) {
+                                                         vector<LogicalType> &return_types, vector<Identifier> &names) {
 	names = {"database_name",
 	         "schema_name",
 	         "semantic_view_name",

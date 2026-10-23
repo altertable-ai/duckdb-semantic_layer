@@ -1,5 +1,5 @@
 # name: test/sql/semantic_layer/parser_passthrough.test
-# description: ordinary SQL is unaffected by the semantic_layer parser extension
+# description: ordinary SQL is unaffected by the semantic_layer grammar extension
 # group: [semantic_layer]
 
 require semantic_layer
@@ -27,13 +27,13 @@ SELECT count(*) FROM v;
 ----
 3
 
-# a syntax error that has nothing to do with semantic views keeps the postgres message
+# a syntax error that has nothing to do with semantic views keeps DuckDB's message
 statement error
 SELEC 1;
 ----
 syntax error at or near "SELEC"
 
-# the vendored PEG parser is wired in and round-trips SQL
+# the semantic_layer grammar is wired in and round-trips SQL
 query I
 SELECT rewritten_sql FROM semantic_layer_peg_parse('SELECT 1 AS x');
 ----

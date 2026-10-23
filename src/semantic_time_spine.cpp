@@ -24,11 +24,11 @@ SemanticTable SemanticTimeSpineTable() {
 	spine.comment = "Time spine";
 	// SELECT CAST(NULL AS DATE) AS day WHERE FALSE
 	auto rows = make_uniq<SelectNode>();
-	auto day = make_uniq<CastExpression>(LogicalType::DATE, make_uniq<ConstantExpression>(Value()));
-	day->alias = SEMANTIC_TIME_SPINE_COLUMN;
+	auto day = make_uniq<CastExpression>(LogicalType::DATE, ConstantExpression::FromValue(Value()));
+	day->SetAlias(Identifier(SEMANTIC_TIME_SPINE_COLUMN));
 	rows->select_list.push_back(std::move(day));
 	rows->from_table = make_uniq<EmptyTableRef>();
-	rows->where_clause = make_uniq<ConstantExpression>(Value::BOOLEAN(false));
+	rows->where_clause = ConstantExpression::FromValue(Value::BOOLEAN(false));
 	spine.source = MakeSubqueryRef(std::move(rows), string());
 	spine.column_names = {SEMANTIC_TIME_SPINE_COLUMN};
 	spine.column_types = {LogicalType::DATE};
@@ -48,7 +48,7 @@ vector<unique_ptr<ParsedSemanticMember>> SemanticTimeSpineDimensions() {
 		dimension->expression = ColumnRef(SEMANTIC_TIME_SPINE_COLUMN);
 		if (dimension->name != SEMANTIC_TIME_SPINE_COLUMN) {
 			vector<unique_ptr<ParsedExpression>> arguments;
-			arguments.push_back(make_uniq<ConstantExpression>(Value(grain)));
+			arguments.push_back(ConstantExpression::FromValue(Value(grain)));
 			arguments.push_back(std::move(dimension->expression));
 			dimension->expression =
 			    make_uniq<CastExpression>(LogicalType::DATE, Call("date_trunc", std::move(arguments)));
