@@ -63,7 +63,7 @@ vector<idx_t> FindCycle(const vector<vector<idx_t>> &next) {
 
 class SemanticModelBuilder {
 public:
-	SemanticModelBuilder(ClientContext &context, const ParsedSemanticView &parsed, const QualifiedName &name)
+	SemanticModelBuilder(ClientContext &context, const ParsedSemanticView &parsed, const SemanticQualifiedName &name)
 	    : context(context), model(NewModel(parsed, name)), definition(*model->definition) {
 	}
 
@@ -88,7 +88,7 @@ public:
 	}
 
 private:
-	static shared_ptr<SemanticModel> NewModel(const ParsedSemanticView &parsed, const QualifiedName &name) {
+	static shared_ptr<SemanticModel> NewModel(const ParsedSemanticView &parsed, const SemanticQualifiedName &name) {
 		auto result = make_shared_ptr<SemanticModel>();
 		result->definition = parsed.Copy();
 		result->definition->name = name;
@@ -129,7 +129,7 @@ private:
 		statement.node = std::move(node);
 		auto binder = Binder::CreateBinder(context);
 		auto bound = binder->Bind(statement.Cast<SQLStatement>());
-		table.column_names = bound.names;
+		table.column_names = IdentifiersToStrings(bound.names);
 		table.column_types = bound.types;
 		for (idx_t i = 0; i < table.column_names.size(); i++) {
 			table.columns[table.column_names[i]] = i;
@@ -142,20 +142,16 @@ private:
 			if (parsed.source->type == TableReferenceType::BASE_TABLE) {
 				auto &base = parsed.source->Cast<BaseTableRef>();
 				// `x.table`: x may be a schema of the default database or a database (as in DuckDB's binder)
-				auto catalog_name = base.catalog_name;
-				auto schema_name = base.schema_name;
-				Binder::BindSchemaOrCatalog(context, catalog_name, schema_name);
-				EntryLookupInfo lookup(CatalogType::TABLE_ENTRY, base.table_name);
-				auto &entry = Catalog::GetEntry(context, catalog_name, schema_name, lookup);
-				table.catalog_name = entry.ParentCatalog().GetName();
-				table.schema_name = entry.ParentSchema().name;
-				table.table_name = entry.name;
+				auto name = base.GetQualifiedName();
+				Binder::BindSchemaOrCatalog(context, name);
+				auto &entry = Catalog::GetEntry(context, EntryLookupInfo(CatalogType::TABLE_ENTRY, name));
+				table.catalog_name = entry.ParentCatalog().GetName().GetIdentifierName();
+				table.schema_name = entry.ParentSchema().name.GetIdentifierName();
+				table.table_name = entry.name.GetIdentifierName();
 				auto qualified = make_uniq<BaseTableRef>();
-				qualified->catalog_name = table.catalog_name;
-				qualified->schema_name = table.schema_name;
-				qualified->table_name = table.table_name;
+				qualified->SetQualifiedName(entry.ParentCatalog().GetName(), entry.ParentSchema().name, entry.name);
 				table.source = std::move(qualified);
-				table.name = parsed.alias.empty() ? base.table_name : parsed.alias;
+				table.name = parsed.alias.empty() ? base.Table().GetIdentifierName() : parsed.alias;
 			} else {
 				if (parsed.alias.empty()) {
 					Fail("a logical table defined by a query needs an alias (<alias> AS (<query>))");
@@ -505,7 +501,7 @@ private:
 	//! Binds SELECT CAST(CAST(NULL AS <type>) + <interval> AS <type>)
 	void CheckOffsetType(const SemanticOffset &offset, const string &what) {
 		auto error = BindError(SemanticShiftColumn(
-		    make_uniq<CastExpression>(offset.type, make_uniq<ConstantExpression>(Value())), offset));
+		    make_uniq<CastExpression>(offset.type, ConstantExpression::FromValue(Value())), offset));
 		if (!error.empty()) {
 			Fail("%s: cannot shift column \"%s.%s\" (%s) by %s: %s", what, model->tables[offset.table].name,
 			     offset.column, offset.type.ToString(), offset.interval->ToString(), error);
@@ -559,7 +555,7 @@ private:
 	//! Binds SELECT <window condition over CAST(NULL AS <type>)>
 	void CheckCumulativeType(const SemanticCumulative &cumulative, const string &what) {
 		auto null = [&]() {
-			return make_uniq<CastExpression>(cumulative.type, make_uniq<ConstantExpression>(Value()));
+			return make_uniq<CastExpression>(cumulative.type, ConstantExpression::FromValue(Value()));
 		};
 		auto error = BindError(SemanticCumulativeWindow(cumulative, null(), null()));
 		if (error.empty()) {
@@ -800,7 +796,7 @@ private:
 } // namespace
 
 shared_ptr<SemanticModel> BuildSemanticModel(ClientContext &context, const ParsedSemanticView &definition,
-                                             const QualifiedName &resolved_name) {
+                                             const SemanticQualifiedName &resolved_name) {
 	SemanticModelBuilder builder(context, definition, resolved_name);
 	return builder.Build();
 }

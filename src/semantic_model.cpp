@@ -283,7 +283,7 @@ SemanticRef SemanticModel::Lookup(const vector<string> &names, const SemanticRes
 static unique_ptr<ParsedExpression> ResolveColumnRef(const SemanticModel &model, const ColumnRefExpression &colref,
                                                      const SemanticResolveContext &context) {
 	string error;
-	auto ref = model.Lookup(colref.column_names, context, error);
+	auto ref = model.Lookup(IdentifiersToStrings(colref.ColumnNames()), context, error);
 	switch (ref.kind) {
 	case SemanticRefKind::MEMBER:
 		if (!context.allow_private && model.members[ref.index].IsPrivate()) {
@@ -305,9 +305,9 @@ static void ResolveRecursive(const SemanticModel &model, unique_ptr<ParsedExpres
 		if (!SemanticMarkers::Classify(colref).Is(SemanticRefKind::NONE)) {
 			return;
 		}
-		auto alias = expr->alias;
+		auto alias = expr->GetAlias();
 		expr = ResolveColumnRef(model, colref, context);
-		expr->alias = alias;
+		expr->SetAlias(Identifier(alias));
 		return;
 	}
 	if (expr->GetExpressionClass() == ExpressionClass::STAR) {

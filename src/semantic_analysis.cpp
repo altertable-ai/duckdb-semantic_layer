@@ -24,17 +24,17 @@ bool SemanticAnalyzer::IsAggregate(const ParsedExpression &expr) {
 		return false;
 	}
 	auto &function = expr.Cast<FunctionExpression>();
-	if (function.is_operator) {
+	if (function.IsOperator()) {
 		return false;
 	}
-	auto key = function.catalog + "." + function.schema + "." + function.function_name;
+	auto &function_name = function.GetQualifiedName();
+	auto key = function_name.ToString();
 	auto entry = aggregate_cache.find(key);
 	if (entry != aggregate_cache.end()) {
 		return entry->second;
 	}
-	EntryLookupInfo lookup(CatalogType::AGGREGATE_FUNCTION_ENTRY, function.function_name);
-	auto catalog_entry =
-	    Catalog::GetEntry(context, function.catalog, function.schema, lookup, OnEntryNotFound::RETURN_NULL);
+	auto catalog_entry = Catalog::GetEntry(
+	    context, EntryLookupInfo(CatalogType::AGGREGATE_FUNCTION_ENTRY, function_name), OnEntryNotFound::RETURN_NULL);
 	bool is_aggregate = catalog_entry && catalog_entry->type == CatalogType::AGGREGATE_FUNCTION_ENTRY;
 	aggregate_cache[key] = is_aggregate;
 	return is_aggregate;
@@ -146,13 +146,13 @@ void SemanticAnalyzer::WindowDimensions(const ParsedExpression &expr, set<idx_t>
 			}
 			ParsedExpressionIterator::EnumerateChildren(key, collect);
 		};
-		for (auto &partition : window.partitions) {
+		for (auto &partition : window.Partitions()) {
 			collect(*partition);
 		}
-		for (auto &order : window.orders) {
+		for (auto &order : window.OrderBy()) {
 			collect(*order.expression);
 		}
-		for (auto &order : window.arg_orders) {
+		for (auto &order : window.ArgOrders()) {
 			collect(*order.expression);
 		}
 	}
@@ -221,13 +221,13 @@ void SemanticAnalyzer::ApplyMetricContext(SemanticAtom &atom, const string &what
 		atom.row_filters = std::move(atom.context.filters);
 	} else if (!atom.context.filters.empty()) {
 		vector<unique_ptr<ParsedExpression>> conditions;
-		if (aggregate.filter) {
-			conditions.push_back(std::move(aggregate.filter));
+		if (aggregate.Filter()) {
+			conditions.push_back(std::move(aggregate.FilterMutable()));
 		}
 		for (auto metric : atom.context.filters) {
 			conditions.push_back(model.members[metric].filter->Copy());
 		}
-		aggregate.filter = AndAll(std::move(conditions));
+		aggregate.FilterMutable() = AndAll(std::move(conditions));
 	}
 	atom.context.filters.clear();
 }
@@ -243,7 +243,7 @@ unique_ptr<ParsedExpression> SemanticAnalyzer::Decompose(const ParsedExpression 
 	auto result = expr.Copy();
 	std::function<void(unique_ptr<ParsedExpression> &)> rewrite_window_key;
 	std::function<void(unique_ptr<ParsedExpression> &)> rewrite = [&](unique_ptr<ParsedExpression> &node) {
-		auto alias = node->alias;
+		auto alias = node->GetAlias();
 		if (IsAggregate(*node)) {
 			SemanticAtom atom;
 			atom.home = AggregateHome(node->Cast<FunctionExpression>(), context.table, what);
@@ -252,7 +252,7 @@ unique_ptr<ParsedExpression> SemanticAnalyzer::Decompose(const ParsedExpression 
 			ApplyMetricContext(atom, what);
 			atoms.push_back(std::move(atom));
 			node = SemanticMarkers::Atom(atoms.size() - 1);
-			node->alias = alias;
+			node->SetAlias(Identifier(alias));
 			return;
 		}
 		auto ref = SemanticMarkers::Classify(*node);
@@ -263,7 +263,7 @@ unique_ptr<ParsedExpression> SemanticAnalyzer::Decompose(const ParsedExpression 
 				                                  model.MemberDisplayName(ref.index));
 			}
 			node = Decompose(*model.members[ref.index].resolved, MetricContext(ref.index, context), atoms, what);
-			node->alias = alias;
+			node->SetAlias(Identifier(alias));
 			return;
 		case SemanticRefKind::COLUMN:
 			throw SemanticDefinitionException("%s cannot reference \"%s.%s\" outside of an aggregate", what,
@@ -273,22 +273,21 @@ unique_ptr<ParsedExpression> SemanticAnalyzer::Decompose(const ParsedExpression 
 		}
 		if (node->GetExpressionClass() == ExpressionClass::WINDOW) {
 			auto &window = node->Cast<WindowExpression>();
-			for (auto &child : window.children) {
-				rewrite(child);
+			for (auto &argument : window.GetArgumentsMutable()) {
+				rewrite(argument.GetExpressionMutable());
 			}
-			for (auto *argument : {&window.filter_expr, &window.start_expr, &window.end_expr, &window.offset_expr,
-			                       &window.default_expr}) {
+			for (auto *argument : {&window.FilterMutable(), &window.StartExprMutable(), &window.EndExprMutable()}) {
 				if (*argument) {
 					rewrite(*argument);
 				}
 			}
-			for (auto &partition : window.partitions) {
+			for (auto &partition : window.PartitionsMutable()) {
 				rewrite_window_key(partition);
 			}
-			for (auto &order : window.orders) {
+			for (auto &order : window.OrderByMutable()) {
 				rewrite_window_key(order.expression);
 			}
-			for (auto &order : window.arg_orders) {
+			for (auto &order : window.ArgOrdersMutable()) {
 				rewrite_window_key(order.expression);
 			}
 			return;
@@ -301,8 +300,8 @@ unique_ptr<ParsedExpression> SemanticAnalyzer::Decompose(const ParsedExpression 
 			return;
 		}
 		if (SemanticMarkers::IsExcluding(*node)) {
-			for (auto &child : node->Cast<FunctionExpression>().children) {
-				auto excluded = SemanticMarkers::Classify(*child);
+			for (auto &argument : node->Cast<FunctionExpression>().GetArguments()) {
+				auto excluded = SemanticMarkers::Classify(argument.GetExpression());
 				if (!excluded.Is(SemanticRefKind::MEMBER) || !model.members[excluded.index].IsRowLevel()) {
 					throw SemanticDefinitionException("%s: PARTITION BY EXCLUDING only accepts dimensions", what);
 				}

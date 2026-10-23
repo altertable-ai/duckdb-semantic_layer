@@ -12,7 +12,7 @@ namespace duckdb {
 
 //! A DDL statement: validated at bind time, applied to the registry when executed (not by EXPLAIN)
 struct SemanticDDLData : public TableFunctionData {
-	explicit SemanticDDLData(shared_ptr<SemanticViewsState> state_p, QualifiedName name_p)
+	explicit SemanticDDLData(shared_ptr<SemanticViewsState> state_p, SemanticQualifiedName name_p)
 	    : state(std::move(state_p)), name(std::move(name_p)) {
 	}
 	virtual string Execute(ClientContext &context) const = 0;
@@ -22,7 +22,7 @@ struct SemanticDDLData : public TableFunctionData {
 	}
 
 	shared_ptr<SemanticViewsState> state;
-	QualifiedName name;
+	SemanticQualifiedName name;
 };
 
 struct SemanticDDLState : public GlobalTableFunctionState {
@@ -48,7 +48,7 @@ static OnEntryNotFound IfNotFound(bool if_exists) {
 	return if_exists ? OnEntryNotFound::RETURN_NULL : OnEntryNotFound::THROW_EXCEPTION;
 }
 
-static void StatusColumn(vector<LogicalType> &return_types, vector<string> &names) {
+static void StatusColumn(vector<LogicalType> &return_types, vector<Identifier> &names) {
 	names.emplace_back("status");
 	return_types.emplace_back(LogicalType::VARCHAR);
 }
@@ -71,7 +71,7 @@ struct SemanticCreateData : public SemanticDDLData {
 				    AdoptMaterializationStates(*model, *previous);
 			    }
 			    ApplySemanticMaterializationChange(context, previous, model, {}, obsolete, [&] {
-				    ApplySemanticViewChange(context, QualifiedName(), model.get());
+				    ApplySemanticViewChange(context, SemanticQualifiedName(), model.get());
 			    });
 		    })) {
 			return "Semantic view " + DisplayName() + " successfully created.";
@@ -84,7 +84,7 @@ struct SemanticCreateData : public SemanticDDLData {
 };
 
 static unique_ptr<FunctionData> SemanticCreateBind(ClientContext &context, TableFunctionBindInput &input,
-                                                   vector<LogicalType> &return_types, vector<string> &names) {
+                                                   vector<LogicalType> &return_types, vector<Identifier> &names) {
 	StatusColumn(return_types, names);
 	auto definition = SemanticLowering::Decode<ParsedSemanticView>(input.inputs[0]);
 	auto &state = input.info->Cast<SemanticViewsFunctionInfo>().state;
@@ -92,9 +92,10 @@ static unique_ptr<FunctionData> SemanticCreateBind(ClientContext &context, Table
 	result->on_conflict = EnumUtil::FromString<OnCreateConflict>(StringArgument(input, 1));
 	bool skip = result->on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT && state->registry.Get(result->name);
 	if (!skip) {
-		BindSemanticViewChange(context, input.binder, QualifiedName(), result->name);
+		BindSemanticViewChange(context, input.binder, SemanticQualifiedName(), result->name);
 		result->model = BuildSemanticModel(context, *definition, result->name);
-		// materializations stored for this view (e.g. before a restart) come back with it
+		// materializations stored for this view (e.g. before a restart) come back
+		// with it
 		result->obsolete = RestoreSemanticMaterializations(context, *result->model);
 	}
 	return std::move(result);
@@ -125,14 +126,14 @@ struct SemanticDropData : public SemanticDDLData {
 };
 
 static unique_ptr<FunctionData> SemanticDropBind(ClientContext &context, TableFunctionBindInput &input,
-                                                 vector<LogicalType> &return_types, vector<string> &names) {
+                                                 vector<LogicalType> &return_types, vector<Identifier> &names) {
 	StatusColumn(return_types, names);
 	auto if_exists = BooleanValue::Get(input.inputs[3]);
 	auto result = make_uniq<SemanticDropData>(
 	    input.info->Cast<SemanticViewsFunctionInfo>().state,
 	    SemanticViewRegistry::ResolveDDLName(context, NameArguments(input, 0), IfNotFound(if_exists)));
 	result->if_exists = if_exists;
-	BindSemanticViewChange(context, input.binder, result->name, QualifiedName());
+	BindSemanticViewChange(context, input.binder, result->name, SemanticQualifiedName());
 	return std::move(result);
 }
 
@@ -169,7 +170,8 @@ struct SemanticAlterData : public SemanticDDLData {
 
 template <class EDIT>
 static unique_ptr<FunctionData> SemanticAlterBind(ClientContext &context, TableFunctionBindInput &input,
-                                                  vector<LogicalType> &return_types, vector<string> &names, EDIT edit) {
+                                                  vector<LogicalType> &return_types, vector<Identifier> &names,
+                                                  EDIT edit) {
 	StatusColumn(return_types, names);
 	auto &state = input.info->Cast<SemanticViewsFunctionInfo>().state;
 	auto if_exists = BooleanValue::Get(input.inputs[3]);
@@ -198,21 +200,22 @@ static unique_ptr<FunctionData> SemanticAlterBind(ClientContext &context, TableF
 }
 
 static unique_ptr<FunctionData> SemanticRenameBind(ClientContext &context, TableFunctionBindInput &input,
-                                                   vector<LogicalType> &return_types, vector<string> &names) {
+                                                   vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto new_name = StringArgument(input, 4);
 	return SemanticAlterBind(context, input, return_types, names,
 	                         [&](ParsedSemanticView &definition) { definition.name.name = new_name; });
 }
 
 static unique_ptr<FunctionData> SemanticSetCommentBind(ClientContext &context, TableFunctionBindInput &input,
-                                                       vector<LogicalType> &return_types, vector<string> &names) {
+                                                       vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto comment = StringArgument(input, 4);
 	return SemanticAlterBind(context, input, return_types, names,
 	                         [&](ParsedSemanticView &definition) { definition.comment = comment; });
 }
 
 static unique_ptr<FunctionData> SemanticSetMaxStalenessBind(ClientContext &context, TableFunctionBindInput &input,
-                                                            vector<LogicalType> &return_types, vector<string> &names) {
+                                                            vector<LogicalType> &return_types,
+                                                            vector<Identifier> &names) {
 	auto &seconds = input.inputs[4];
 	if (!seconds.IsNull() && seconds.GetValue<int64_t>() < 0) {
 		throw BinderException("MAX_STALENESS must not be negative");
@@ -237,7 +240,7 @@ static idx_t FindMaterialization(const ParsedSemanticView &definition, const str
 
 static unique_ptr<FunctionData> SemanticAddMaterializationBind(ClientContext &context, TableFunctionBindInput &input,
                                                                vector<LogicalType> &return_types,
-                                                               vector<string> &names) {
+                                                               vector<Identifier> &names) {
 	auto payload = SemanticLowering::Decode<ParsedSemanticMaterializationPayload>(input.inputs[4]);
 	auto materialization = &payload->materialization;
 	auto if_not_exists = BooleanValue::Get(input.inputs[5]);
@@ -263,7 +266,7 @@ static unique_ptr<FunctionData> SemanticAddMaterializationBind(ClientContext &co
 
 static unique_ptr<FunctionData> SemanticDropMaterializationBind(ClientContext &context, TableFunctionBindInput &input,
                                                                 vector<LogicalType> &return_types,
-                                                                vector<string> &names) {
+                                                                vector<Identifier> &names) {
 	auto name = StringArgument(input, 4);
 	auto if_exists = BooleanValue::Get(input.inputs[5]);
 	return SemanticAlterBind(context, input, return_types, names, [&](ParsedSemanticView &definition) {
@@ -301,7 +304,7 @@ struct SemanticRefreshData : public SemanticDDLData {
 static unique_ptr<FunctionData> SemanticRefreshMaterializationBind(ClientContext &context,
                                                                    TableFunctionBindInput &input,
                                                                    vector<LogicalType> &return_types,
-                                                                   vector<string> &names) {
+                                                                   vector<Identifier> &names) {
 	StatusColumn(return_types, names);
 	auto &state = input.info->Cast<SemanticViewsFunctionInfo>().state;
 	auto if_exists = BooleanValue::Get(input.inputs[3]);

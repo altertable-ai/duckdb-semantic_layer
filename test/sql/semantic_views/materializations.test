@@ -283,7 +283,7 @@ shop__fine__0
 
 # the metadata records every materialization (definition, tables, watermark), under the view's current name
 query III
-SELECT view_name, name, list_transform(tables, t -> regexp_replace(t, '__[0-9a-f]{32}$', '')) FROM __semantic_materializations.__sv_materializations;
+SELECT view_name, name, list_transform(tables, lambda t: regexp_replace(t, '__[0-9a-f]{32}$', '')) FROM __semantic_materializations.__sv_materializations;
 ----
 store	fine	[shop__fine__0]
 

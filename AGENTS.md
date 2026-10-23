@@ -8,12 +8,13 @@ Instructions for AI agents working in this repository.
   (`CREATE SEMANTIC VIEW`, `SEMANTIC_VIEW(...)` queries, `SHOW` / `DESCRIBE`).
 - Design overview: `README.md` ("How it works"). Local design notes and plans go in `docs/superpowers/`
   (git-ignored, like `.superpowers/` and `.cache/`).
-- Parsing uses a vendored copy of DuckDB's PEG parser (`third_party/duckdb_peg_parser`, namespace
-  `duckdb::semantic_views_peg`), reached through `parse_function` when the postgres parser fails.
+- Parsing is a grammar extension of DuckDB's PEG parser (`src/parser/semantic_views_grammar.cpp`): rules added to
+  DuckDB's grammar and transforms lowering the statements onto internal table functions. It is activated on every
+  connection when the extension loads.
 - Semantic queries are expanded at bind time into plain DuckDB SQL ASTs (no custom operators).
 - Submodules:
-  - DuckDB (`./duckdb`) — pinned to tag `v1.5.5`
-  - Extension CI Tools (`./extension-ci-tools`) — branch `v1.5.5`
+  - DuckDB (`./duckdb`) — pinned to tag `v2.0.0`
+  - Extension CI Tools (`./extension-ci-tools`) — branch `v2.0-cyanoptera`
 
 **IMPORTANT**: Never modify files in `./duckdb` or `./extension-ci-tools` unless explicitly instructed.
 
@@ -34,8 +35,11 @@ Instructions for AI agents working in this repository.
 - SQL tests: `make test` or `./build/release/test/unittest "test/sql/*"`
 - Single test: `./build/release/test/unittest test/sql/semantic_views/<file>.test`
 
-## PEG parser maintenance
+## Grammar
 
-- `scripts/sync_duckdb_peg_parser.sh` — re-vendor from `duckdb/extension/autocomplete`, apply `custom/` + `patches/`.
-- `scripts/regenerate_duckdb_peg_parser.sh` — after editing `.gram` files or keyword lists.
-- `scripts/make_peg_patch.sh` — after editing patched vendored files, refresh the patch.
+- Rules are plain strings in `SEMANTIC_VIEW_RULES`, one PEG rule per entry, reusing DuckDB's rules (`Expression`,
+  `QualifiedName`, `ColId`, ...). Each transform reads its rule's children by position: keep the comment above it in
+  sync with the rule.
+- New result types of transforms must be registered with `DUCKDB_REGISTER_TRANSFORM_RESULT_TYPE`.
+- The grammar changes `Statement`, `ExplainableStatements`, `InnerTableRef` and `WindowPartition`, so it is active for
+  every query: after a DuckDB bump, also run DuckDB's own parser tests with the extension loaded.

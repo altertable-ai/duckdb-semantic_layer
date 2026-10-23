@@ -23,14 +23,14 @@ SemanticSourceTable ClassifySemanticSource(ClientContext &context, const Semanti
 		reason = "logical table \"" + logical.name + "\" is defined by a query";
 		return SemanticSourceTable();
 	}
-	auto catalog = Catalog::GetCatalogEntry(context, logical.catalog_name);
+	auto catalog = Catalog::GetCatalogEntry(context, Identifier(logical.catalog_name));
 	if (!catalog || catalog->GetCatalogType() != DUCKLAKE_CATALOG_TYPE) {
 		reason = "logical table \"" + logical.name + "\" reads " + logical.catalog_name + "." + logical.schema_name +
 		         "." + logical.table_name + ", which is not a DuckLake table";
 		return SemanticSourceTable();
 	}
-	EntryLookupInfo lookup(CatalogType::TABLE_ENTRY, logical.table_name);
-	auto entry = catalog->GetEntry(context, logical.schema_name, lookup, OnEntryNotFound::RETURN_NULL);
+	auto entry = catalog->GetEntry(context, CatalogType::TABLE_ENTRY, Identifier(logical.schema_name),
+	                               Identifier(logical.table_name), OnEntryNotFound::RETURN_NULL);
 	if (!entry || entry->type != CatalogType::TABLE_ENTRY) {
 		reason = "logical table \"" + logical.name + "\" reads a DuckLake view";
 		return SemanticSourceTable();
@@ -46,10 +46,10 @@ SemanticChangeTracker::SemanticChangeTracker(ClientContext &context) : connectio
 }
 
 static string Literal(const string &value) {
-	return KeywordHelper::WriteQuoted(value, '\'');
+	return SQLString::ToString(value);
 }
 
-unique_ptr<MaterializedQueryResult> SemanticChangeTracker::Run(const string &sql) {
+unique_ptr<QueryResult> SemanticChangeTracker::Run(const string &sql) {
 	auto result = connection.Query(sql);
 	if (result->HasError()) {
 		result->ThrowError("semantic view materialization: ");
@@ -78,17 +78,18 @@ SemanticCatalogChanges SemanticChangeTracker::CatalogChanges(const string &catal
 	SemanticCatalogChanges changes;
 	vector<pair<idx_t, pair<string, string>>> raw;
 	for (idx_t row = 0; row < result->RowCount(); row++) {
-		auto kind = result->GetValue(0, row).ToString();
-		auto snapshot = result->GetValue(3, row);
+		auto kind = result->Collection().GetValue(0, row).ToString();
+		auto snapshot = result->Collection().GetValue(3, row);
 		if (kind == "current") {
 			changes.current = snapshot.GetValue<idx_t>();
 		} else if (kind == "available") {
 			changes.available = snapshot.GetValue<int64_t>() > 0;
 		} else if (kind == "table") {
-			changes.tables.push_back(
-			    {result->GetValue(1, row).ToString(), snapshot.ToString(), result->GetValue(2, row).ToString()});
-		} else if (!result->GetValue(1, row).IsNull()) {
-			raw.emplace_back(snapshot.GetValue<idx_t>(), make_pair(kind, result->GetValue(1, row).ToString()));
+			changes.tables.push_back({result->Collection().GetValue(1, row).ToString(), snapshot.ToString(),
+			                          result->Collection().GetValue(2, row).ToString()});
+		} else if (!result->Collection().GetValue(1, row).IsNull()) {
+			raw.emplace_back(snapshot.GetValue<idx_t>(),
+			                 make_pair(kind, result->Collection().GetValue(1, row).ToString()));
 		}
 	}
 	// snapshots committed after the current one was read belong to the next refresh
@@ -178,10 +179,8 @@ string SemanticChangeTracker::ChangesSQL(const SemanticSourceTable &table, idx_t
 
 unique_ptr<TableRef> SemanticChangeTracker::AtSnapshot(const SemanticSourceTable &table, idx_t snapshot) {
 	auto ref = make_uniq<BaseTableRef>();
-	ref->catalog_name = table.catalog;
-	ref->schema_name = table.schema;
-	ref->table_name = table.table;
-	ref->at_clause = make_uniq<AtClause>("VERSION", make_uniq<ConstantExpression>(Value::UBIGINT(snapshot)));
+	ref->SetQualifiedName(Identifier(table.catalog), Identifier(table.schema), Identifier(table.table));
+	ref->at_clause = make_uniq<AtClause>("VERSION", ConstantExpression::FromValue(Value::UBIGINT(snapshot)));
 	return std::move(ref);
 }
 

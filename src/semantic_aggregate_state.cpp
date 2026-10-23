@@ -30,14 +30,14 @@ string SemanticAggregateKindToString(SemanticAggregateKind kind) {
 
 SemanticAggregateKind ClassifySemanticAggregate(const ParsedExpression &expr, const LogicalType &type) {
 	auto &function = expr.Cast<FunctionExpression>();
-	if (function.distinct || function.export_state || (function.order_bys && !function.order_bys->orders.empty())) {
+	if (function.Distinct() || function.ExportState() || (function.OrderBy() && !function.OrderBy()->orders.empty())) {
 		return SemanticAggregateKind::OPAQUE;
 	}
-	auto name = StringUtil::Lower(function.function_name);
-	if (name == "count_star" && function.children.empty()) {
+	auto name = StringUtil::Lower(function.FunctionName().GetIdentifierName());
+	if (name == "count_star" && ArgumentCount(function) == 0) {
 		return SemanticAggregateKind::COUNT;
 	}
-	if (function.children.size() != 1) {
+	if (ArgumentCount(function) != 1) {
 		return SemanticAggregateKind::OPAQUE;
 	}
 	if (name == "sum") {
@@ -76,7 +76,7 @@ vector<string> SemanticMaterializedAtom::StateColumns() const {
 }
 
 static unique_ptr<ParsedExpression> Call(const string &name, vector<unique_ptr<ParsedExpression>> children) {
-	return make_uniq<FunctionExpression>(name, std::move(children));
+	return make_uniq<FunctionExpression>(Identifier(name), std::move(children));
 }
 
 static unique_ptr<ParsedExpression> Call(const string &name, unique_ptr<ParsedExpression> child) {
@@ -89,8 +89,8 @@ vector<unique_ptr<ParsedExpression>> SemanticStateExpressions(const SemanticMate
                                                               const FunctionExpression &compiled) {
 	// the same aggregate (and FILTER) over the same argument, decomposed into its state
 	auto over_argument = [&](const string &name) {
-		auto result = Call(name, compiled.children[0]->Copy());
-		result->Cast<FunctionExpression>().filter = compiled.filter ? compiled.filter->Copy() : nullptr;
+		auto result = Call(name, Argument(compiled, 0).Copy());
+		result->Cast<FunctionExpression>().FilterMutable() = compiled.Filter() ? compiled.Filter()->Copy() : nullptr;
 		return result;
 	};
 	vector<unique_ptr<ParsedExpression>> result;
@@ -106,7 +106,7 @@ vector<unique_ptr<ParsedExpression>> SemanticStateExpressions(const SemanticMate
 	}
 	auto columns = atom.StateColumns();
 	for (idx_t c = 0; c < result.size(); c++) {
-		result[c]->alias = columns[c];
+		result[c]->SetAlias(Identifier(columns[c]));
 	}
 	return result;
 }
@@ -123,15 +123,15 @@ unique_ptr<ParsedExpression> SemanticRollupExpression(const SemanticMaterialized
 	case SemanticAggregateKind::COUNT: {
 		// COUNT over no rows is 0, SUM over no rows is NULL
 		auto coalesce = make_uniq<OperatorExpression>(ExpressionType::OPERATOR_COALESCE);
-		coalesce->children.push_back(Call("sum", column("_cnt")));
-		coalesce->children.push_back(make_uniq<ConstantExpression>(Value::BIGINT(0)));
+		coalesce->GetChildrenMutable().push_back(Call("sum", column("_cnt")));
+		coalesce->GetChildrenMutable().push_back(ConstantExpression::FromValue(Value::BIGINT(0)));
 		result = std::move(coalesce);
 		break;
 	}
 	case SemanticAggregateKind::AVG: {
 		vector<unique_ptr<ParsedExpression>> count;
 		count.push_back(Call("sum", column("_cnt")));
-		count.push_back(make_uniq<ConstantExpression>(Value::BIGINT(0)));
+		count.push_back(ConstantExpression::FromValue(Value::BIGINT(0)));
 		vector<unique_ptr<ParsedExpression>> division;
 		division.push_back(make_uniq<CastExpression>(LogicalType::DOUBLE, Call("sum", column("_sum"))));
 		division.push_back(Call("nullif", std::move(count)));

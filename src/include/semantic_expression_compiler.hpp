@@ -44,7 +44,7 @@ public:
 		auto ref = SemanticMarkers::Classify(expr);
 		if (ref.Is(SemanticRefKind::ATOM)) {
 			auto result = replacement(ref.index);
-			result->alias = expr.alias;
+			result->SetAlias(expr.GetAlias());
 			return result;
 		}
 		auto result = expr.Copy();

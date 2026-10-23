@@ -1,0 +1,64 @@
+# name: test/sql/semantic_views/grammar_activation.test
+# description: the semantic_views grammar extension: activation, unreserved clause keywords, opt-out
+# group: [semantic_views]
+
+require semantic_views
+
+statement ok
+CREATE TABLE orders AS SELECT range AS id, range % 2 AS status, range * 10 AS amount FROM range(4);
+
+query I
+SELECT list_contains(current_setting('active_grammar_extensions'), 'semantic_views');
+----
+true
+
+statement ok
+CREATE SEMANTIC VIEW shop TABLES (o AS orders PRIMARY KEY (id)) DIMENSIONS (o.status AS status) METRICS (o.revenue AS SUM(amount));
+
+# the clause keywords stay usable as names
+query III
+SELECT 1 AS dimensions, 2 AS metrics, 3 AS semantic;
+----
+1	2	3
+
+statement ok
+CREATE TABLE tables (facts INTEGER);
+
+# connections opened after LOAD parse the syntax too
+query II con2
+SELECT * FROM SEMANTIC_VIEW(shop DIMENSIONS o.status METRICS o.revenue) ORDER BY status;
+----
+0	20
+1	40
+
+# a connection can opt out, then back in
+statement ok
+SET active_grammar_extensions = [];
+
+statement error
+SHOW SEMANTIC VIEWS;
+----
+syntax error
+
+# semantic_views_peg_parse always uses the extension grammar
+query I
+SELECT count(*) FROM semantic_views_peg_parse('SHOW SEMANTIC VIEWS');
+----
+1
+
+statement ok
+SET active_grammar_extensions = ['semantic_views'];
+
+query I
+SELECT name FROM (SHOW SEMANTIC VIEWS);
+----
+shop
+
+# PARTITION BY without EXCLUDING is DuckDB's own
+query II
+SELECT id, sum(amount) OVER (PARTITION BY status) FROM orders ORDER BY id;
+----
+0	20
+1	40
+2	20
+3	40

@@ -28,9 +28,7 @@ class StandardFormRewriter {
 public:
 	StandardFormRewriter(ClientContext &context, const SemanticModel &model, const BaseTableRef &ref)
 	    : model(model), analyzer(model, context), ref(ref) {
-		query.view.catalog = ref.catalog_name;
-		query.view.schema = ref.schema_name;
-		query.view.name = ref.table_name;
+		query.view = SemanticQualifiedName::FromQualifiedName(ref.GetQualifiedName());
 	}
 
 	void Rewrite(SelectNode &node) {
@@ -108,8 +106,8 @@ private:
 	void NormalizeClauses(const SelectNode &node, const vector<unique_ptr<ParsedExpression> *> &orders) {
 		for (auto &expr : node.select_list) {
 			select.push_back(Normalize(*expr));
-			select.back()->alias = expr->alias;
-			select_aliases.push_back(expr->alias);
+			select.back()->SetAlias(expr->GetAlias());
+			select_aliases.push_back(expr->GetAlias().GetIdentifierName());
 			original_text.push_back(expr->ToString());
 			CheckNoWindow(*select.back());
 		}
@@ -167,7 +165,7 @@ private:
 		vector<unique_ptr<ParsedExpression>> result;
 		for (idx_t i = 0; i < select.size(); i++) {
 			auto expr = Replace(*select[i], false);
-			expr->alias = OutputName(i);
+			expr->SetAlias(Identifier(OutputName(i)));
 			result.push_back(std::move(expr));
 		}
 		return result;
@@ -180,14 +178,14 @@ private:
 			CheckNotMetric(*select[i]);
 			AddItem(SemanticMemberKind::FACT, WithoutAlias(*select[i]), FactColumn(i));
 			result.push_back(ColumnRef(FactColumn(i)));
-			result.back()->alias = OutputName(i);
+			result.back()->SetAlias(Identifier(OutputName(i)));
 		}
 		return result;
 	}
 
 	static unique_ptr<ParsedExpression> WithoutAlias(const ParsedExpression &expr) {
 		auto result = expr.Copy();
-		result->alias.clear();
+		result->ClearAlias();
 		return result;
 	}
 
@@ -195,7 +193,7 @@ private:
 		if (model.FindTable(qualifier).IsValid()) {
 			return false;
 		}
-		return StringUtil::CIEquals(qualifier, ref.alias.empty() ? ref.table_name : ref.alias);
+		return StringUtil::CIEquals(qualifier, (ref.alias.empty() ? ref.Table() : ref.alias).GetIdentifierName());
 	}
 
 	//! Strips qualifiers naming the semantic view itself and splits quoted "entity.name" identifiers
@@ -204,7 +202,7 @@ private:
 		std::function<void(unique_ptr<ParsedExpression> &)> visit = [&](unique_ptr<ParsedExpression> &node) {
 			if (node->GetExpressionClass() == ExpressionClass::COLUMN_REF) {
 				auto &colref = node->Cast<ColumnRefExpression>();
-				auto names = colref.column_names;
+				auto names = IdentifiersToStrings(colref.ColumnNames());
 				auto view_qualified = names.size() >= 2 && IsViewQualifier(names[0]);
 				if (view_qualified) {
 					names.erase(names.begin());
@@ -223,9 +221,9 @@ private:
 						throw BinderException("%s", error);
 					}
 				}
-				auto alias = node->alias;
-				node = make_uniq<ColumnRefExpression>(std::move(names));
-				node->alias = alias;
+				auto alias = node->GetAlias();
+				node = make_uniq<ColumnRefExpression>(StringsToIdentifiers(names));
+				node->SetAlias(alias);
 				return;
 			}
 			ParsedExpressionIterator::EnumerateChildren(*node, visit);
@@ -247,7 +245,7 @@ private:
 			return false;
 		}
 		auto &function = expr.Cast<FunctionExpression>();
-		return StringUtil::CIEquals(function.function_name, "agg") || analyzer.IsAggregate(expr);
+		return StringUtil::CIEquals(function.FunctionName().GetIdentifierName(), "agg") || analyzer.IsAggregate(expr);
 	}
 
 	bool ContainsAggregate(const ParsedExpression &expr) {
@@ -263,18 +261,20 @@ private:
 	unique_ptr<ParsedExpression> ResolveGroup(const ParsedExpression &group) {
 		auto normalized = Normalize(group);
 		if (normalized->GetExpressionClass() == ExpressionClass::CONSTANT) {
-			auto &value = normalized->Cast<ConstantExpression>().value;
+			auto value = ConstantValue(*normalized);
 			if (value.type().IsIntegral()) {
 				auto index = value.GetValue<int64_t>();
 				if (index < 1 || index > int64_t(select.size())) {
-					throw BinderException("GROUP BY term out of range - should be between 1 and %d", select.size());
+					throw BinderException("GROUP BY term out of range - "
+					                      "should be between 1 and %d",
+					                      select.size());
 				}
 				return WithoutAlias(*select[NumericCast<idx_t>(index - 1)]);
 			}
 		}
 		if (normalized->GetExpressionClass() == ExpressionClass::COLUMN_REF) {
 			auto &colref = normalized->Cast<ColumnRefExpression>();
-			if (!colref.IsQualified() && !HasInputName(colref.GetColumnName())) {
+			if (!colref.IsQualified() && !HasInputName(colref.GetColumnName().GetIdentifierName())) {
 				auto alias = OutputAlias(*normalized);
 				if (alias.IsValid()) {
 					return WithoutAlias(*select[alias.GetIndex()]);
@@ -304,7 +304,7 @@ private:
 		if (!colref.IsQualified()) {
 			for (idx_t i = select_aliases.size(); i > 0; i--) {
 				if (!select_aliases[i - 1].empty() &&
-				    StringUtil::CIEquals(select_aliases[i - 1], colref.GetColumnName())) {
+				    StringUtil::CIEquals(select_aliases[i - 1], colref.GetColumnName().GetIdentifierName())) {
 					return i - 1;
 				}
 			}
@@ -316,7 +316,8 @@ private:
 	void CheckNotMetric(const ParsedExpression &expr) {
 		if (expr.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
 			string ignored;
-			auto ref = model.Lookup(expr.Cast<ColumnRefExpression>().column_names, SemanticResolveContext(), ignored);
+			auto ref = model.Lookup(IdentifiersToStrings(expr.Cast<ColumnRefExpression>().ColumnNames()),
+			                        SemanticResolveContext(), ignored);
 			if (ref.Is(SemanticRefKind::MEMBER) && model.members[ref.index].Kind() == SemanticMemberKind::METRIC) {
 				throw BinderException("Metric \"%s\" must be used with AGG()", expr.ToString());
 			}
@@ -337,11 +338,11 @@ private:
 	string MetricFor(const ParsedExpression &aggregate) {
 		unique_ptr<ParsedExpression> metric;
 		auto &function = aggregate.Cast<FunctionExpression>();
-		if (StringUtil::CIEquals(function.function_name, "agg")) {
-			if (function.children.size() != 1 || function.distinct || function.filter) {
+		if (StringUtil::CIEquals(function.FunctionName().GetIdentifierName(), "agg")) {
+			if (ArgumentCount(function) != 1 || function.Distinct() || function.Filter()) {
 				throw BinderException("AGG() takes exactly one metric");
 			}
-			metric = WithoutAlias(*function.children[0]);
+			metric = WithoutAlias(Argument(function, 0));
 			SemanticResolveContext resolve_context;
 			resolve_context.allow_private = false;
 			resolve_context.what = "AGG(" + metric->ToString() + ")";
@@ -371,17 +372,17 @@ private:
 		}
 		for (idx_t g = 0; g < groups.size(); g++) {
 			if (groups[g]->Equals(expr)) {
-				return make_uniq<ColumnRefExpression>(GroupColumn(g));
+				return make_uniq<ColumnRefExpression>(Identifier(GroupColumn(g)));
 			}
 		}
 		if (IsAggregateCall(expr)) {
-			return make_uniq<ColumnRefExpression>(MetricFor(expr));
+			return make_uniq<ColumnRefExpression>(Identifier(MetricFor(expr)));
 		}
 		if (expr.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
 			auto &colref = expr.Cast<ColumnRefExpression>();
-			if (allow_aliases && !colref.IsQualified() && !HasInputName(colref.GetColumnName())) {
+			if (allow_aliases && !colref.IsQualified() && !HasInputName(colref.GetColumnName().GetIdentifierName())) {
 				for (auto &alias : select_aliases) {
-					if (!alias.empty() && StringUtil::CIEquals(alias, colref.GetColumnName())) {
+					if (!alias.empty() && StringUtil::CIEquals(alias, colref.GetColumnName().GetIdentifierName())) {
 						return expr.Copy();
 					}
 				}
@@ -407,12 +408,12 @@ private:
 		}
 		for (idx_t i = 0; i < select.size(); i++) {
 			if (select[i]->Equals(expr)) {
-				return make_uniq<ColumnRefExpression>(FactColumn(i));
+				return make_uniq<ColumnRefExpression>(Identifier(FactColumn(i)));
 			}
 		}
 		if (expr.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
 			auto &colref = expr.Cast<ColumnRefExpression>();
-			if (!HasInputName(colref.GetColumnName())) {
+			if (!HasInputName(colref.GetColumnName().GetIdentifierName())) {
 				auto output = OutputAlias(expr);
 				if (output.IsValid()) {
 					return ColumnRef(FactColumn(output.GetIndex()));
@@ -441,7 +442,7 @@ private:
 			return select_aliases[index];
 		}
 		if (select[index]->GetExpressionClass() == ExpressionClass::COLUMN_REF) {
-			return select[index]->Cast<ColumnRefExpression>().GetColumnName();
+			return select[index]->Cast<ColumnRefExpression>().GetColumnName().GetIdentifierName();
 		}
 		return original_text[index];
 	}
@@ -469,9 +470,10 @@ public:
 protected:
 	void VisitTableRef(unique_ptr<TableRef> &ref, bool in_join) override {
 		if (in_join && ref->type == TableReferenceType::BASE_TABLE && SemanticViewFor(ref->Cast<BaseTableRef>())) {
-			throw BinderException("Semantic view \"%s\" cannot be joined in the FROM clause; use SEMANTIC_VIEW(...) "
+			throw BinderException("Semantic view \"%s\" cannot be joined in the FROM "
+			                      "clause; use SEMANTIC_VIEW(...) "
 			                      "or a subquery instead",
-			                      ref->Cast<BaseTableRef>().table_name);
+			                      ref->Cast<BaseTableRef>().Table().GetIdentifierName());
 		}
 	}
 
@@ -508,24 +510,24 @@ protected:
 
 private:
 	shared_ptr<SemanticModel> SemanticViewFor(const BaseTableRef &ref) {
-		bool unqualified = (ref.catalog_name.empty() || ref.catalog_name == INVALID_CATALOG) &&
-		                   (ref.schema_name.empty() || ref.schema_name == INVALID_SCHEMA);
-		if (unqualified && IsCTEName(ref.table_name)) {
+		auto &qualified_name = ref.GetQualifiedName();
+		if (qualified_name.Path().size() > 3) {
+			// a table in a nested schema: semantic views live in catalog.schema
 			return nullptr;
 		}
-		QualifiedName name;
-		name.catalog = ref.catalog_name;
-		name.schema = ref.schema_name;
-		name.name = ref.table_name;
+		bool unqualified = qualified_name.Path().size() == 1;
+		if (unqualified && IsCTEName(ref.Table().GetIdentifierName())) {
+			return nullptr;
+		}
+		auto name = SemanticQualifiedName::FromQualifiedName(qualified_name);
 		auto model = state.registry.Lookup(context, name);
 		if (!model) {
 			return nullptr;
 		}
 		// a real table or view of that name (another catalog's, or a CTE) takes precedence over the semantic view; its
 		// own catalog entry is a placeholder
-		EntryLookupInfo lookup(CatalogType::TABLE_ENTRY, ref.table_name);
-		auto entry =
-		    Catalog::GetEntry(context, ref.catalog_name, ref.schema_name, lookup, OnEntryNotFound::RETURN_NULL);
+		auto entry = Catalog::GetEntry(context, EntryLookupInfo(CatalogType::TABLE_ENTRY, qualified_name),
+		                               OnEntryNotFound::RETURN_NULL);
 		if (entry && !IsSemanticPlaceholder(*entry)) {
 			return nullptr;
 		}

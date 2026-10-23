@@ -121,7 +121,7 @@ SELECT * FROM SEMANTIC_VIEW(sales DIMENSIONS orders.order_year METRICS customers
 
 ## Installation
 
-The extension targets DuckDB **v1.5.5** and is built from source:
+The extension targets DuckDB **v2.0.0** and is built from source:
 
 ```bash
 git clone --recurse-submodules https://github.com/altertable-ai/duckdb-semantic_views.git
@@ -132,9 +132,9 @@ GEN=ninja make
 The build produces:
 
 - `./build/release/duckdb`, a DuckDB shell with the extension (and `tpch`) statically linked, ready to use;
-- `./build/release/extension/semantic_views/semantic_views.duckdb_extension`, a loadable extension for DuckDB v1.5.5.
+- `./build/release/extension/semantic_views/semantic_views.duckdb_extension`, a loadable extension for DuckDB v2.0.0.
 
-To load the extension into another DuckDB v1.5.5 client, allow unsigned extensions and load the file:
+To load the extension into another DuckDB v2.0.0 client, allow unsigned extensions and load the file:
 
 ```bash
 duckdb -unsigned
@@ -581,8 +581,9 @@ relationships are about 9x faster than a hand-written range join. See [docs/benc
 - No placeholder is created in read-only databases or in attached non-DuckDB catalogs (Postgres, SQLite, ...). Such
   semantic views work but are not listed. A plain `DROP VIEW x` removes only the placeholder.
 - A DuckDB view cannot be defined over the query-by-name form; use `SEMANTIC_VIEW(...)` in view definitions.
-- One statement cannot combine `SEMANTIC_VIEW(...)` with the syntax of another parser extension, such as
-  `MATCH_RECOGNIZE`.
+- The semantic view syntax is a grammar extension that `LOAD semantic_views` turns on for every connection. A
+  connection that was already open switches once its current query ends, so `LOAD semantic_views; SHOW SEMANTIC
+  VIEWS;` sent as a single query string fails to parse: send the `LOAD` on its own first.
 
 ## Development
 
@@ -613,12 +614,11 @@ python3 scripts/bench_semantic_views.py --db /tmp/semantic_views_bench.duckdb --
 | `src/semantic_sql_rewrite.cpp` | querying a semantic view by name |
 | `src/semantic_catalog.cpp` | catalog placeholder views |
 | `src/semantic_*_functions.cpp` | the internal table functions statements are lowered to |
-| `third_party/duckdb_peg_parser` | vendored DuckDB PEG parser with the semantic view grammar (`custom/`) |
+| `src/parser/semantic_views_grammar.cpp` | the semantic view grammar and its transforms |
 
-Statements DuckDB's parser rejects are parsed by a vendored copy of DuckDB's PEG parser, extended with the semantic
-view grammar. After editing the grammar or the vendored files, use the scripts in `scripts/`
-(`regenerate_duckdb_peg_parser.sh`, `make_peg_patch.sh`, `sync_duckdb_peg_parser.sh`). See [AGENTS.md](AGENTS.md)
-for details and [docs/UPDATING.md](docs/UPDATING.md) for moving to a new DuckDB version.
+The semantic view syntax extends DuckDB's PEG parser through a grammar extension (rules added to DuckDB's own grammar,
+plus transforms that lower the statements onto the internal table functions). See [AGENTS.md](AGENTS.md) for details
+and [docs/UPDATING.md](docs/UPDATING.md) for moving to a new DuckDB version.
 
 Contributions are welcome: please open an issue or a pull request, with tests for any behavior change.
 
@@ -660,5 +660,4 @@ SERVICE`, `AI_SQL_GENERATION`, `AI_QUESTION_CATEGORIZATION`, `AI_VERIFIED_QUERIE
 
 ## License
 
-MIT, see [LICENSE](LICENSE). The vendored DuckDB PEG parser in `third_party/duckdb_peg_parser` keeps DuckDB's MIT
-license ([third_party/duckdb_peg_parser/LICENSE](third_party/duckdb_peg_parser/LICENSE)).
+MIT, see [LICENSE](LICENSE).

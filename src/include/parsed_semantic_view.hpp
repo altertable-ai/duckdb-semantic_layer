@@ -22,6 +22,18 @@ namespace duckdb {
 class Serializer;
 class Deserializer;
 
+//! A possibly qualified object name as written, one string per part: an empty
+//! part is unset
+struct SemanticQualifiedName {
+	string catalog;
+	string schema;
+	string name;
+
+	//! From a name as DuckDB's parser produces it (catalog.schema.name,
+	//! schema.name or name)
+	static SemanticQualifiedName FromQualifiedName(const QualifiedName &qualified_name);
+};
+
 enum class SemanticMemberKind : uint8_t { FACT = 0, DIMENSION = 1, METRIC = 2 };
 
 string SemanticMemberKindToString(SemanticMemberKind kind);
@@ -196,7 +208,7 @@ struct ParsedSemanticMaterializationPayload {
 };
 
 struct ParsedSemanticView {
-	QualifiedName name;
+	SemanticQualifiedName name;
 	vector<ParsedSemanticTable> tables;
 	vector<ParsedSemanticRelationship> relationships;
 	vector<ParsedSemanticMember> facts;
@@ -218,7 +230,7 @@ struct ParsedSemanticView {
 };
 
 struct ParsedSemanticQuery {
-	QualifiedName view;
+	SemanticQualifiedName view;
 	vector<ParsedSemanticQueryItem> items;
 	unique_ptr<ParsedExpression> where;
 

@@ -28,7 +28,7 @@ constexpr const char *METADATA_COLUMNS =
 constexpr const char *METADATA_KEY =
     "view_catalog = $1 AND view_schema = $2 AND lower(view_name) = lower($3) AND lower(name) = lower($4)";
 
-unique_ptr<MaterializedQueryResult> RunStorageSQL(Connection &connection, const string &sql) {
+unique_ptr<QueryResult> RunStorageSQL(Connection &connection, const string &sql) {
 	auto result = connection.Query(sql);
 	if (result->HasError()) {
 		result->ThrowError("semantic view materialization: ");
@@ -41,7 +41,7 @@ unique_ptr<QueryResult> RunPrepared(Connection &connection, const string &sql, v
 	if (prepared->HasError()) {
 		throw BinderException("semantic view materialization: %s", prepared->GetError());
 	}
-	auto result = prepared->Execute(values, false);
+	auto result = prepared->Execute(values);
 	if (result->HasError()) {
 		result->ThrowError("semantic view materialization: ");
 	}
@@ -56,7 +56,7 @@ Value StringList(const vector<string> &values) {
 	return Value::LIST(LogicalType::VARCHAR, std::move(list));
 }
 
-vector<Value> MetadataKey(const QualifiedName &view, const string &name) {
+vector<Value> MetadataKey(const SemanticQualifiedName &view, const string &name) {
 	return {Value(view.catalog), Value(view.schema), Value(view.name), Value(name)};
 }
 
@@ -123,19 +123,18 @@ void UpdateMetadata(Connection &connection, const SemanticMaterialization &mater
 }
 
 bool HasMetadata(ClientContext &context, const string &catalog_name) {
-	auto catalog = Catalog::GetCatalogEntry(context, catalog_name);
-	if (!catalog || !catalog->GetSchema(context, SEMANTIC_MATERIALIZATION_SCHEMA, OnEntryNotFound::RETURN_NULL)) {
+	auto catalog = Catalog::GetCatalogEntry(context, Identifier(catalog_name));
+	if (!catalog ||
+	    !catalog->GetSchema(context, Identifier(SEMANTIC_MATERIALIZATION_SCHEMA), OnEntryNotFound::RETURN_NULL)) {
 		return false;
 	}
-	// the lookup keeps a reference to the name
-	const string table = SEMANTIC_MATERIALIZATION_METADATA;
-	EntryLookupInfo lookup(CatalogType::TABLE_ENTRY, table);
-	return catalog->GetEntry(context, SEMANTIC_MATERIALIZATION_SCHEMA, lookup, OnEntryNotFound::RETURN_NULL) != nullptr;
+	return catalog->GetEntry(context, CatalogType::TABLE_ENTRY, Identifier(SEMANTIC_MATERIALIZATION_SCHEMA),
+	                         Identifier(SEMANTIC_MATERIALIZATION_METADATA), OnEntryNotFound::RETURN_NULL) != nullptr;
 }
 
 //! Drops tables and deletes the metadata row of a materialization, in one transaction
 static void DropStored(Connection &connection, const string &catalog, const vector<string> &tables,
-                       const QualifiedName &view, const string &name) {
+                       const SemanticQualifiedName &view, const string &name) {
 	for (auto &table : tables) {
 		RunStorageSQL(connection, "DROP TABLE IF EXISTS " + table);
 	}
@@ -172,7 +171,7 @@ void DropStoredMaterialization(Connection &connection, const SemanticStoredMater
 }
 
 void RenameStoredMaterializations(Connection &connection, const SemanticModel &model,
-                                  const QualifiedName &previous_name, const string &storage_catalog) {
+                                  const SemanticQualifiedName &previous_name, const string &storage_catalog) {
 	for (auto &materialization : model.materializations) {
 		if (!StringUtil::CIEquals(materialization->storage_catalog, storage_catalog)) {
 			continue;
@@ -200,62 +199,68 @@ void RenameStoredMaterializations(Connection &connection, const SemanticModel &m
 }
 
 vector<SemanticMaterializationRecord> ReadStoredMaterializations(Connection &connection, const string &catalog,
-                                                                 const QualifiedName &view) {
+                                                                 const SemanticQualifiedName &view) {
 	vector<SemanticMaterializationRecord> records;
 	if (!HasMetadata(*connection.context, catalog)) {
 		return records;
 	}
 	auto result = RunPrepared(connection,
-	                          "SELECT name, definition, fingerprint, table_schema, tables, watermark_catalogs, "
-	                          "watermark_snapshots, verified_at, last_refresh, last_refresh_detail FROM " +
+	                          "SELECT name, definition, fingerprint, table_schema, tables, "
+	                          "watermark_catalogs, "
+	                          "watermark_snapshots, verified_at, last_refresh, "
+	                          "last_refresh_detail FROM " +
 	                              MetadataTable(catalog) +
-	                              " WHERE view_catalog = $1 AND view_schema = $2 AND lower(view_name) = lower($3)",
+	                              " WHERE view_catalog = $1 AND view_schema = $2 AND "
+	                              "lower(view_name) = lower($3)",
 	                          {Value(view.catalog), Value(view.schema), Value(view.name)});
-	auto rows = unique_ptr_cast<QueryResult, MaterializedQueryResult>(std::move(result));
+	auto rows = std::move(result);
 	for (idx_t row = 0; row < rows->RowCount(); row++) {
 		SemanticMaterializationRecord record;
 		auto &entry = record.location;
 		entry.catalog = catalog;
-		entry.schema = rows->GetValue(3, row).ToString();
+		entry.schema = rows->Collection().GetValue(3, row).ToString();
 		entry.view = view;
-		entry.name = rows->GetValue(0, row).ToString();
-		auto tables = rows->GetValue(4, row);
+		entry.name = rows->Collection().GetValue(0, row).ToString();
+		auto tables = rows->Collection().GetValue(4, row);
 		for (auto &table : ListValue::GetChildren(tables)) {
 			entry.tables.push_back(table.ToString());
 		}
 		record.definition = std::move(
-		    SemanticLowering::Decode<ParsedSemanticMaterializationPayload>(rows->GetValue(1, row))->materialization);
-		record.fingerprint = rows->GetValue(2, row).ToString();
-		auto catalogs = ListValue::GetChildren(rows->GetValue(5, row));
-		auto snapshots = ListValue::GetChildren(rows->GetValue(6, row));
+		    SemanticLowering::Decode<ParsedSemanticMaterializationPayload>(rows->Collection().GetValue(1, row))
+		        ->materialization);
+		record.fingerprint = rows->Collection().GetValue(2, row).ToString();
+		auto catalogs = ListValue::GetChildren(rows->Collection().GetValue(5, row));
+		auto snapshots = ListValue::GetChildren(rows->Collection().GetValue(6, row));
 		if (catalogs.size() != snapshots.size()) {
-			throw InvalidInputException(
-			    "Invalid materialization metadata: watermark catalogs and snapshots have different lengths");
+			throw InvalidInputException("Invalid materialization metadata: watermark catalogs and snapshots "
+			                            "have different lengths");
 		}
 		for (idx_t i = 0; i < catalogs.size(); i++) {
 			record.watermark[catalogs[i].ToString()] = snapshots[i].GetValue<idx_t>();
 		}
-		record.verified_at = rows->GetValue(7, row).GetValue<timestamp_t>();
-		record.last_refresh = rows->GetValue(8, row).ToString();
-		record.last_refresh_detail = rows->GetValue(9, row).ToString();
+		record.verified_at = rows->Collection().GetValue(7, row).GetValue<timestamp_t>();
+		record.last_refresh = rows->Collection().GetValue(8, row).ToString();
+		record.last_refresh_detail = rows->Collection().GetValue(9, row).ToString();
 		records.push_back(std::move(record));
 	}
 	if (!records.empty()) {
-		// Older allocations used sanitized names, which could already have collided before upgrading.
-		// Reject ambiguous ownership without deleting either owner's recoverable data.
+		// Older allocations used sanitized names, which could already have collided
+		// before upgrading. Reject ambiguous ownership without deleting either
+		// owner's recoverable data.
 		auto conflicts = RunStorageSQL(connection, "SELECT lower(table_schema), lower(table_name) FROM (SELECT "
 		                                           "table_schema, unnest(tables) AS table_name FROM " +
 		                                               MetadataTable(catalog) + ") GROUP BY ALL HAVING count(*) > 1");
 		set<pair<string, string>> ambiguous;
 		for (idx_t row = 0; row < conflicts->RowCount(); row++) {
-			ambiguous.emplace(conflicts->GetValue(0, row).ToString(), conflicts->GetValue(1, row).ToString());
+			ambiguous.emplace(conflicts->Collection().GetValue(0, row).ToString(),
+			                  conflicts->Collection().GetValue(1, row).ToString());
 		}
 		for (auto &record : records) {
 			for (auto &table : record.location.tables) {
 				if (ambiguous.count({StringUtil::Lower(record.location.schema), StringUtil::Lower(table)})) {
-					throw InvalidInputException(
-					    "Invalid materialization metadata: multiple owners claim table %s.%s.%s", catalog,
-					    record.location.schema, table);
+					throw InvalidInputException("Invalid materialization metadata: "
+					                            "multiple owners claim table %s.%s.%s",
+					                            catalog, record.location.schema, table);
 				}
 			}
 		}
@@ -297,7 +302,8 @@ vector<SemanticStoredMaterialization> RestoreSemanticMaterializations(ClientCont
 		if (type != "duckdb" && type != "ducklake") {
 			continue;
 		}
-		for (auto &record : ReadStoredMaterializations(connection, catalog.GetName(), model.Name())) {
+		for (auto &record :
+		     ReadStoredMaterializations(connection, catalog.GetName().GetIdentifierName(), model.Name())) {
 			auto &entry = record.location;
 			bool defined = false;
 			for (auto &materialization : model.materializations) {

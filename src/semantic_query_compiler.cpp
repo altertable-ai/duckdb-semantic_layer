@@ -95,31 +95,31 @@ void MapWindowDimensions(const SemanticModel &model, unique_ptr<ParsedExpression
 	}
 	auto &window = expr->Cast<WindowExpression>();
 	vector<unique_ptr<ParsedExpression>> partitions;
-	for (auto &partition : window.partitions) {
+	for (auto &partition : window.PartitionsMutable()) {
 		if (!SemanticMarkers::IsExcluding(*partition)) {
 			map_key(partition);
 			partitions.push_back(std::move(partition));
 			continue;
 		}
-		auto &excluded = partition->Cast<FunctionExpression>().children;
+		auto &excluded = partition->Cast<FunctionExpression>().GetArguments();
 		for (auto &dimension : excluded) {
-			dimension_column(*dimension);
+			dimension_column(dimension.GetExpression());
 		}
 		for (idx_t d = 0; d < dimensions.size(); d++) {
 			bool is_excluded = false;
 			for (auto &dimension : excluded) {
-				is_excluded = is_excluded || dimensions[d]->resolved->Equals(*dimension);
+				is_excluded = is_excluded || dimensions[d]->resolved->Equals(dimension.GetExpression());
 			}
 			if (!is_excluded) {
 				partitions.push_back(ColumnRef(DimensionColumn(d)));
 			}
 		}
 	}
-	window.partitions = std::move(partitions);
-	for (auto &order : window.orders) {
+	window.PartitionsMutable() = std::move(partitions);
+	for (auto &order : window.OrderByMutable()) {
 		map_key(order.expression);
 	}
-	for (auto &order : window.arg_orders) {
+	for (auto &order : window.ArgOrdersMutable()) {
 		map_key(order.expression);
 	}
 	ParsedExpressionIterator::EnumerateChildren(
@@ -249,12 +249,12 @@ private:
 		auto node = make_uniq<SelectNode>();
 		for (idx_t c = 0; c < bridge.key_source_columns.size(); c++) {
 			auto key = scope.ColumnReference(bridge.key_source, bridge.key_source_columns[c]);
-			key->alias = KeyColumn(c);
+			key->SetAlias(Identifier(KeyColumn(c)));
 			node->select_list.push_back(std::move(key));
 		}
 		for (auto &dimension : group.dimensions) {
 			auto expr = compiler.ShiftedRow(*dimension.expr, scope, dimension.what, block.offsets);
-			expr->alias = dimension.column;
+			expr->SetAlias(Identifier(dimension.column));
 			node->select_list.push_back(std::move(expr));
 		}
 		vector<unique_ptr<ParsedExpression>> conditions;
@@ -317,7 +317,7 @@ public:
 			} else {
 				expr = ColumnRef(DimensionColumn(dimension++));
 			}
-			expr->alias = item.output_name;
+			expr->SetAlias(Identifier(item.output_name));
 			node->select_list.push_back(std::move(expr));
 		}
 		node->from_table = MakeSubqueryRef(std::move(aggregated), "__sv_agg");
@@ -357,7 +357,7 @@ public:
 			aggregate->groups.group_expressions.push_back(ColumnRef(DimensionColumn(d)));
 		}
 		auto rows_count = make_uniq<FunctionExpression>("count_star", vector<unique_ptr<ParsedExpression>>());
-		rows_count->alias = MATERIALIZED_ROWS_COLUMN;
+		rows_count->SetAlias(Identifier(MATERIALIZED_ROWS_COLUMN));
 		aggregate->select_list.push_back(std::move(rows_count));
 		for (idx_t k = 0; k < block.atoms.size(); k++) {
 			for (auto &state : states(k, parts.aggregates[k]->Cast<FunctionExpression>())) {
@@ -418,21 +418,21 @@ private:
 		idx_t argument_count = 0;
 		auto extract = [&](unique_ptr<ParsedExpression> &argument) {
 			auto name = "__sv_x" + to_string(argument_count++);
-			argument->alias = name;
+			argument->SetAlias(Identifier(name));
 			rows.select_list.push_back(std::move(argument));
 			argument = ColumnRef(name);
 		};
 		for (auto a : block.atoms) {
 			auto expr = compiler.Aggregate(atoms[a], scope, "Invalid metric");
 			auto &function = expr->Cast<FunctionExpression>();
-			for (auto &child : function.children) {
-				extract(child);
+			for (auto &argument : function.GetArgumentsMutable()) {
+				extract(argument.GetExpressionMutable());
 			}
-			if (function.filter) {
-				extract(function.filter);
+			if (function.FilterMutable()) {
+				extract(function.FilterMutable());
 			}
-			if (function.order_bys) {
-				for (auto &order : function.order_bys->orders) {
+			if (function.OrderByMutable()) {
+				for (auto &order : function.OrderByMutable()->orders) {
 					extract(order.expression);
 				}
 			}
@@ -471,7 +471,7 @@ private:
 		vector<unique_ptr<ParsedExpression>> select_list;
 		for (idx_t d = 0; d < result.dimensions.size(); d++) {
 			select_list.push_back(result.dimensions[d]->Copy());
-			select_list.back()->alias = DimensionColumn(d);
+			select_list.back()->SetAlias(Identifier(DimensionColumn(d)));
 		}
 		for (auto &expr : result.rows->select_list) {
 			select_list.push_back(std::move(expr));
@@ -484,7 +484,7 @@ private:
 	static void FinishRows(SelectNode &rows, SemanticJoinScope &scope, BlockBridges &bridges) {
 		if (rows.select_list.empty()) {
 			// e.g. only COUNT(*): the rows still have to be produced
-			rows.select_list.push_back(make_uniq<ConstantExpression>(Value::BOOLEAN(true)));
+			rows.select_list.push_back(ConstantExpression::FromValue(Value::BOOLEAN(true)));
 		}
 		rows.from_table = bridges.Join(scope);
 	}
@@ -538,7 +538,7 @@ private:
 		auto node = make_uniq<SelectNode>();
 		for (idx_t d = 0; d < dimensions.size(); d++) {
 			node->groups.group_expressions.push_back(read.dimensions[d]->Copy());
-			read.dimensions[d]->alias = DimensionColumn(d);
+			read.dimensions[d]->SetAlias(Identifier(DimensionColumn(d)));
 			node->select_list.push_back(std::move(read.dimensions[d]));
 		}
 		AddAtomColumns(*node, block, std::move(read.aggregates), tag);
@@ -591,16 +591,16 @@ private:
 			if (block.Owns(a)) {
 				expr = std::move(owned[next++]);
 			} else if (tag.IsValid()) {
-				expr = make_uniq<ConstantExpression>(Value());
+				expr = ConstantExpression::FromValue(Value());
 			} else {
 				continue;
 			}
-			expr->alias = AtomColumn(a);
+			expr->SetAlias(Identifier(AtomColumn(a)));
 			node.select_list.push_back(std::move(expr));
 		}
 		if (tag.IsValid()) {
-			auto tag_value = make_uniq<ConstantExpression>(Value::BIGINT(NumericCast<int64_t>(tag.GetIndex())));
-			tag_value->alias = BLOCK_COLUMN;
+			auto tag_value = ConstantExpression::FromValue(Value::BIGINT(NumericCast<int64_t>(tag.GetIndex())));
+			tag_value->SetAlias(Identifier(BLOCK_COLUMN));
 			node.select_list.push_back(std::move(tag_value));
 		}
 	}
@@ -609,52 +609,53 @@ private:
 	//! snapshot in NON ADDITIVE BY order. Adds the needed columns to `rows` and returns the filter on them.
 	unique_ptr<ParsedExpression> LastSnapshotFilter(const SemanticMember &metric, SemanticJoinScope &scope,
 	                                                vector<unique_ptr<ParsedExpression>> partitions, SelectNode &rows) {
-		auto window = [&](ExpressionType type, const string &function) {
-			auto result = make_uniq<WindowExpression>(type, INVALID_CATALOG, INVALID_SCHEMA, function);
+		auto window = [&](const string &function) {
+			auto result = make_uniq<WindowExpression>(INVALID_CATALOG, INVALID_SCHEMA, function);
 			for (auto &partition : partitions) {
-				result->partitions.push_back(partition->Copy());
+				result->PartitionsMutable().push_back(partition->Copy());
 			}
-			result->start = WindowBoundary::UNBOUNDED_PRECEDING;
-			result->end = WindowBoundary::UNBOUNDED_FOLLOWING;
+			result->WindowStartMutable() = WindowBoundary::UNBOUNDED_PRECEDING;
+			result->WindowEndMutable() = WindowBoundary::UNBOUNDED_FOLLOWING;
 			return result;
 		};
 		if (metric.non_additive.size() > 1) {
-			// several dimensions: rank by the reversed order, the last snapshot ranks first
-			auto rank = window(ExpressionType::WINDOW_RANK, "rank");
-			rank->end = WindowBoundary::CURRENT_ROW_RANGE;
+			// several dimensions: rank by the reversed order, the last snapshot
+			// ranks first
+			auto rank = window("rank");
+			rank->WindowEndMutable() = WindowBoundary::CURRENT_ROW_RANGE;
 			for (auto &entry : metric.non_additive) {
 				auto type = entry.type == OrderType::ASCENDING ? OrderType::DESCENDING : OrderType::ASCENDING;
 				auto nulls = entry.null_order == OrderByNullType::NULLS_LAST ? OrderByNullType::NULLS_FIRST
 				                                                             : OrderByNullType::NULLS_LAST;
-				rank->orders.emplace_back(
+				rank->OrderByMutable().emplace_back(
 				    type, nulls, compiler.Row(*entry.resolved, scope, DConstants::INVALID_INDEX, "NON ADDITIVE BY"));
 			}
-			rank->alias = "__sv_rank";
+			rank->SetAlias(Identifier("__sv_rank"));
 			rows.select_list.push_back(std::move(rank));
 			return Compare(ExpressionType::COMPARE_EQUAL, ColumnRef("__sv_rank"),
-			               make_uniq<ConstantExpression>(Value::BIGINT(1)));
+			               ConstantExpression::FromValue(Value::BIGINT(1)));
 		}
 		// one dimension: compare with the group's last value from unordered window aggregates (no sort):
 		// max (ASC) / min (DESC), or NULL when NULLs sort last and the group has some
 		auto &entry = metric.non_additive[0];
 		auto value = compiler.Row(*entry.resolved, scope, DConstants::INVALID_INDEX, "NON ADDITIVE BY");
-		auto last = window(ExpressionType::WINDOW_AGGREGATE, entry.type == OrderType::ASCENDING ? "max" : "min");
-		last->children.push_back(value->Copy());
+		auto last = window(entry.type == OrderType::ASCENDING ? "max" : "min");
+		last->GetArgumentsMutable().emplace_back(value->Copy());
 		unique_ptr<ParsedExpression> last_value = std::move(last);
 		if (entry.null_order == OrderByNullType::NULLS_LAST) {
-			auto counted = window(ExpressionType::WINDOW_AGGREGATE, "count");
-			counted->children.push_back(value->Copy());
+			auto counted = window("count");
+			counted->GetArgumentsMutable().emplace_back(value->Copy());
 			CaseCheck has_nulls;
-			has_nulls.when_expr = Compare(ExpressionType::COMPARE_GREATERTHAN,
-			                              window(ExpressionType::WINDOW_AGGREGATE, "count_star"), std::move(counted));
-			has_nulls.then_expr = make_uniq<ConstantExpression>(Value());
+			has_nulls.when_expr =
+			    Compare(ExpressionType::COMPARE_GREATERTHAN, window("count_star"), std::move(counted));
+			has_nulls.then_expr = ConstantExpression::FromValue(Value());
 			auto case_expr = make_uniq<CaseExpression>();
-			case_expr->case_checks.push_back(std::move(has_nulls));
-			case_expr->else_expr = std::move(last_value);
+			case_expr->CaseChecksMutable().push_back(std::move(has_nulls));
+			case_expr->ElseMutable() = std::move(last_value);
 			last_value = std::move(case_expr);
 		}
-		value->alias = "__sv_na";
-		last_value->alias = "__sv_last";
+		value->SetAlias(Identifier("__sv_na"));
+		last_value->SetAlias(Identifier("__sv_last"));
 		rows.select_list.push_back(std::move(value));
 		rows.select_list.push_back(std::move(last_value));
 		return Compare(ExpressionType::COMPARE_NOT_DISTINCT_FROM, ColumnRef("__sv_na"), ColumnRef("__sv_last"));
@@ -679,9 +680,10 @@ private:
 				vector<unique_ptr<ParsedExpression>> children;
 				children.push_back(ColumnRef(AtomColumn(a)));
 				auto any_value = make_uniq<FunctionExpression>("any_value", std::move(children));
-				any_value->filter = Compare(ExpressionType::COMPARE_EQUAL, ColumnRef(BLOCK_COLUMN),
-				                            make_uniq<ConstantExpression>(Value::BIGINT(NumericCast<int64_t>(b))));
-				any_value->alias = AtomColumn(a);
+				any_value->FilterMutable() =
+				    Compare(ExpressionType::COMPARE_EQUAL, ColumnRef(BLOCK_COLUMN),
+					        ConstantExpression::FromValue(Value::BIGINT(NumericCast<int64_t>(b))));
+				any_value->SetAlias(Identifier(AtomColumn(a)));
 				merged->select_list.push_back(std::move(any_value));
 			}
 		}
@@ -853,7 +855,7 @@ vector<SemanticBlockPlan> SemanticQueryCompiler::PlanBlocks(const SemanticQueryS
 		node->select_list.push_back(make_uniq<StarExpression>());
 		node->from_table = MakeSubqueryRef(metric_compiler.SourceBlock(b, plan.dependencies), "__sv_probe");
 		auto limit = make_uniq<LimitModifier>();
-		limit->limit = make_uniq<ConstantExpression>(Value::BIGINT(0));
+		limit->limit = ConstantExpression::FromValue(Value::BIGINT(0));
 		node->modifiers.push_back(std::move(limit));
 		auto statement = MakeSelectStatement(std::move(node));
 		auto binder = Binder::CreateBinder(analyzer.Context());
@@ -919,7 +921,7 @@ unique_ptr<SelectStatement> SemanticQueryCompiler::CompileRowQuery(SemanticExpre
 			children.push_back(std::move(expr));
 			expr = make_uniq<FunctionExpression>("any_value", std::move(children));
 		}
-		expr->alias = item.output_name;
+		expr->SetAlias(Identifier(item.output_name));
 		node->select_list.push_back(std::move(expr));
 	}
 	GroupByAll(*node);

@@ -41,8 +41,8 @@ void SemanticStatementVisitor::VisitStatement(SQLStatement &statement) {
 	}
 	case StatementType::INSERT_STATEMENT: {
 		auto &insert = statement.Cast<InsertStatement>();
-		if (insert.select_statement) {
-			VisitNode(*insert.select_statement->node);
+		if (insert.node && insert.node->select_statement) {
+			VisitNode(*insert.node->select_statement->node);
 		}
 		break;
 	}
@@ -63,11 +63,11 @@ bool SemanticStatementVisitor::IsCTEName(const string &name) const {
 void SemanticStatementVisitor::VisitNode(QueryNode &node) {
 	case_insensitive_set_t ctes;
 	for (auto &cte : node.cte_map.map) {
-		ctes.insert(cte.first);
+		ctes.insert(cte.first.GetIdentifierName());
 	}
 	cte_scopes.push_back(std::move(ctes));
 	for (auto &cte : node.cte_map.map) {
-		VisitNode(*cte.second->query->node);
+		VisitNode(*cte.second->query_node);
 	}
 	ParsedExpressionIterator::EnumerateQueryNodeModifiers(
 	    node, [&](unique_ptr<ParsedExpression> &expr) { VisitExpression(expr); });
@@ -150,7 +150,7 @@ void SemanticStatementVisitor::VisitRef(unique_ptr<TableRef> &ref, bool in_join)
 
 void SemanticStatementVisitor::VisitExpression(unique_ptr<ParsedExpression> &expr) {
 	if (expr->GetExpressionClass() == ExpressionClass::SUBQUERY) {
-		VisitNode(*expr->Cast<SubqueryExpression>().subquery->node);
+		VisitNode(*expr->Cast<SubqueryExpression>().SubqueryMutable()->node);
 	}
 	ParsedExpressionIterator::EnumerateChildren(*expr,
 	                                            [&](unique_ptr<ParsedExpression> &child) { VisitExpression(child); });
