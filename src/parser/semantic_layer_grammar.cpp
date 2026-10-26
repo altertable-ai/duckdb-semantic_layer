@@ -25,20 +25,42 @@
 
 namespace duckdb {
 
-DUCKDB_REGISTER_TRANSFORM_RESULT_TYPE("semantic_layer::ParsedSemanticTag", ParsedSemanticTag)
-DUCKDB_REGISTER_TRANSFORM_RESULT_TYPE("semantic_layer::vector<ParsedSemanticTag>", vector<ParsedSemanticTag>)
-DUCKDB_REGISTER_TRANSFORM_RESULT_TYPE("semantic_layer::ParsedSemanticTable", ParsedSemanticTable)
-DUCKDB_REGISTER_TRANSFORM_RESULT_TYPE("semantic_layer::vector<ParsedSemanticTable>", vector<ParsedSemanticTable>)
-DUCKDB_REGISTER_TRANSFORM_RESULT_TYPE("semantic_layer::ParsedSemanticRangeConstraint", ParsedSemanticRangeConstraint)
-DUCKDB_REGISTER_TRANSFORM_RESULT_TYPE("semantic_layer::ParsedSemanticRelationship", ParsedSemanticRelationship)
-DUCKDB_REGISTER_TRANSFORM_RESULT_TYPE("semantic_layer::vector<ParsedSemanticRelationship>",
-                                      vector<ParsedSemanticRelationship>)
-DUCKDB_REGISTER_TRANSFORM_RESULT_TYPE("semantic_layer::ParsedSemanticMember", ParsedSemanticMember)
-DUCKDB_REGISTER_TRANSFORM_RESULT_TYPE("semantic_layer::vector<ParsedSemanticMember>", vector<ParsedSemanticMember>)
-DUCKDB_REGISTER_TRANSFORM_RESULT_TYPE("semantic_layer::ParsedSemanticVerifiedQuery", ParsedSemanticVerifiedQuery)
-DUCKDB_REGISTER_TRANSFORM_RESULT_TYPE("semantic_layer::unique_ptr<ParsedSemanticView>", unique_ptr<ParsedSemanticView>)
-DUCKDB_REGISTER_TRANSFORM_RESULT_TYPE("semantic_layer::unique_ptr<ParsedSemanticQuery>",
-                                      unique_ptr<ParsedSemanticQuery>)
+// The primary TypedTransformResult template is DUCKDB_API, i.e. dllimport in a Windows loadable extension, and
+// duckdb.dll does not export instantiations for extension types: specialize it so ours are defined locally.
+#define SEMANTIC_LAYER_REGISTER_TRANSFORM_RESULT_TYPE(NAME, ...)                                                       \
+	DUCKDB_REGISTER_TRANSFORM_RESULT_TYPE(NAME, __VA_ARGS__)                                                           \
+	template <>                                                                                                        \
+	struct TypedTransformResult<__VA_ARGS__> : public TransformResultValue {                                           \
+		explicit TypedTransformResult(__VA_ARGS__ value_p) : value(std::move(value_p)) {                               \
+		}                                                                                                              \
+		TypedTransformResult(const TypedTransformResult &) = delete;                                                   \
+		TypedTransformResult &operator=(const TypedTransformResult &) = delete;                                        \
+		void *GetValuePointer(const char *type_name) override {                                                        \
+			auto expected = TransformResultTypeName<__VA_ARGS__>();                                                    \
+			return type_name == expected || std::strcmp(type_name, expected) == 0 ? &value : nullptr;                  \
+		}                                                                                                              \
+		__VA_ARGS__ value;                                                                                             \
+	};
+
+SEMANTIC_LAYER_REGISTER_TRANSFORM_RESULT_TYPE("semantic_layer::ParsedSemanticTag", ParsedSemanticTag)
+SEMANTIC_LAYER_REGISTER_TRANSFORM_RESULT_TYPE("semantic_layer::vector<ParsedSemanticTag>", vector<ParsedSemanticTag>)
+SEMANTIC_LAYER_REGISTER_TRANSFORM_RESULT_TYPE("semantic_layer::ParsedSemanticTable", ParsedSemanticTable)
+SEMANTIC_LAYER_REGISTER_TRANSFORM_RESULT_TYPE("semantic_layer::vector<ParsedSemanticTable>",
+                                              vector<ParsedSemanticTable>)
+SEMANTIC_LAYER_REGISTER_TRANSFORM_RESULT_TYPE("semantic_layer::ParsedSemanticRangeConstraint",
+                                              ParsedSemanticRangeConstraint)
+SEMANTIC_LAYER_REGISTER_TRANSFORM_RESULT_TYPE("semantic_layer::ParsedSemanticRelationship", ParsedSemanticRelationship)
+SEMANTIC_LAYER_REGISTER_TRANSFORM_RESULT_TYPE("semantic_layer::vector<ParsedSemanticRelationship>",
+                                              vector<ParsedSemanticRelationship>)
+SEMANTIC_LAYER_REGISTER_TRANSFORM_RESULT_TYPE("semantic_layer::ParsedSemanticMember", ParsedSemanticMember)
+SEMANTIC_LAYER_REGISTER_TRANSFORM_RESULT_TYPE("semantic_layer::vector<ParsedSemanticMember>",
+                                              vector<ParsedSemanticMember>)
+SEMANTIC_LAYER_REGISTER_TRANSFORM_RESULT_TYPE("semantic_layer::ParsedSemanticVerifiedQuery",
+                                              ParsedSemanticVerifiedQuery)
+SEMANTIC_LAYER_REGISTER_TRANSFORM_RESULT_TYPE("semantic_layer::unique_ptr<ParsedSemanticView>",
+                                              unique_ptr<ParsedSemanticView>)
+SEMANTIC_LAYER_REGISTER_TRANSFORM_RESULT_TYPE("semantic_layer::unique_ptr<ParsedSemanticQuery>",
+                                              unique_ptr<ParsedSemanticQuery>)
 
 namespace {
 
