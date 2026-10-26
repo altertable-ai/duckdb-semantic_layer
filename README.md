@@ -1,7 +1,7 @@
 # semantic_layer
 
 [![CI](https://github.com/altertable-ai/duckdb-semantic_layer/actions/workflows/MainDistributionPipeline.yml/badge.svg)](https://github.com/altertable-ai/duckdb-semantic_layer/actions/workflows/MainDistributionPipeline.yml)
-[![DuckDB](https://img.shields.io/badge/DuckDB-v1.5.5-fff100?logo=duckdb)](https://duckdb.org)
+[![DuckDB](https://img.shields.io/badge/DuckDB-v1.5.6-fff100?logo=duckdb)](https://duckdb.org)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 **A semantic layer inside DuckDB.** Define your business metrics once, in SQL, next to your data. Then query any
@@ -170,7 +170,7 @@ the metric, not of the query.
 ## Installation
 
 The extension is distributed through the
-[DuckDB community extensions](https://duckdb.org/community_extensions/) repository, for DuckDB **v1.5.5**:
+[DuckDB community extensions](https://duckdb.org/community_extensions/) repository, for DuckDB **v1.5.6**:
 
 ```sql
 INSTALL semantic_layer FROM community;
@@ -188,9 +188,9 @@ GEN=ninja make
 The build produces:
 
 - `./build/release/duckdb`, a DuckDB shell with the extension (and `tpch`) statically linked, ready to use;
-- `./build/release/extension/semantic_layer/semantic_layer.duckdb_extension`, a loadable extension for DuckDB v1.5.5.
+- `./build/release/extension/semantic_layer/semantic_layer.duckdb_extension`, a loadable extension for DuckDB v1.5.6.
 
-To load the extension into another DuckDB v1.5.5 client, allow unsigned extensions and load the file:
+To load the extension into another DuckDB v1.5.6 client, allow unsigned extensions and load the file:
 
 ```bash
 duckdb -unsigned

@@ -12,8 +12,8 @@ Instructions for AI agents working in this repository.
   `duckdb::semantic_views_peg`), reached through `parse_function` when the postgres parser fails.
 - Semantic queries are expanded at bind time into plain DuckDB SQL ASTs (no custom operators).
 - Submodules:
-  - DuckDB (`./duckdb`) — pinned to tag `v1.5.5`
-  - Extension CI Tools (`./extension-ci-tools`) — branch `v1.5.5`
+  - DuckDB (`./duckdb`) — pinned to tag `v1.5.6`
+  - Extension CI Tools (`./extension-ci-tools`) — branch `v1.5.6`
 
 **IMPORTANT**: Never modify files in `./duckdb` or `./extension-ci-tools` unless explicitly instructed.
 
