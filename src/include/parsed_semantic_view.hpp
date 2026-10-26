@@ -51,6 +51,8 @@ struct ParsedSemanticTable {
 	vector<string> primary_key;
 	vector<vector<string>> unique_keys;
 	vector<ParsedSemanticRangeConstraint> range_constraints;
+	//! TIME (<column>): this table's aggregation time column; empty when absent
+	string time_column;
 	vector<string> synonyms;
 	string comment;
 	vector<ParsedSemanticTag> tags;

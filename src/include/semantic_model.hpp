@@ -17,6 +17,7 @@
 #include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
 #include "parsed_semantic_view.hpp"
+#include <functional>
 #include "semantic_markers.hpp"
 
 namespace duckdb {
@@ -26,7 +27,7 @@ class SemanticMaterialization;
 
 struct SemanticTable {
 	string name;
-	//! Fully qualified BaseTableRef, or SubqueryRef for query-backed logical tables
+	//! Fully qualified BaseTableRef, or SubqueryRef for query-backed logical tables (and the empty time spine)
 	unique_ptr<TableRef> source;
 	string catalog_name;
 	string schema_name;
@@ -39,6 +40,9 @@ struct SemanticTable {
 	vector<ParsedSemanticRangeConstraint> range_constraints;
 	vector<string> synonyms;
 	string comment;
+	vector<ParsedSemanticTag> tags;
+	//! TIME (<column>) of this table, empty when it has none (resolved column name)
+	string time_column;
 
 	bool IsBaseTable() const {
 		return !table_name.empty();
@@ -61,6 +65,9 @@ struct SemanticRelationship {
 	bool is_range = false;
 	string range_start;
 	string range_end;
+	//! Generated from TIME (...): its table's default path to the time spine. When several paths reach a table,
+	//! TryPath prefers the one through a default relationship.
+	bool is_default = false;
 };
 
 //! A traversal step of the relationship graph
@@ -214,13 +221,18 @@ public:
 	unique_ptr<ParsedSemanticView> definition;
 	timestamp_tz_t created_on;
 
+	//! Logical tables: those of the definition, in order, then the time spine (semantic_time_spine.hpp)
 	vector<SemanticTable> tables;
+	//! Index of the time spine in `tables`, invalid when no table declares TIME
+	optional_idx time_spine;
 	vector<SemanticRelationship> relationships;
 	vector<SemanticMember> members;
 	//! Distinct OFFSETs of the metrics
 	vector<SemanticOffset> offsets;
 	//! Distinct CUMULATIVE clauses of the metrics
 	vector<SemanticCumulative> cumulatives;
+	//! Built-in metric_time dimensions. Members point into these; the parsed definition stays unchanged.
+	vector<unique_ptr<ParsedSemanticMember>> generated_members;
 	//! Materializations of the view (semantic_materialization.hpp), in definition order
 	vector<shared_ptr<SemanticMaterialization>> materializations;
 
@@ -238,6 +250,9 @@ public:
 	}
 
 	optional_idx FindTable(const string &table_name) const;
+	bool IsTimeSpine(idx_t table) const {
+		return time_spine.IsValid() && time_spine.GetIndex() == table;
+	}
 	optional_idx FindMember(idx_t table, const string &member_name) const;
 	vector<idx_t> FindMembersByName(const string &member_name) const;
 
@@ -261,6 +276,11 @@ public:
 
 	string MemberDisplayName(idx_t member) const;
 	static string KindDisplayName(SemanticMemberKind kind);
+
+private:
+	//! Up to two simple paths from -> to through the edges `allowed` accepts
+	vector<vector<SemanticEdge>> FindPaths(idx_t from, idx_t to,
+	                                       const std::function<bool(const SemanticEdge &)> &allowed) const;
 };
 
 //! Builds and validates a model from a parsed definition (catalog lookups through `context`)

@@ -1,0 +1,625 @@
+# name: test/sql/semantic_views/time_spine.test
+# description: built-in time spine (TIME (<column>) and metric_time): grains, join elimination, offsets, cumulative anchors
+# group: [semantic_views]
+
+require semantic_views
+
+statement ok
+PRAGMA enable_verification
+
+statement ok
+CREATE TABLE accounts (account_id INTEGER, country VARCHAR);
+
+statement ok
+INSERT INTO accounts VALUES (1, 'FR'), (2, 'US'), (3, 'DE');
+
+statement ok
+CREATE TABLE invoices (invoice_id INTEGER, account_id INTEGER, invoiced_at DATE, amount INTEGER);
+
+statement ok
+INSERT INTO invoices VALUES
+  (1, 1, '2026-01-01', 10), (2, 1, '2026-01-01', 5), (3, 2, '2026-01-03', 7), (4, 1, '2026-02-02', 20),
+  (5, 3, NULL, 100), (6, 1, '2025-01-15', 4), (7, 9, '2026-03-01', 1);
+
+statement ok
+CREATE TABLE lines (line_id INTEGER, invoice_id INTEGER, qty INTEGER);
+
+statement ok
+INSERT INTO lines VALUES (1, 1, 1), (2, 1, 2), (3, 1, 3);
+
+statement ok
+CREATE TABLE costs (cost_id INTEGER, incurred_at DATE, cost INTEGER);
+
+statement ok
+INSERT INTO costs VALUES (1, '2026-01-01', 3), (2, '2026-02-02', 8);
+
+statement ok
+CREATE SEMANTIC VIEW shop
+  TABLES (
+    account AS accounts PRIMARY KEY (account_id),
+    invoices PRIMARY KEY (invoice_id) TIME (invoiced_at),
+    lines PRIMARY KEY (line_id),
+    costs PRIMARY KEY (cost_id) TIME (incurred_at)
+  )
+  RELATIONSHIPS (
+    invoices (account_id) REFERENCES account,
+    lines (invoice_id) REFERENCES invoices
+  )
+  DIMENSIONS (
+    account.country AS country,
+    metric_time.weekday AS dayofweek(day),
+    invoices.only_time AS metric_time.day
+  )
+  METRICS (
+    invoices.revenue AS SUM(amount),
+    invoices.n AS COUNT(*),
+    costs.cost AS SUM(cost),
+    lines.qty AS SUM(qty),
+    invoices.revenue_ly OFFSET (metric_time.day BY INTERVAL 1 YEAR) AS revenue,
+    invoices.running CUMULATIVE (metric_time.day) AS SUM(amount),
+    invoices.last_7 CUMULATIVE (metric_time.day OVER INTERVAL 7 DAYS) AS SUM(amount),
+    invoices.mtd CUMULATIVE (metric_time.day TO MONTH) AS SUM(amount),
+    invoices.running_months AS SUM(revenue) OVER (ORDER BY metric_time.month)
+  );
+
+# every grain, including the NULL date as its own group, matches date_trunc of the fact column
+query I
+WITH facts AS (
+  SELECT invoiced_at AS d, amount FROM invoices
+), grains AS (
+  SELECT 'day' AS grain, d AS g, SUM(amount) AS revenue FROM facts GROUP BY d
+  UNION ALL
+  SELECT 'week', date_trunc('week', d)::DATE, SUM(amount) FROM facts GROUP BY 2
+  UNION ALL
+  SELECT 'month', date_trunc('month', d)::DATE, SUM(amount) FROM facts GROUP BY 2
+  UNION ALL
+  SELECT 'quarter', date_trunc('quarter', d)::DATE, SUM(amount) FROM facts GROUP BY 2
+  UNION ALL
+  SELECT 'year', date_trunc('year', d)::DATE, SUM(amount) FROM facts GROUP BY 2
+), actual AS (
+  SELECT 'day' AS grain, day AS g, revenue FROM SEMANTIC_VIEW(shop DIMENSIONS metric_time.day METRICS invoices.revenue)
+  UNION ALL
+  SELECT 'week', week, revenue FROM SEMANTIC_VIEW(shop DIMENSIONS metric_time.week METRICS invoices.revenue)
+  UNION ALL
+  SELECT 'month', month, revenue FROM SEMANTIC_VIEW(shop DIMENSIONS metric_time.month METRICS invoices.revenue)
+  UNION ALL
+  SELECT 'quarter', quarter, revenue FROM SEMANTIC_VIEW(shop DIMENSIONS metric_time.quarter METRICS invoices.revenue)
+  UNION ALL
+  SELECT 'year', year, revenue FROM SEMANTIC_VIEW(shop DIMENSIONS metric_time.year METRICS invoices.revenue)
+)
+SELECT count(*) FROM ((SELECT * FROM grains EXCEPT SELECT * FROM actual) UNION ALL (SELECT * FROM actual EXCEPT SELECT * FROM grains));
+----
+0
+
+# WHERE on a grain keeps that period, and drops the NULL date
+query II
+SELECT month, revenue
+FROM SEMANTIC_VIEW(shop DIMENSIONS metric_time.month METRICS invoices.revenue WHERE metric_time.year = DATE '2026-01-01')
+ORDER BY month;
+----
+2026-01-01	22
+2026-02-01	20
+2026-03-01	1
+
+# two facts merge on metric_time.month; a missing side is NULL, and the NULL invoice date is its own group
+query III
+SELECT month, revenue, cost
+FROM SEMANTIC_VIEW(shop DIMENSIONS metric_time.month METRICS invoices.revenue, costs.cost)
+ORDER BY month NULLS LAST;
+----
+2025-01-01	4	NULL
+2026-01-01	22	3
+2026-02-01	20	8
+2026-03-01	1	NULL
+NULL	100	NULL
+
+# the account join does not multiply revenue, and an invoice with no account is a NULL country
+query II
+SELECT country, revenue FROM SEMANTIC_VIEW(shop DIMENSIONS account.country METRICS invoices.revenue) ORDER BY country NULLS LAST;
+----
+DE	100
+FR	39
+US	7
+NULL	1
+
+# lines inherit the invoice time, and joining them does not multiply revenue (invoice 1 has three lines)
+query III
+SELECT month, revenue, qty
+FROM SEMANTIC_VIEW(shop DIMENSIONS metric_time.month METRICS invoices.revenue, lines.qty)
+WHERE month = DATE '2026-01-01';
+----
+2026-01-01	22	6
+
+query II
+SELECT month, AGG(revenue) FROM shop GROUP BY month HAVING month = DATE '2026-01-01';
+----
+2026-01-01	22
+
+# 2026-01-01 is a Thursday (DuckDB dayofweek: Sunday = 0)
+query I
+SELECT weekday FROM SEMANTIC_VIEW(shop DIMENSIONS metric_time.day, metric_time.weekday METRICS invoices.revenue) WHERE day = DATE '2026-01-01';
+----
+4
+
+# OFFSET moves the grain with the day
+query III
+SELECT month, revenue, revenue_ly
+FROM SEMANTIC_VIEW(shop DIMENSIONS metric_time.month METRICS invoices.revenue, invoices.revenue_ly WHERE metric_time.year = DATE '2026-01-01')
+ORDER BY month;
+----
+2026-01-01	22	4
+2026-02-01	20	NULL
+2026-03-01	1	NULL
+
+# a day with no invoices is absent from a plain aggregate and present in the running total (4 + 10 + 5)
+query I
+SELECT count(*) FROM SEMANTIC_VIEW(shop DIMENSIONS metric_time.day METRICS invoices.revenue) WHERE day = DATE '2026-01-02';
+----
+0
+
+query II
+SELECT day, running FROM SEMANTIC_VIEW(shop DIMENSIONS metric_time.day METRICS invoices.running)
+WHERE day IN (DATE '2026-01-01', DATE '2026-01-02', DATE '2026-01-03') ORDER BY day;
+----
+2026-01-01	19
+2026-01-02	19
+2026-01-03	26
+
+# WHERE on the year selects 2026 anchors; their windows still read 2025
+query I
+SELECT running FROM SEMANTIC_VIEW(shop DIMENSIONS metric_time.day METRICS invoices.running WHERE metric_time.year = DATE '2026-01-01')
+WHERE day = DATE '2026-01-01';
+----
+19
+
+query I
+WITH facts AS (
+  SELECT invoiced_at AS d, amount FROM invoices WHERE invoiced_at IS NOT NULL
+), bounds AS (
+  SELECT min(d) AS lo, max(d) AS hi FROM facts
+), anchors AS (
+  SELECT unnest(generate_series(lo, hi, INTERVAL 1 DAY))::DATE AS day FROM bounds
+), expected AS (
+  SELECT a.day, SUM(f.amount) AS running FROM anchors a JOIN facts f ON f.d <= a.day GROUP BY a.day
+), actual AS (
+  SELECT day, running FROM SEMANTIC_VIEW(shop DIMENSIONS metric_time.day METRICS invoices.running)
+)
+SELECT count(*) FROM ((SELECT * FROM expected EXCEPT SELECT * FROM actual) UNION ALL (SELECT * FROM actual EXCEPT SELECT * FROM expected));
+----
+0
+
+query II
+SELECT day, last_7 FROM SEMANTIC_VIEW(shop DIMENSIONS metric_time.day METRICS invoices.last_7)
+WHERE day IN (DATE '2026-01-02', DATE '2026-01-03') ORDER BY day;
+----
+2026-01-02	15
+2026-01-03	22
+
+query I
+WITH facts AS (
+  SELECT invoiced_at AS d, amount FROM invoices WHERE invoiced_at IS NOT NULL
+), bounds AS (
+  SELECT min(d) AS lo, max(d) AS hi FROM facts
+), anchors AS (
+  SELECT unnest(generate_series(lo, hi, INTERVAL 1 DAY))::DATE AS day FROM bounds
+), expected AS (
+  SELECT a.day, SUM(f.amount) AS last_7
+  FROM anchors a JOIN facts f ON f.d <= a.day AND f.d > a.day - INTERVAL 7 DAY
+  GROUP BY a.day
+), actual AS (
+  SELECT day, last_7 FROM SEMANTIC_VIEW(shop DIMENSIONS metric_time.day METRICS invoices.last_7)
+)
+SELECT count(*) FROM ((SELECT * FROM expected EXCEPT SELECT * FROM actual) UNION ALL (SELECT * FROM actual EXCEPT SELECT * FROM expected));
+----
+0
+
+query II
+SELECT month, mtd FROM SEMANTIC_VIEW(shop DIMENSIONS metric_time.month METRICS invoices.mtd) ORDER BY month;
+----
+2025-01-01	4
+2026-01-01	22
+2026-02-01	20
+2026-03-01	1
+
+# the spine is not joined, and a cumulative metric scans the fact table once (the dated rows are materialized)
+query I
+SELECT sql NOT ILIKE '%metric_time%'
+  AND (length(sql) - length(replace(sql, 'FROM memory.main.invoices', ''))) / length('FROM memory.main.invoices') = 1
+FROM semantic_view_sql('SELECT * FROM SEMANTIC_VIEW(shop DIMENSIONS metric_time.month METRICS invoices.revenue)');
+----
+true
+
+query I
+SELECT sql ILIKE '%AS MATERIALIZED%' AND sql NOT ILIKE '%metric_time%'
+  AND (length(sql) - length(replace(sql, 'FROM memory.main.invoices', ''))) / length('FROM memory.main.invoices') = 1
+FROM semantic_view_sql('SELECT * FROM SEMANTIC_VIEW(shop DIMENSIONS metric_time.day METRICS invoices.running)');
+----
+true
+
+query II
+SELECT month, running_months
+FROM SEMANTIC_VIEW(shop DIMENSIONS metric_time.month METRICS invoices.running_months WHERE metric_time.month IS NOT NULL)
+ORDER BY month;
+----
+2025-01-01	4
+2026-01-01	26
+2026-02-01	46
+2026-03-01	47
+
+statement ok
+ALTER SEMANTIC VIEW shop SET MAX_STALENESS = 3600;
+
+statement ok
+ALTER SEMANTIC VIEW shop ADD MATERIALIZATION revenue_by_month AS DIMENSIONS metric_time.month METRICS invoices.revenue;
+
+query I
+SELECT sql ILIKE '%shop__revenue_by_month__0%' AND sql NOT ILIKE '%metric_time%'
+FROM semantic_view_sql('SELECT * FROM SEMANTIC_VIEW(shop DIMENSIONS metric_time.month METRICS invoices.revenue)');
+----
+true
+
+query III
+SELECT len(tables), tables::VARCHAR NOT ILIKE '%metric_time%', not_incremental_reason NOT ILIKE '%metric_time%'
+FROM (SHOW SEMANTIC MATERIALIZATIONS IN shop) WHERE name = 'revenue_by_month';
+----
+1	true	true
+
+query II
+SELECT month, revenue
+FROM SEMANTIC_VIEW(shop DIMENSIONS metric_time.month METRICS invoices.revenue WHERE metric_time.year = DATE '2026-01-01')
+ORDER BY month;
+----
+2026-01-01	22
+2026-02-01	20
+2026-03-01	1
+
+query II
+SELECT object_name, property_value FROM (DESCRIBE SEMANTIC VIEW shop) WHERE property = 'TIME' ORDER BY 1;
+----
+costs	incurred_at
+invoices	invoiced_at
+
+query II
+SELECT property, property_value FROM (DESCRIBE SEMANTIC VIEW shop)
+WHERE object_kind = 'TABLE' AND object_name = 'metric_time' AND property IN ('PRIMARY_KEY', 'COMMENT') ORDER BY property;
+----
+COMMENT	Time spine
+PRIMARY_KEY	[day]
+
+query I
+SELECT count(*) FROM (DESCRIBE SEMANTIC VIEW shop)
+WHERE object_name = 'metric_time' AND property IN ('BASE_QUERY', 'BASE_TABLE_NAME', 'BASE_TABLE_DATABASE_NAME');
+----
+0
+
+query II
+SELECT property, property_value FROM (DESCRIBE SEMANTIC VIEW shop)
+WHERE object_kind = 'RELATIONSHIP' AND object_name = 'invoices_to_metric_time'
+  AND property IN ('TABLE', 'REF_TABLE', 'FOREIGN_KEY', 'REF_KEY')
+ORDER BY property;
+----
+FOREIGN_KEY	[invoiced_at]
+REF_KEY	[day]
+REF_TABLE	metric_time
+TABLE	invoices
+
+query I
+SELECT count(*) FROM (DESCRIBE SEMANTIC VIEW shop)
+WHERE object_kind = 'DIMENSION' AND parent_entity = 'metric_time' AND property = 'EXPRESSION' AND (
+  (object_name = 'day' AND property_value = '"day"') OR
+  (object_name IN ('week', 'month', 'quarter', 'year') AND property_value ILIKE '%date_trunc%')
+);
+----
+5
+
+query II
+SELECT name, data_type FROM (SHOW SEMANTIC DIMENSIONS IN shop)
+WHERE table_name = 'metric_time' AND name IN ('day', 'week', 'month', 'quarter', 'year') ORDER BY name;
+----
+day	DATE
+month	DATE
+quarter	DATE
+week	DATE
+year	DATE
+
+query I
+SELECT count(*) FROM (SHOW SEMANTIC DIMENSIONS IN shop FOR METRIC revenue)
+WHERE table_name = 'metric_time' AND name IN ('day', 'week', 'month', 'quarter', 'year');
+----
+5
+
+query II
+SELECT column_name, data_type FROM information_schema.columns
+WHERE table_name = 'shop' AND column_name IN ('day', 'week', 'month', 'quarter', 'year') ORDER BY column_name;
+----
+day	DATE
+month	DATE
+quarter	DATE
+week	DATE
+year	DATE
+
+# the spine has no rows, so its own dimensions cannot be queried alone. A dimension of a fact table that
+# only reads metric_time still runs from that fact table.
+statement error
+SELECT * FROM SEMANTIC_VIEW(shop DIMENSIONS metric_time.day);
+----
+has no rows
+
+query I
+SELECT count(*) FROM SEMANTIC_VIEW(shop DIMENSIONS invoices.only_time);
+----
+6
+
+query I
+SELECT sql NOT ILIKE '%metric_time%' AND sql ILIKE '%FROM memory.main.invoices%'
+FROM semantic_view_sql('SELECT * FROM SEMANTIC_VIEW(shop DIMENSIONS invoices.only_time)');
+----
+true
+
+query II
+SELECT only_time, revenue FROM SEMANTIC_VIEW(shop DIMENSIONS invoices.only_time METRICS invoices.revenue)
+WHERE only_time = DATE '2026-01-01';
+----
+2026-01-01	15
+
+# a name is reserved only when TIME is used
+statement ok
+CREATE SEMANTIC VIEW plain TABLES (metric_time AS invoices PRIMARY KEY (invoice_id)) METRICS (metric_time.n AS COUNT(*));
+
+statement ok
+DROP SEMANTIC VIEW plain;
+
+# TIMESTAMP time column, role-playing date, and a child that follows TIME unless USING says otherwise
+statement ok
+CREATE TABLE shipments (shipment_id INTEGER, ordered_at TIMESTAMP, shipped_at TIMESTAMP, booked INTEGER);
+
+statement ok
+INSERT INTO shipments VALUES (1, '2026-01-01 15:00:00', '2026-01-03 10:00:00', 10);
+
+statement ok
+CREATE TABLE details (detail_id INTEGER, shipment_id INTEGER, fees INTEGER);
+
+statement ok
+INSERT INTO details VALUES (1, 1, 2);
+
+statement ok
+CREATE SEMANTIC VIEW logistics
+  TABLES (
+    shipments PRIMARY KEY (shipment_id) TIME (ordered_at),
+    details PRIMARY KEY (detail_id)
+  )
+  RELATIONSHIPS (
+    details (shipment_id) REFERENCES shipments,
+    shipped AS shipments (shipped_at) REFERENCES metric_time
+  )
+  METRICS (
+    shipments.booked_amount AS SUM(booked),
+    shipments.shipped_amount USING (shipped) AS SUM(booked),
+    details.fee_total AS SUM(fees),
+    details.fees_shipped USING (shipped) AS SUM(fees)
+  );
+
+query II
+SELECT day, booked_amount FROM SEMANTIC_VIEW(logistics DIMENSIONS metric_time.day METRICS shipments.booked_amount);
+----
+2026-01-01	10
+
+query II
+SELECT day, shipped_amount FROM SEMANTIC_VIEW(logistics DIMENSIONS metric_time.day METRICS shipments.shipped_amount);
+----
+2026-01-03	10
+
+query II
+SELECT day, fee_total FROM SEMANTIC_VIEW(logistics DIMENSIONS metric_time.day METRICS details.fee_total);
+----
+2026-01-01	2
+
+query II
+SELECT day, fees_shipped FROM SEMANTIC_VIEW(logistics DIMENSIONS metric_time.day METRICS details.fees_shipped);
+----
+2026-01-03	2
+
+statement ok
+CREATE TABLE pings (id INTEGER, ts TIMESTAMPTZ, n INTEGER);
+
+statement ok
+INSERT INTO pings VALUES (1, '2026-01-02 01:30:00+00', 9);
+
+statement ok
+CREATE SEMANTIC VIEW tz TABLES (pings PRIMARY KEY (id) TIME (ts)) METRICS (pings.n AS SUM(n));
+
+query II
+SELECT day, n FROM SEMANTIC_VIEW(tz DIMENSIONS metric_time.day METRICS pings.n);
+----
+2026-01-02	9
+
+# two TIME columns: ambiguous until USING picks a relationship into the spine
+statement ok
+CREATE TABLE side_a (id INTEGER, d DATE, n INTEGER);
+
+statement ok
+INSERT INTO side_a VALUES (1, '2026-01-01', 1);
+
+statement ok
+CREATE TABLE side_b (id INTEGER, d DATE, n INTEGER);
+
+statement ok
+INSERT INTO side_b VALUES (1, '2026-02-01', 2);
+
+statement ok
+CREATE TABLE link (id INTEGER, a_id INTEGER, b_id INTEGER, n INTEGER);
+
+statement ok
+INSERT INTO link VALUES (1, 1, 1, 5);
+
+statement ok
+CREATE SEMANTIC VIEW bridge
+  TABLES (
+    a AS side_a PRIMARY KEY (id) TIME (d),
+    b AS side_b PRIMARY KEY (id) TIME (d),
+    link PRIMARY KEY (id)
+  )
+  RELATIONSHIPS (
+    link (a_id) REFERENCES a,
+    link (b_id) REFERENCES b
+  )
+  METRICS (
+    link.total AS SUM(n),
+    link.via_a USING (a_to_metric_time) AS SUM(n),
+    link.via_b USING (b_to_metric_time) AS SUM(n)
+  );
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(bridge DIMENSIONS metric_time.day METRICS link.total);
+----
+multiple relationship paths
+
+query II
+SELECT day, via_a FROM SEMANTIC_VIEW(bridge DIMENSIONS metric_time.day METRICS link.via_a);
+----
+2026-01-01	5
+
+query II
+SELECT day, via_b FROM SEMANTIC_VIEW(bridge DIMENSIONS metric_time.day METRICS link.via_b);
+----
+2026-02-01	5
+
+# a query-backed table can declare TIME
+statement ok
+CREATE SEMANTIC VIEW started
+  TABLES (
+    trials AS (SELECT event_id, occurred_at FROM (VALUES (1, DATE '2026-04-01'), (2, DATE '2026-04-02')) t(event_id, occurred_at))
+      PRIMARY KEY (event_id) TIME (occurred_at)
+  )
+  METRICS (trials.n AS COUNT(*));
+
+query II
+SELECT month, n FROM SEMANTIC_VIEW(started DIMENSIONS metric_time.month METRICS trials.n);
+----
+2026-04-01	2
+
+# a range hop in front of the spine reads the matched row's TIME column
+statement ok
+CREATE TABLE periods (id INTEGER, start_time TIMESTAMP, end_time TIMESTAMP);
+
+statement ok
+INSERT INTO periods VALUES
+  (1, '2026-01-01 00:00:00', '2026-01-10 00:00:00'),
+  (2, '2026-01-10 00:00:00', '2026-02-01 00:00:00');
+
+statement ok
+CREATE TABLE hits (id INTEGER, ts TIMESTAMP, n INTEGER);
+
+statement ok
+INSERT INTO hits VALUES (1, '2026-01-05 12:00:00', 3), (2, '2026-01-15 12:00:00', 4);
+
+statement ok
+CREATE SEMANTIC VIEW ranged
+  TABLES (
+    periods PRIMARY KEY (id) TIME (start_time)
+      CONSTRAINT r DISTINCT RANGE BETWEEN start_time AND end_time EXCLUSIVE,
+    hits PRIMARY KEY (id)
+  )
+  RELATIONSHIPS (
+    hits (ts) REFERENCES periods (BETWEEN start_time AND end_time EXCLUSIVE)
+  )
+  METRICS (hits.n AS SUM(n));
+
+query II
+SELECT day, n FROM SEMANTIC_VIEW(ranged DIMENSIONS metric_time.day METRICS hits.n) ORDER BY day;
+----
+2026-01-01	3
+2026-01-10	4
+
+# the last snapshot of each month, not the sum of the snapshots
+statement ok
+CREATE TABLE balances (id INTEGER, account_id INTEGER, as_of DATE, balance INTEGER);
+
+statement ok
+INSERT INTO balances VALUES
+  (1, 1, '2026-01-30', 10), (2, 1, '2026-01-31', 12), (3, 1, '2026-02-01', 7),
+  (4, 2, '2026-01-31', 4), (5, 2, '2026-02-01', 5);
+
+statement ok
+CREATE SEMANTIC VIEW bals
+  TABLES (balances PRIMARY KEY (id) TIME (as_of))
+  METRICS (balances.level NON ADDITIVE BY (metric_time.day) AS SUM(balance));
+
+query II
+SELECT month, level FROM SEMANTIC_VIEW(bals DIMENSIONS metric_time.month METRICS balances.level) ORDER BY month;
+----
+2026-01-01	16
+2026-02-01	12
+
+statement error
+CREATE SEMANTIC VIEW bad TABLES (o AS invoices PRIMARY KEY (invoice_id) TIME (invoiced_at) TIME (invoiced_at)) METRICS (o.n AS COUNT(*));
+----
+more than one TIME
+
+statement error
+CREATE SEMANTIC VIEW bad TABLES (o AS invoices PRIMARY KEY (invoice_id) TIME (invoice_id, invoiced_at)) METRICS (o.n AS COUNT(*));
+----
+exactly one column
+
+statement error
+CREATE SEMANTIC VIEW bad TABLES (o AS invoices PRIMARY KEY (invoice_id) TIME (invoiced_at));
+----
+at least one dimension or metric
+
+statement error
+CREATE SEMANTIC VIEW bad TABLES (
+  metric_time AS invoices PRIMARY KEY (invoice_id),
+  o AS invoices PRIMARY KEY (invoice_id) TIME (invoiced_at)
+) METRICS (o.n AS COUNT(*));
+----
+is reserved
+
+statement error
+CREATE SEMANTIC VIEW bad TABLES (o AS invoices PRIMARY KEY (invoice_id) TIME (amount)) METRICS (o.n AS COUNT(*));
+----
+must be a DATE or TIMESTAMP
+
+statement error
+CREATE SEMANTIC VIEW bad TABLES (o AS invoices PRIMARY KEY (invoice_id) TIME (nope)) METRICS (o.n AS COUNT(*));
+----
+does not exist
+
+statement error
+CREATE SEMANTIC VIEW bad TABLES (o AS invoices PRIMARY KEY (invoice_id) TIME (invoiced_at))
+  RELATIONSHIPS (o_to_metric_time AS o (invoiced_at) REFERENCES metric_time)
+  METRICS (o.n AS COUNT(*));
+----
+is generated for TIME
+
+statement error
+CREATE SEMANTIC VIEW bad TABLES (o AS invoices PRIMARY KEY (invoice_id) TIME (invoiced_at))
+  RELATIONSHIPS (r AS o (invoiced_at) REFERENCES metric_time (ASOF day))
+  METRICS (o.n AS COUNT(*));
+----
+exactly one column
+
+statement error
+CREATE SEMANTIC VIEW bad TABLES (o AS invoices PRIMARY KEY (invoice_id) TIME (invoiced_at))
+  RELATIONSHIPS (r AS o (invoiced_at) REFERENCES metric_time (BETWEEN day AND day EXCLUSIVE))
+  METRICS (o.n AS COUNT(*));
+----
+metric_time
+
+statement error
+CREATE SEMANTIC VIEW bad TABLES (o AS invoices PRIMARY KEY (invoice_id) TIME (invoiced_at))
+  RELATIONSHIPS (r AS o (invoice_id) REFERENCES metric_time)
+  METRICS (o.n AS COUNT(*));
+----
+must be a DATE or TIMESTAMP to reference
+
+statement error
+CREATE SEMANTIC VIEW bad TABLES (o AS invoices PRIMARY KEY (invoice_id) TIME (invoiced_at))
+  FACTS (metric_time.f AS day) METRICS (o.n AS COUNT(*));
+----
+only dimensions
+
+statement error
+CREATE SEMANTIC VIEW bad TABLES (o AS invoices PRIMARY KEY (invoice_id) TIME (invoiced_at))
+  DIMENSIONS (metric_time.month AS date_trunc('month', day)) METRICS (o.n AS COUNT(*));
+----
+Duplicate semantic expression

@@ -902,6 +902,11 @@ unique_ptr<SelectStatement> SemanticQueryCompiler::CompileRowQuery(SemanticExpre
 	if (base == DConstants::INVALID_INDEX) {
 		throw SemanticDefinitionException("SEMANTIC_VIEW must reference at least one dimension or fact");
 	}
+	if (!has_facts && model.IsTimeSpine(base)) {
+		throw SemanticDefinitionException(
+		    "Invalid SEMANTIC_VIEW query: \"%s\" is the time spine and has no rows; query a metric or a fact with it",
+		    model.tables[base].name);
+	}
 	if (has_facts && has_dimensions && row_tables.size() > 1) {
 		throw SemanticDefinitionException(
 		    "When FACTS and DIMENSIONS are both specified, all facts and dimensions (including "

@@ -21,12 +21,13 @@ SemanticLogicalTable <- SemanticTableAliasAs? SemanticTableSource SemanticTableO
 SemanticTableAliasAs <- ColId 'AS'
 SemanticTableSource <- SemanticParensSelect / BaseTableName
 SemanticParensSelect <- Parens(SelectStatementInternal)
-SemanticTableOption <- SemanticPrimaryKey / SemanticUnique / SemanticRangeConstraint / SemanticWithSynonyms / SemanticComment / SemanticTag
+SemanticTableOption <- SemanticPrimaryKey / SemanticUnique / SemanticRangeConstraint / SemanticTimeColumn / SemanticWithSynonyms / SemanticComment / SemanticTag
 SemanticPrimaryKey <- 'PRIMARY' 'KEY' SemanticColumnList
 SemanticUnique <- 'UNIQUE' SemanticColumnList
 SemanticRangeConstraint <- 'CONSTRAINT' SemanticConstraintName? 'DISTINCT' 'RANGE' 'BETWEEN' ColId 'AND' ColId 'EXCLUSIVE'
 SemanticConstraintName <- ColId
 SemanticColumnList <- Parens(List(ColId))
+SemanticTimeColumn <- 'TIME' SemanticColumnList
 
 SemanticRelationshipsClause <- 'RELATIONSHIPS' Parens(List(SemanticRelationship))
 SemanticRelationship <- SemanticRelationshipName? ColId SemanticColumnList 'REFERENCES' ColId SemanticReferencedColumns?

@@ -172,6 +172,16 @@ ParsedSemanticTable TransformSemanticLogicalTable(PEGTransformer &transformer, o
 			table.unique_keys.push_back(transformer.Transform<vector<string>>(List(option), 1));
 		} else if (option->name == "SemanticRangeConstraint") {
 			table.range_constraints.push_back(transformer.Transform<ParsedSemanticRangeConstraint>(option));
+		} else if (option->name == "SemanticTimeColumn") {
+			// 'TIME' SemanticColumnList
+			auto columns = transformer.Transform<vector<string>>(List(option), 1);
+			if (!table.time_column.empty()) {
+				throw ParserException("semantic view: logical table has more than one TIME");
+			}
+			if (columns.size() != 1) {
+				throw ParserException("semantic view: TIME takes exactly one column");
+			}
+			table.time_column = std::move(columns[0]);
 		} else if (option->name == "SemanticWithSynonyms") {
 			table.synonyms = transformer.Transform<vector<string>>(option);
 		} else if (option->name == "SemanticComment") {

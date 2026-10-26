@@ -42,6 +42,7 @@ set(EXTENSION_SOURCES
     src/semantic_query_compiler.cpp
     src/semantic_sql_rewrite.cpp
     src/semantic_time_reads.cpp
+    src/semantic_time_spine.cpp
     src/semantic_statement_visitor.cpp
     src/semantic_view_registry.cpp
     src/parser/semantic_views_parser.cpp)
