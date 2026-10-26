@@ -52,7 +52,7 @@ public:
 
 private:
 	static SemanticViewsPendingBind &Get(ClientContext &context) {
-		return *context.registered_state->GetOrCreate<SemanticViewsPendingBind>("semantic_views_pending_bind");
+		return *context.registered_state->GetOrCreate<SemanticViewsPendingBind>("semantic_layer_pending_bind");
 	}
 
 	unique_ptr<SQLStatement> pending;
@@ -139,7 +139,7 @@ public:
 	}
 
 	static void Register(ClientContext &context, shared_ptr<SemanticViewsState> state) {
-		context.registered_state->GetOrCreate<SemanticViewsRebindState>("semantic_views_rebind", std::move(state));
+		context.registered_state->GetOrCreate<SemanticViewsRebindState>("semantic_layer_rebind", std::move(state));
 	}
 
 	bool CanRequestRebind() override {

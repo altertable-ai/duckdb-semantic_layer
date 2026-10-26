@@ -1,5 +1,5 @@
 # name: test/sql/semantic_layer/parser_passthrough.test
-# description: ordinary SQL is unaffected by the semantic_views parser extension
+# description: ordinary SQL is unaffected by the semantic_layer parser extension
 # group: [semantic_layer]
 
 require semantic_layer
@@ -35,6 +35,6 @@ syntax error at or near "SELEC"
 
 # the vendored PEG parser is wired in and round-trips SQL
 query I
-SELECT rewritten_sql FROM semantic_views_peg_parse('SELECT 1 AS x');
+SELECT rewritten_sql FROM semantic_layer_peg_parse('SELECT 1 AS x');
 ----
 SELECT 1 AS x

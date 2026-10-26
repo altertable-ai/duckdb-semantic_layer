@@ -1,6 +1,6 @@
 # Benchmarks
 
-`scripts/bench_semantic_views.py` compares every `SEMANTIC_VIEW(...)` query in
+`scripts/bench_semantic_layer.py` compares every `SEMANTIC_VIEW(...)` query in
 `benchmark/semantic_layer/queries.sql` with an equivalent hand-written query: it checks that both return the same
 rows and reports the median wall time of each (DuckDB CLI `.timer`, queries alternated).
 
@@ -43,7 +43,7 @@ visible on q1.
 
 ```bash
 GEN=ninja make
-python3 scripts/bench_semantic_views.py --db /tmp/semantic_views_bench.duckdb --rows 100000000 --runs 11
+python3 scripts/bench_semantic_layer.py --db /tmp/semantic_layer_bench.duckdb --rows 100000000 --runs 11
 ```
 
 The database is generated on the first run (about 3 GB on disk).
@@ -272,7 +272,7 @@ These local measurements describe this workload; refresh timing also reflects ca
 
 ```bash
 VCPKG_TOOLCHAIN_PATH=<vcpkg>/scripts/buildsystems/vcpkg.cmake GEN=ninja make
-python3 scripts/bench_materializations.py --dir /tmp/semantic_views_materializations --rows 100000000 --runs 11
+python3 scripts/bench_materializations.py --dir /tmp/semantic_layer_materializations --rows 100000000 --runs 11
 ```
 
 The script saves the generated SQL and raw CLI output in `--dir/benchmark.sql` and `--dir/benchmark.log`.

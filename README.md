@@ -699,7 +699,7 @@ The benchmark generates a 100M-row star schema and compares every semantic query
 (results and timings):
 
 ```bash
-python3 scripts/bench_semantic_views.py --db /tmp/semantic_views_bench.duckdb --rows 100000000
+python3 scripts/bench_semantic_layer.py --db /tmp/semantic_layer_bench.duckdb --rows 100000000
 ```
 
 ### Layout

@@ -2,7 +2,7 @@
 """Benchmark SEMANTIC_VIEW queries against equivalent hand-written SQL.
 
 Usage:
-    python3 scripts/bench_semantic_views.py --db /path/to/bench.duckdb [--rows 100000000] [--runs 5]
+    python3 scripts/bench_semantic_layer.py --db /path/to/bench.duckdb [--rows 100000000] [--runs 5]
 
 The database is generated on first use (benchmark/semantic_layer/generate.sql).
 For every query pair in benchmark/semantic_layer/queries.sql the script checks that
