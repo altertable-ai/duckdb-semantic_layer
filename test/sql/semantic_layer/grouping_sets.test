@@ -5,6 +5,9 @@
 require semantic_layer
 
 statement ok
+PRAGMA enable_verification
+
+statement ok
 CREATE TABLE grouping_values (category VARCHAR, value INTEGER);
 INSERT INTO grouping_values VALUES ('A', 10), ('A', 20), ('B', 30);
 CREATE SEMANTIC VIEW grouping_view TABLES (t AS grouping_values) DIMENSIONS (t.category AS category) METRICS (t.total AS SUM(value));

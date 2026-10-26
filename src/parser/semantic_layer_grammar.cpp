@@ -1139,6 +1139,31 @@ void SetTransform(vector<GrammarChange> &changes, const char *rule_name, rule_tr
 //===--------------------------------------------------------------------===//
 // Activation
 //===--------------------------------------------------------------------===//
+//! The DuckDB CLI runs `SET active_grammar_extensions=['shell']` as the first
+//! query of every connection it opens, replacing a grammar activated when the
+//! connection opened (statically linked builds): add it back after that query.
+//! Any other list is the user's choice and is left alone.
+class SemanticViewsShellGrammarRestore final : public ClientContextState {
+public:
+	static constexpr const char *KEY = "semantic_layer_shell_grammar_restore";
+	static constexpr const char *SHELL_GRAMMAR = "shell";
+
+	explicit SemanticViewsShellGrammarRestore(shared_ptr<SemanticViewsGrammarExtension> grammar_p)
+	    : grammar(std::move(grammar_p)) {
+	}
+
+	void QueryEnd(ClientContext &context) override {
+		auto &active = ClientConfig::GetConfig(context).active_grammar_extensions;
+		if (active.size() == 1 && StringUtil::CIEquals(active[0], SHELL_GRAMMAR)) {
+			grammar->Activate(context);
+		}
+		context.registered_state->Remove(KEY);
+	}
+
+private:
+	shared_ptr<SemanticViewsGrammarExtension> grammar;
+};
+
 //! Connections opened after LOAD parse with the grammar from the start
 class SemanticViewsGrammarActivation final : public ExtensionCallback {
 public:
@@ -1148,6 +1173,8 @@ public:
 
 	void OnConnectionOpened(ClientContext &context) override {
 		grammar->Activate(context);
+		context.registered_state->GetOrCreate<SemanticViewsShellGrammarRestore>(SemanticViewsShellGrammarRestore::KEY,
+		                                                                        grammar);
 	}
 
 private:

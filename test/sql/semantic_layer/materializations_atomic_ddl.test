@@ -5,6 +5,9 @@
 require semantic_layer
 
 statement ok
+PRAGMA enable_verification
+
+statement ok
 CREATE TABLE t (id INTEGER, amount INTEGER);
 INSERT INTO t VALUES (1, 10);
 CREATE SEMANTIC VIEW v TABLES (t AS t PRIMARY KEY (id)) METRICS (t.total AS SUM(amount));

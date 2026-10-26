@@ -5,6 +5,9 @@
 require semantic_layer
 
 statement ok
+PRAGMA enable_verification
+
+statement ok
 ATTACH '__TEST_DIR__/restore_readonly.db' AS store;
 CREATE TABLE t (id INTEGER, amount INTEGER);
 INSERT INTO t VALUES (1, 10);

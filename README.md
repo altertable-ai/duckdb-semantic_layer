@@ -679,8 +679,10 @@ relationships are about 9x faster than a hand-written range join. See [docs/benc
   semantic views work but are not listed. A plain `DROP VIEW x` removes only the placeholder.
 - A DuckDB view cannot be defined over the query-by-name form; use `SEMANTIC_VIEW(...)` in view definitions.
 - The semantic view syntax is a grammar extension that `LOAD semantic_layer` turns on for every connection. A
-  connection that was already open switches once its current query ends, so `LOAD semantic_layer; SHOW SEMANTIC
-  VIEWS;` sent as a single query string fails to parse: send the `LOAD` on its own first.
+  connection that was already open switches once its current (or, when the extension is loaded through an API rather
+  than a `LOAD` statement, next) query ends, so `LOAD semantic_layer; SHOW SEMANTIC VIEWS;` sent as a single query
+  string fails to parse: send the `LOAD` on its own first. `SET active_grammar_extensions = ['semantic_layer']`
+  switches a connection right away.
 
 ## Development
 

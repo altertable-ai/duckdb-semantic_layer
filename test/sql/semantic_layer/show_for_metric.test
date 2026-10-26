@@ -5,6 +5,9 @@
 require semantic_layer
 
 statement ok
+PRAGMA enable_verification
+
+statement ok
 CREATE TABLE regions (id INTEGER, name VARCHAR);
 INSERT INTO regions VALUES (1, 'EMEA'), (2, 'AMER');
 CREATE TABLE customers (id INTEGER, name VARCHAR, region_id INTEGER);
