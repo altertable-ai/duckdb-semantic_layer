@@ -12,6 +12,7 @@
 #include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/expression/comparison_expression.hpp"
 #include "duckdb/parser/expression/conjunction_expression.hpp"
+#include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/expression/subquery_expression.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
@@ -21,6 +22,12 @@ namespace duckdb {
 
 inline unique_ptr<ParsedExpression> ColumnRef(const string &column, const string &table = string()) {
 	return table.empty() ? make_uniq<ColumnRefExpression>(column) : make_uniq<ColumnRefExpression>(column, table);
+}
+
+//! name(children...), or an operator such as "-" when `is_operator`
+inline unique_ptr<ParsedExpression> Call(const string &name, vector<unique_ptr<ParsedExpression>> children,
+                                         bool is_operator = false) {
+	return make_uniq<FunctionExpression>(name, std::move(children), nullptr, nullptr, false, is_operator);
 }
 
 inline unique_ptr<ParsedExpression> Compare(ExpressionType type, unique_ptr<ParsedExpression> left,

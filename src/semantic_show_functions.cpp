@@ -221,7 +221,7 @@ static unique_ptr<FunctionData> DescribeBind(ClientContext &context, TableFuncti
 			add(kind, object, null_value, "BASE_TABLE_DATABASE_NAME", table.catalog_name);
 			add(kind, object, null_value, "BASE_TABLE_SCHEMA_NAME", table.schema_name);
 			add(kind, object, null_value, "BASE_TABLE_NAME", table.table_name);
-		} else {
+		} else if (!model->IsTimeSpine(t)) {
 			add(kind, object, null_value, "BASE_QUERY", table.source->ToString());
 		}
 		if (!table.primary_key.empty()) {
@@ -234,7 +234,8 @@ static unique_ptr<FunctionData> DescribeBind(ClientContext &context, TableFuncti
 			add(kind, object, null_value, "SYNONYMS", BracketList(table.synonyms));
 		}
 		add(kind, object, null_value, "COMMENT", table.comment);
-		add(kind, object, null_value, "TAGS", TagList(definition.tables[t].tags));
+		add(kind, object, null_value, "TIME", table.time_column);
+		add(kind, object, null_value, "TAGS", TagList(table.tags));
 	}
 	for (auto &rel : model->relationships) {
 		Value kind("RELATIONSHIP");

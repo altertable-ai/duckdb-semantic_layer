@@ -24,6 +24,7 @@
 #include "semantic_materialization.hpp"
 #include "semantic_cumulative.hpp"
 #include "semantic_query_compiler.hpp"
+#include "semantic_time_spine.hpp"
 
 namespace duckdb {
 
@@ -183,7 +184,25 @@ private:
 			}
 			table.synonyms = parsed.synonyms;
 			table.comment = parsed.comment;
+			table.tags = parsed.tags;
+			if (!parsed.time_column.empty()) {
+				table.time_column = ResolveColumn(table, parsed.time_column, "TIME");
+				auto &time_type = table.column_types[table.columns.at(table.time_column)];
+				if (!SemanticIsTimeType(time_type)) {
+					Fail("TIME column \"%s.%s\" must be a DATE or TIMESTAMP (%s)", table.name, table.time_column,
+					     time_type.ToString());
+				}
+			}
 			model->tables.push_back(std::move(table));
+		}
+		auto timed = std::any_of(model->tables.begin(), model->tables.end(),
+		                         [](const SemanticTable &table) { return !table.time_column.empty(); });
+		if (timed) {
+			if (model->FindTable(SEMANTIC_TIME_SPINE_TABLE).IsValid()) {
+				Fail("logical table name \"%s\" is reserved when a table declares TIME", SEMANTIC_TIME_SPINE_TABLE);
+			}
+			model->time_spine = model->tables.size();
+			model->tables.push_back(SemanticTimeSpineTable());
 		}
 	}
 
@@ -224,8 +243,51 @@ private:
 			} else {
 				ResolveKeyReference(parsed, rel);
 			}
-			rel.one_to_one =
-			    !rel.is_range && rel.asof_index == DConstants::INVALID_INDEX && from.IsKey(rel.from_columns);
+			if (model->IsTimeSpine(rel.to_table)) {
+				CheckTimeSpineReference(rel);
+			}
+			// never walk from the time spine back to a table, even when the referencing column is a key
+			rel.one_to_one = !rel.is_range && rel.asof_index == DConstants::INVALID_INDEX &&
+			                 !model->IsTimeSpine(rel.to_table) && from.IsKey(rel.from_columns);
+			model->relationships.push_back(std::move(rel));
+		}
+		AddTimeRelationships(names);
+	}
+
+	//! A relationship into the time spine references its day from one DATE or timestamp column
+	void CheckTimeSpineReference(const SemanticRelationship &rel) {
+		if (rel.is_range || rel.asof_index != DConstants::INVALID_INDEX || rel.from_columns.size() != 1 ||
+		    !StringUtil::CIEquals(rel.to_columns[0], SEMANTIC_TIME_SPINE_COLUMN)) {
+			Fail("relationship \"%s\": a relationship to \"%s\" references its \"%s\" column from exactly one column",
+			     rel.name, SEMANTIC_TIME_SPINE_TABLE, SEMANTIC_TIME_SPINE_COLUMN);
+		}
+		auto &from = model->tables[rel.from_table];
+		auto &time_type = from.column_types[from.columns.at(rel.from_columns[0])];
+		if (!SemanticIsTimeType(time_type)) {
+			Fail("relationship \"%s\": column \"%s.%s\" must be a DATE or TIMESTAMP to reference \"%s\" (%s)", rel.name,
+			     from.name, rel.from_columns[0], SEMANTIC_TIME_SPINE_TABLE, time_type.ToString());
+		}
+	}
+
+	//! TIME (<column>): the table's default relationship into the time spine
+	void AddTimeRelationships(case_insensitive_set_t &names) {
+		for (idx_t t = 0; t < model->tables.size(); t++) {
+			auto &table = model->tables[t];
+			if (table.time_column.empty()) {
+				continue;
+			}
+			SemanticRelationship rel;
+			rel.name = table.name + "_to_" + SEMANTIC_TIME_SPINE_TABLE;
+			rel.from_table = t;
+			rel.to_table = model->time_spine.GetIndex();
+			rel.from_columns = {table.time_column};
+			rel.to_columns = {SEMANTIC_TIME_SPINE_COLUMN};
+			rel.is_default = true;
+			if (!names.insert(rel.name).second) {
+				Fail("relationship name \"%s\" is generated for TIME (%s) of logical table \"%s\"; rename the other "
+				     "relationship",
+				     rel.name, table.time_column, table.name);
+			}
 			model->relationships.push_back(std::move(rel));
 		}
 	}
@@ -326,63 +388,77 @@ private:
 
 	void AddMembers(const vector<ParsedSemanticMember> &parsed_members) {
 		for (auto &parsed : parsed_members) {
-			SemanticMember member;
-			member.parsed = &parsed;
-			if (parsed.table.empty()) {
-				member.table = DConstants::INVALID_INDEX;
-				for (auto &existing : model->members) {
-					if (existing.Kind() == SemanticMemberKind::METRIC &&
-					    StringUtil::CIEquals(existing.Name(), member.Name())) {
-						Fail("Derived metric \"%s\" has the same name as another metric", member.Name());
-					}
-				}
-			} else {
-				member.table = RequireTable(parsed.table, "\"" + parsed.FullName() + "\"");
-			}
-			for (auto &existing : model->members) {
-				if (existing.table == member.table && StringUtil::CIEquals(existing.Name(), member.Name())) {
-					Fail("Duplicate semantic expression \"%s\"", parsed.FullName());
-				}
-				if (existing.IsDerived() && member.Kind() == SemanticMemberKind::METRIC &&
-				    StringUtil::CIEquals(existing.Name(), member.Name())) {
-					Fail("Metric \"%s\" has the same name as a derived metric", parsed.FullName());
-				}
-			}
-			for (auto &rel_name : parsed.using_relationships) {
-				if (member.Kind() != SemanticMemberKind::METRIC) {
-					Fail("USING is only allowed on metrics (\"%s\")", parsed.FullName());
-				}
-				idx_t found = DConstants::INVALID_INDEX;
-				for (idx_t r = 0; r < model->relationships.size(); r++) {
-					if (StringUtil::CIEquals(model->relationships[r].name, rel_name)) {
-						found = r;
-					}
-				}
-				if (found == DConstants::INVALID_INDEX) {
-					Fail("Unknown relationship \"%s\" in USING of \"%s\"", rel_name, parsed.FullName());
-				}
-				member.using_relationships.push_back(found);
-			}
-			if (!parsed.non_additive_by.empty() && member.Kind() != SemanticMemberKind::METRIC) {
-				Fail("NON ADDITIVE BY is only allowed on metrics (\"%s\")", parsed.FullName());
-			}
-			if (parsed.filter && member.Kind() != SemanticMemberKind::METRIC) {
-				Fail("FILTER is only allowed on metrics (\"%s\")", parsed.FullName());
-			}
-			if (!parsed.offset_dimension.empty() && member.Kind() != SemanticMemberKind::METRIC) {
-				Fail("OFFSET is only allowed on metrics (\"%s\")", parsed.FullName());
-			}
-			if (!parsed.cumulative_dimension.empty() && member.Kind() != SemanticMemberKind::METRIC) {
-				Fail("CUMULATIVE is only allowed on metrics (\"%s\")", parsed.FullName());
-			}
-			model->members.push_back(std::move(member));
+			AddMember(parsed);
 		}
+	}
+
+	void AddMember(const ParsedSemanticMember &parsed) {
+		SemanticMember member;
+		member.parsed = &parsed;
+		if (parsed.table.empty()) {
+			member.table = DConstants::INVALID_INDEX;
+			for (auto &existing : model->members) {
+				if (existing.Kind() == SemanticMemberKind::METRIC &&
+				    StringUtil::CIEquals(existing.Name(), member.Name())) {
+					Fail("Derived metric \"%s\" has the same name as another metric", member.Name());
+				}
+			}
+		} else {
+			member.table = RequireTable(parsed.table, "\"" + parsed.FullName() + "\"");
+			if (model->IsTimeSpine(member.table) && parsed.kind != SemanticMemberKind::DIMENSION) {
+				Fail("logical table \"%s\" is the time spine; only dimensions can be defined on it",
+				     SEMANTIC_TIME_SPINE_TABLE);
+			}
+		}
+		for (auto &existing : model->members) {
+			if (existing.table == member.table && StringUtil::CIEquals(existing.Name(), member.Name())) {
+				Fail("Duplicate semantic expression \"%s\"", parsed.FullName());
+			}
+			if (existing.IsDerived() && member.Kind() == SemanticMemberKind::METRIC &&
+			    StringUtil::CIEquals(existing.Name(), member.Name())) {
+				Fail("Metric \"%s\" has the same name as a derived metric", parsed.FullName());
+			}
+		}
+		for (auto &rel_name : parsed.using_relationships) {
+			if (member.Kind() != SemanticMemberKind::METRIC) {
+				Fail("USING is only allowed on metrics (\"%s\")", parsed.FullName());
+			}
+			idx_t found = DConstants::INVALID_INDEX;
+			for (idx_t r = 0; r < model->relationships.size(); r++) {
+				if (StringUtil::CIEquals(model->relationships[r].name, rel_name)) {
+					found = r;
+				}
+			}
+			if (found == DConstants::INVALID_INDEX) {
+				Fail("Unknown relationship \"%s\" in USING of \"%s\"", rel_name, parsed.FullName());
+			}
+			member.using_relationships.push_back(found);
+		}
+		if (!parsed.non_additive_by.empty() && member.Kind() != SemanticMemberKind::METRIC) {
+			Fail("NON ADDITIVE BY is only allowed on metrics (\"%s\")", parsed.FullName());
+		}
+		if (parsed.filter && member.Kind() != SemanticMemberKind::METRIC) {
+			Fail("FILTER is only allowed on metrics (\"%s\")", parsed.FullName());
+		}
+		if (!parsed.offset_dimension.empty() && member.Kind() != SemanticMemberKind::METRIC) {
+			Fail("OFFSET is only allowed on metrics (\"%s\")", parsed.FullName());
+		}
+		if (!parsed.cumulative_dimension.empty() && member.Kind() != SemanticMemberKind::METRIC) {
+			Fail("CUMULATIVE is only allowed on metrics (\"%s\")", parsed.FullName());
+		}
+		model->members.push_back(std::move(member));
 	}
 
 	void BuildMembers() {
 		AddMembers(definition.facts);
 		AddMembers(definition.dimensions);
 		AddMembers(definition.metrics);
+		if (model->time_spine.IsValid()) {
+			model->generated_members = SemanticTimeSpineDimensions();
+			for (auto &dimension : model->generated_members) {
+				AddMember(*dimension);
+			}
+		}
 	}
 
 	string What(idx_t member_idx) {

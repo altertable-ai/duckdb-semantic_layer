@@ -75,10 +75,6 @@ vector<string> SemanticMaterializedAtom::StateColumns() const {
 	}
 }
 
-static unique_ptr<ParsedExpression> Call(const string &name, vector<unique_ptr<ParsedExpression>> children) {
-	return make_uniq<FunctionExpression>(name, std::move(children));
-}
-
 static unique_ptr<ParsedExpression> Call(const string &name, unique_ptr<ParsedExpression> child) {
 	vector<unique_ptr<ParsedExpression>> children;
 	children.push_back(std::move(child));
