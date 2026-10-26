@@ -13,17 +13,17 @@ static constexpr const char *ATOM_MARKER = "__sv_atom__";
 
 unique_ptr<ParsedExpression> SemanticMarkers::Column(idx_t table, const string &column) {
 	vector<string> names {COLUMN_MARKER, to_string(table), column};
-	return make_uniq<ColumnRefExpression>(std::move(names));
+	return make_uniq<ColumnRefExpression>(StringsToIdentifiers(names));
 }
 
 unique_ptr<ParsedExpression> SemanticMarkers::Member(idx_t member) {
 	vector<string> names {MEMBER_MARKER, to_string(member)};
-	return make_uniq<ColumnRefExpression>(std::move(names));
+	return make_uniq<ColumnRefExpression>(StringsToIdentifiers(names));
 }
 
 unique_ptr<ParsedExpression> SemanticMarkers::Atom(idx_t atom) {
 	vector<string> names {ATOM_MARKER, to_string(atom)};
-	return make_uniq<ColumnRefExpression>(std::move(names));
+	return make_uniq<ColumnRefExpression>(StringsToIdentifiers(names));
 }
 
 SemanticRef SemanticMarkers::Classify(const ParsedExpression &expr) {
@@ -31,10 +31,10 @@ SemanticRef SemanticMarkers::Classify(const ParsedExpression &expr) {
 	if (expr.GetExpressionClass() != ExpressionClass::COLUMN_REF) {
 		return result;
 	}
-	auto &names = expr.Cast<ColumnRefExpression>().column_names;
+	auto &names = expr.Cast<ColumnRefExpression>().ColumnNames();
 	if (names.size() == 3 && names[0] == COLUMN_MARKER) {
 		result.kind = SemanticRefKind::COLUMN;
-		result.column = names[2];
+		result.column = names[2].GetIdentifierName();
 	} else if (names.size() == 2 && names[0] == MEMBER_MARKER) {
 		result.kind = SemanticRefKind::MEMBER;
 	} else if (names.size() == 2 && names[0] == ATOM_MARKER) {
@@ -42,13 +42,14 @@ SemanticRef SemanticMarkers::Classify(const ParsedExpression &expr) {
 	} else {
 		return result;
 	}
-	result.index = std::stoull(names[1]);
+	result.index = std::stoull(names[1].GetIdentifierName());
 	return result;
 }
 
 bool SemanticMarkers::IsExcluding(const ParsedExpression &expr) {
 	return expr.GetExpressionClass() == ExpressionClass::FUNCTION &&
-	       StringUtil::CIEquals(expr.Cast<FunctionExpression>().function_name, SEMANTIC_EXCLUDING_FUNCTION);
+	       StringUtil::CIEquals(expr.Cast<FunctionExpression>().FunctionName().GetIdentifierName(),
+	                            SEMANTIC_EXCLUDING_FUNCTION);
 }
 
 } // namespace duckdb

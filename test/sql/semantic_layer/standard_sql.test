@@ -1,0 +1,310 @@
+# name: test/sql/semantic_layer/standard_sql.test
+# description: querying a semantic view by name in the FROM clause (SELECT dim, AGG(metric) FROM sv GROUP BY dim)
+# group: [semantic_layer]
+
+require semantic_layer
+
+statement ok
+PRAGMA enable_verification
+
+statement ok
+CREATE TABLE regions (id INTEGER, name VARCHAR);
+INSERT INTO regions VALUES (1, 'EMEA'), (2, 'AMER');
+CREATE TABLE customers (id INTEGER, name VARCHAR, region_id INTEGER);
+INSERT INTO customers VALUES (1, 'Alice', 1), (2, 'Bob', 1), (3, 'Carol', 2), (4, 'Dan', NULL);
+CREATE TABLE orders (id INTEGER, customer_id INTEGER, amount DECIMAL(10, 2), order_date DATE, status VARCHAR);
+INSERT INTO orders VALUES (1, 1, 100, '2024-01-01', 'open'), (2, 1, 50, '2024-01-02', 'closed'), (3, 2, 200, '2024-02-01', 'open'), (4, 3, 10, '2024-02-15', 'open'), (5, 99, 7, '2024-03-01', 'open');
+CREATE TABLE line_items (order_id INTEGER, line_no INTEGER, qty INTEGER, price DECIMAL(10, 2));
+INSERT INTO line_items VALUES (1, 1, 2, 30), (1, 2, 1, 40), (2, 1, 5, 10), (3, 1, 1, 200), (3, 2, 1, 0);
+CREATE SEMANTIC VIEW shop
+  TABLES (
+    r AS regions PRIMARY KEY (id),
+    c AS customers PRIMARY KEY (id),
+    o AS orders PRIMARY KEY (id),
+    li AS line_items PRIMARY KEY (order_id, line_no)
+  )
+  RELATIONSHIPS (
+    customer_region AS c (region_id) REFERENCES r,
+    order_customer AS o (customer_id) REFERENCES c,
+    line_order AS li (order_id) REFERENCES o
+  )
+  FACTS (
+    li.line_total AS qty * price,
+    o.line_count AS COUNT(li.line_no)
+  )
+  DIMENSIONS (
+    r.region_name AS r.name,
+    c.customer_name AS c.name,
+    c.revenue_tier AS CASE WHEN o.revenue > 100 THEN 'big' ELSE 'small' END,
+    o.order_date AS order_date,
+    o.order_month AS DATE_TRUNC('month', order_date),
+    o.status AS status,
+    o.customer_region AS r.region_name,
+    li.line_number AS line_no
+  )
+  METRICS (
+    o.revenue AS SUM(amount),
+    o.order_count AS COUNT(*),
+    o.avg_lines AS AVG(o.line_count),
+    li.units AS SUM(qty),
+    li.line_revenue AS SUM(li.line_total),
+    c.customer_count AS COUNT(*),
+    c.avg_customer_revenue AS AVG(SUM(o.amount)),
+    PRIVATE o.secret AS MAX(amount),
+    revenue_per_customer AS o.revenue / c.customer_count,
+    avg_order AS o.revenue / o.order_count
+  );
+
+query II
+SELECT status, AGG(revenue) FROM shop GROUP BY status ORDER BY status;
+----
+closed	50.00
+open	317.00
+
+# qualified names, and quoted "entity.name" identifiers (BI tools)
+query II
+SELECT o.status, AGG(o.revenue) FROM shop GROUP BY o.status ORDER BY 1;
+----
+closed	50.00
+open	317.00
+
+query II
+SELECT "o.status", AGG("o.revenue") FROM shop GROUP BY "o.status" ORDER BY 1;
+----
+closed	50.00
+open	317.00
+
+# output column names
+query II
+SELECT column_name, column_type FROM (DESCRIBE SELECT o.status, AGG(revenue), AGG(revenue) AS rev FROM shop GROUP BY o.status);
+----
+status	VARCHAR
+agg(revenue)	DECIMAL(38,2)
+rev	DECIMAL(38,2)
+
+# GROUP BY ordinal, alias and ALL
+query II
+SELECT r.region_name, AGG(o.revenue) FROM shop GROUP BY 1 ORDER BY 1 NULLS LAST;
+----
+AMER	10.00
+EMEA	350.00
+NULL	7.00
+
+query II
+SELECT YEAR(o.order_date) AS y, AGG(order_count) FROM shop GROUP BY y;
+----
+2024	5
+
+query II
+SELECT LOWER(status), AGG(revenue) FROM shop GROUP BY ALL ORDER BY 1;
+----
+closed	50.00
+open	317.00
+
+# a scalar expression over a grouped dimension
+query II
+SELECT UPPER(status), AGG(revenue) FROM shop GROUP BY status ORDER BY 1;
+----
+CLOSED	50.00
+OPEN	317.00
+
+# HAVING, ORDER BY on metrics, LIMIT
+query II
+SELECT status, AGG(revenue) FROM shop GROUP BY status HAVING AGG(revenue) > 100;
+----
+open	317.00
+
+query I
+SELECT customer_name FROM shop GROUP BY customer_name ORDER BY AGG(c.customer_count) DESC, customer_name LIMIT 2;
+----
+Alice
+Bob
+
+# expressions over metrics, metrics only, ad-hoc aggregates of dimensions
+query I
+SELECT AGG(revenue) * 10 FROM shop;
+----
+3670.00
+
+query I
+SELECT AGG(revenue_per_customer) FROM shop;
+----
+91.75
+
+query I
+SELECT COUNT(customer_name) FROM shop;
+----
+4
+
+query II
+SELECT region_name, AGG(o.revenue) + AGG(c.customer_count) FROM shop GROUP BY region_name ORDER BY 1 NULLS LAST;
+----
+AMER	11.00
+EMEA	352.00
+NULL	8.00
+
+# without aggregation: facts / dimensions row by row
+query I
+SELECT o.line_count FROM shop ORDER BY 1;
+----
+0
+0
+1
+2
+2
+
+query I
+SELECT DISTINCT status FROM shop ORDER BY 1;
+----
+closed
+open
+
+# WHERE (including a subquery), table alias
+query II
+SELECT status, AGG(revenue) FROM shop WHERE r.region_name = 'EMEA' GROUP BY status ORDER BY 1;
+----
+closed	50.00
+open	300.00
+
+query I
+SELECT AGG(revenue) FROM shop WHERE status IN (SELECT 'closed');
+----
+50.00
+
+query II
+SELECT s.status, AGG(s.revenue) FROM shop AS s GROUP BY s.status ORDER BY 1;
+----
+closed	50.00
+open	317.00
+
+# composes with the rest of SQL
+query I
+WITH x AS (SELECT status, AGG(revenue) AS rev FROM shop GROUP BY status) SELECT sum(rev) FROM x;
+----
+367.00
+
+query I
+SELECT count(*) FROM (SELECT status, AGG(revenue) FROM shop GROUP BY status) t;
+----
+2
+
+statement ok
+CREATE TABLE rev_by_status AS SELECT status, AGG(revenue) AS rev FROM shop GROUP BY status;
+
+query II
+SELECT * FROM rev_by_status ORDER BY 1;
+----
+closed	50.00
+open	317.00
+
+statement ok
+EXPLAIN SELECT status, AGG(revenue) FROM shop GROUP BY status;
+
+statement ok
+PREPARE big AS SELECT status, AGG(revenue) FROM shop GROUP BY status HAVING AGG(revenue) > $1;
+
+query II
+EXECUTE big(100);
+----
+open	317.00
+
+# both query forms in one statement
+query II
+SELECT a.status, b.revenue FROM (SELECT status FROM shop GROUP BY status) a JOIN SEMANTIC_VIEW(shop DIMENSIONS o.status METRICS o.revenue) b ON a.status = b.status ORDER BY 1;
+----
+closed	50.00
+open	317.00
+
+# a semantic view cannot share its name with a table or view (they share the catalog namespace)
+statement ok
+CREATE TABLE shadowed (x INTEGER);
+
+statement ok
+INSERT INTO shadowed VALUES (42);
+
+statement error
+CREATE SEMANTIC VIEW shadowed TABLES (o AS orders PRIMARY KEY (id)) METRICS (o.n AS COUNT(*));
+----
+Cannot create semantic view "shadowed": a table or view with that name already exists
+
+query I
+SELECT * FROM shadowed;
+----
+42
+
+# errors
+statement error
+SELECT AGG(status) FROM shop;
+----
+AGG() requires a metric
+
+statement error
+SELECT revenue FROM shop;
+----
+Metric "revenue" must be used with AGG()
+
+statement error
+SELECT status, AGG(revenue) FROM shop;
+----
+must appear in the GROUP BY clause
+
+statement error
+SELECT status, AGG(revenue) OVER () FROM shop GROUP BY status;
+----
+Window functions are not supported
+
+statement error
+SELECT AGG(o.revenue) FROM shop JOIN orders ON true;
+----
+cannot be joined
+
+statement error
+SELECT * FROM shop;
+----
+SELECT * is not supported
+
+statement error
+SELECT AGG(nope) FROM no_such_table_or_view;
+----
+Table with name no_such_table_or_view does not exist
+
+# ORDER BY expressions must survive lowering to internally named fact columns.
+query I
+SELECT o.line_count FROM shop ORDER BY o.line_count * -1, o.order_date;
+----
+2
+2
+1
+0
+0
+
+# Sort columns need not occur in the result, and table qualifiers remain valid.
+query I
+SELECT o.status FROM shop ORDER BY o.order_date DESC;
+----
+open
+open
+open
+closed
+open
+
+query I
+SELECT o.line_count AS n FROM shop ORDER BY n DESC, o.order_date;
+----
+2
+2
+1
+0
+0
+
+# DISTINCT ON keys also have to be mapped to the lowered query's columns.
+query II
+SELECT DISTINCT ON (o.status) o.status, o.line_count FROM shop ORDER BY o.status, o.order_date DESC;
+----
+closed	1
+open	0
+
+statement error
+SELECT o.status FROM shop ORDER BY ROW_NUMBER() OVER (ORDER BY o.order_date);
+----
+Window functions are not supported

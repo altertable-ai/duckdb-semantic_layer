@@ -1,0 +1,203 @@
+# name: test/sql/semantic_layer/query_grain.test
+# description: multi-grain metrics, derived metrics, child aggregations and fan-out safety
+# group: [semantic_layer]
+
+require semantic_layer
+
+statement ok
+PRAGMA enable_verification
+
+statement ok
+CREATE TABLE regions (id INTEGER, name VARCHAR);
+INSERT INTO regions VALUES (1, 'EMEA'), (2, 'AMER');
+CREATE TABLE customers (id INTEGER, name VARCHAR, region_id INTEGER);
+INSERT INTO customers VALUES (1, 'Alice', 1), (2, 'Bob', 1), (3, 'Carol', 2), (4, 'Dan', NULL);
+CREATE TABLE orders (id INTEGER, customer_id INTEGER, amount DECIMAL(10, 2), order_date DATE, status VARCHAR);
+INSERT INTO orders VALUES (1, 1, 100, '2024-01-01', 'open'), (2, 1, 50, '2024-01-02', 'closed'), (3, 2, 200, '2024-02-01', 'open'), (4, 3, 10, '2024-02-15', 'open'), (5, 99, 7, '2024-03-01', 'open');
+CREATE TABLE line_items (order_id INTEGER, line_no INTEGER, qty INTEGER, price DECIMAL(10, 2));
+INSERT INTO line_items VALUES (1, 1, 2, 30), (1, 2, 1, 40), (2, 1, 5, 10), (3, 1, 1, 200), (3, 2, 1, 0);
+CREATE SEMANTIC VIEW shop
+  TABLES (
+    r AS regions PRIMARY KEY (id),
+    c AS customers PRIMARY KEY (id),
+    o AS orders PRIMARY KEY (id),
+    li AS line_items PRIMARY KEY (order_id, line_no)
+  )
+  RELATIONSHIPS (
+    customer_region AS c (region_id) REFERENCES r,
+    order_customer AS o (customer_id) REFERENCES c,
+    line_order AS li (order_id) REFERENCES o
+  )
+  FACTS (
+    li.line_total AS qty * price,
+    o.line_count AS COUNT(li.line_no)
+  )
+  DIMENSIONS (
+    r.region_name AS r.name,
+    c.customer_name AS c.name,
+    c.revenue_tier AS CASE WHEN o.revenue > 100 THEN 'big' ELSE 'small' END,
+    o.order_date AS order_date,
+    o.order_month AS DATE_TRUNC('month', order_date),
+    o.status AS status,
+    o.customer_region AS r.region_name,
+    li.line_number AS line_no
+  )
+  METRICS (
+    o.revenue AS SUM(amount),
+    o.order_count AS COUNT(*),
+    o.avg_lines AS AVG(o.line_count),
+    li.units AS SUM(qty),
+    li.line_revenue AS SUM(li.line_total),
+    c.customer_count AS COUNT(*),
+    c.avg_customer_revenue AS AVG(SUM(o.amount)),
+    PRIVATE o.secret AS MAX(amount),
+    revenue_per_customer AS o.revenue / c.customer_count,
+    avg_order AS o.revenue / o.order_count
+  );
+
+# metrics from two logical tables in one query: each is aggregated at its own grain, then merged on the
+# dimension values (the NULL region of the dangling order and of customer Dan merge into one group)
+query III
+SELECT * FROM SEMANTIC_VIEW(shop DIMENSIONS r.region_name METRICS o.revenue, c.customer_count) ORDER BY 1 NULLS LAST;
+----
+AMER	10.00	1
+EMEA	350.00	2
+NULL	7.00	1
+
+# fan-out safety: order revenue next to line-item units by customer. A naive join of orders with
+# line_items would count Alice's order 1 twice (revenue 250 instead of 150).
+query III
+SELECT * FROM SEMANTIC_VIEW(shop DIMENSIONS c.customer_name METRICS o.revenue, li.units) ORDER BY 1 NULLS LAST;
+----
+Alice	150.00	8
+Bob	200.00	2
+Carol	10.00	NULL
+NULL	7.00	NULL
+
+query III
+WITH rev AS (SELECT c.name, SUM(o.amount) AS revenue FROM orders o LEFT JOIN customers c ON o.customer_id = c.id GROUP BY 1),
+     units AS (SELECT c.name, SUM(li.qty) AS units FROM line_items li LEFT JOIN orders o ON li.order_id = o.id LEFT JOIN customers c ON o.customer_id = c.id GROUP BY 1)
+SELECT rev.name, revenue, units FROM rev LEFT JOIN units ON rev.name IS NOT DISTINCT FROM units.name ORDER BY 1 NULLS LAST;
+----
+Alice	150.00	8
+Bob	200.00	2
+Carol	10.00	NULL
+NULL	7.00	NULL
+
+# without dimensions every block yields one row
+query II
+SELECT * FROM SEMANTIC_VIEW(shop METRICS o.revenue, li.units);
+----
+367.00	10
+
+# a finer table's metric grouped by a coarser table's dimension
+query II
+SELECT * FROM SEMANTIC_VIEW(shop DIMENSIONS o.status METRICS li.units) ORDER BY 1;
+----
+closed	5
+open	5
+
+# derived metrics combine metrics of different tables
+query II
+SELECT * FROM SEMANTIC_VIEW(shop METRICS revenue_per_customer, avg_order);
+----
+91.75	73.4
+
+query II
+SELECT * FROM SEMANTIC_VIEW(shop DIMENSIONS r.region_name METRICS revenue_per_customer) ORDER BY 1 NULLS LAST;
+----
+AMER	10.0
+EMEA	175.0
+NULL	7.0
+
+# ad-hoc metrics: aggregates of dimensions / facts and expressions over metrics
+query III
+SELECT * FROM SEMANTIC_VIEW(shop DIMENSIONS o.status METRICS MAX(o.order_date) AS last_order, o.revenue * 2 AS double_revenue) ORDER BY 1;
+----
+closed	2024-01-02	100.00
+open	2024-03-01	634.00
+
+# an ad-hoc aggregate of customer dimensions lives at the customer grain: it cannot be split by order status
+statement error
+SELECT * FROM SEMANTIC_VIEW(shop DIMENSIONS o.status METRICS COUNT(DISTINCT c.customer_name));
+----
+Invalid dimension specified
+
+# a fact aggregating child rows (COUNT is 0 for orders without line items)
+query I
+SELECT * FROM SEMANTIC_VIEW(shop FACTS o.line_count) ORDER BY 1;
+----
+0
+0
+1
+2
+2
+
+query I
+SELECT * FROM SEMANTIC_VIEW(shop METRICS o.avg_lines);
+----
+1.0
+
+# nested aggregation: average over customers of their order revenue
+query I
+SELECT * FROM SEMANTIC_VIEW(shop METRICS c.avg_customer_revenue);
+----
+120.000000
+
+# a dimension computed from a finer table's metric
+query II
+SELECT * FROM SEMANTIC_VIEW(shop DIMENSIONS c.revenue_tier METRICS c.customer_count) ORDER BY 1;
+----
+big	2
+small	2
+
+# facts with dimensions of the same table
+query II
+SELECT * FROM SEMANTIC_VIEW(shop DIMENSIONS o.order_date FACTS o.line_count) ORDER BY 1;
+----
+2024-01-01	2
+2024-01-02	1
+2024-02-01	2
+2024-02-15	0
+2024-03-01	0
+
+# facts of a table and of the tables it references, row by row
+query III
+SELECT * FROM SEMANTIC_VIEW(shop FACTS li.line_total, o.status, c.customer_name) ORDER BY 1, 3;
+----
+0.00	open	Bob
+40.00	open	Alice
+50.00	closed	Alice
+60.00	open	Alice
+200.00	open	Bob
+
+# errors
+statement error
+SELECT * FROM SEMANTIC_VIEW(shop DIMENSIONS li.line_number METRICS o.revenue);
+----
+Invalid dimension specified: The dimension entity 'li' must be related to and have an equal or lower level of granularity compared to the base metric or dimension entity 'o'.
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(shop DIMENSIONS o.status FACTS li.line_total);
+----
+must be defined in the same logical table
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(shop FACTS li.line_total METRICS o.revenue);
+----
+Cannot specify FACTS and METRICS
+
+# role-playing tables need USING: two relationship paths from flights to airports
+statement ok
+CREATE TABLE airports (code VARCHAR, city VARCHAR);
+
+statement ok
+CREATE TABLE flights (id INTEGER, dep VARCHAR, arr VARCHAR);
+
+statement ok
+CREATE SEMANTIC VIEW air TABLES (f AS flights PRIMARY KEY (id), a AS airports PRIMARY KEY (code)) RELATIONSHIPS (dep AS f (dep) REFERENCES a, arr AS f (arr) REFERENCES a) DIMENSIONS (a.city AS city) METRICS (f.flight_count AS COUNT(*));
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(air DIMENSIONS a.city METRICS f.flight_count);
+----
+multiple relationship paths

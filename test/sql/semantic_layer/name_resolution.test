@@ -1,0 +1,47 @@
+# name: test/sql/semantic_layer/name_resolution.test
+# description: self-named members resolve their own physical columns before members of other tables
+# group: [semantic_layer]
+
+require semantic_layer
+
+statement ok
+PRAGMA enable_verification
+
+statement ok
+CREATE TABLE left_values (id INTEGER, value INTEGER);
+INSERT INTO left_values VALUES (1, 10), (2, 20);
+CREATE TABLE right_values (id INTEGER, value INTEGER);
+INSERT INTO right_values VALUES (1, 100), (2, 200);
+
+statement ok
+CREATE SEMANTIC VIEW same_names
+  TABLES (l AS left_values PRIMARY KEY (id), r AS right_values PRIMARY KEY (id))
+  RELATIONSHIPS (l (id) REFERENCES r)
+  DIMENSIONS (l.value AS value, r.value AS value, l.doubled AS value * 2)
+  METRICS (l.total AS SUM(value));
+
+query IIII
+SELECT * FROM SEMANTIC_VIEW(same_names DIMENSIONS l.value, r.value AS right_value, l.doubled METRICS l.total) ORDER BY 1;
+----
+10	100	20	10
+20	200	40	20
+
+# Explicit table qualification has the same meaning as an unqualified self-reference.
+statement ok
+CREATE SEMANTIC VIEW qualified_names
+  TABLES (l AS left_values PRIMARY KEY (id), r AS right_values PRIMARY KEY (id))
+  RELATIONSHIPS (l (id) REFERENCES r)
+  DIMENSIONS (l.value AS l.value, r.value AS r.value)
+  METRICS (l.total AS SUM(l.value));
+
+query III
+SELECT * FROM SEMANTIC_VIEW(qualified_names DIMENSIONS l.value, r.value AS right_value METRICS l.total) ORDER BY 1;
+----
+10	100	10
+20	200	20
+
+# Bare names in queries remain ambiguous; only the defining expression has a self-column exception.
+statement error
+SELECT * FROM SEMANTIC_VIEW(same_names DIMENSIONS value);
+----
+Ambiguous name "value"

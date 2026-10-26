@@ -1,0 +1,232 @@
+# name: test/sql/semantic_layer/metric_filters.test
+# description: metric filters (FILTER (WHERE ...)) restrict the rows of every aggregate a metric is computed from
+# group: [semantic_layer]
+
+require semantic_layer
+
+statement ok
+PRAGMA enable_verification
+
+statement ok
+CREATE TABLE accounts (account_id INTEGER, segment VARCHAR, country VARCHAR);
+
+statement ok
+INSERT INTO accounts VALUES (1, 'enterprise', 'FR'), (2, 'startup', 'US'), (3, 'enterprise', 'DE'), (4, 'startup', 'FR');
+
+statement ok
+CREATE TABLE invoices (invoice_id INTEGER, account_id INTEGER, reseller_id INTEGER, invoiced_at DATE, amount INTEGER);
+
+statement ok
+INSERT INTO invoices VALUES
+  (1, 1, 2, '2025-09-03', 800), (2, 2, 3, '2025-09-10', 400), (3, 3, 1, '2025-10-20', 600), (4, 4, 1, '2025-12-31', 300),
+  (5, 1, 2, '2026-09-01', 1000), (6, 2, 3, '2026-09-15', 500), (7, 1, 4, '2026-09-15', 1200), (8, 3, NULL, '2026-10-10', 900),
+  (9, 4, 3, '2026-02-28', 250);
+
+# several lines per invoice: a fan-out trap for invoice metrics
+statement ok
+CREATE TABLE invoice_lines (invoice_id INTEGER, line_no INTEGER, qty INTEGER);
+
+statement ok
+INSERT INTO invoice_lines VALUES (1, 1, 2), (1, 2, 1), (5, 1, 3), (5, 2, 1), (5, 3, 1), (7, 1, 2), (8, 1, 1);
+
+statement ok
+CREATE TABLE costs (cost_id INTEGER, account_id INTEGER, incurred_at DATE, cost INTEGER);
+
+statement ok
+INSERT INTO costs VALUES (1, 1, '2025-09-03', 160), (2, 2, '2025-09-10', 90), (3, 3, '2025-10-20', 170),
+  (4, 1, '2026-09-01', 250), (5, 2, '2026-09-15', 80), (6, 3, '2026-10-10', 180);
+
+statement ok
+CREATE SEMANTIC VIEW fin
+  TABLES (
+    account AS accounts PRIMARY KEY (account_id),
+    invoices PRIMARY KEY (invoice_id),
+    lines AS invoice_lines PRIMARY KEY (invoice_id, line_no),
+    costs PRIMARY KEY (cost_id)
+  )
+  RELATIONSHIPS (
+    invoices (account_id) REFERENCES account,
+    lines (invoice_id) REFERENCES invoices,
+    costs (account_id) REFERENCES account
+  )
+  DIMENSIONS (
+    account.segment AS segment,
+    account.country AS country,
+    invoices.year AS year(invoiced_at)
+  )
+  METRICS (
+    invoices.revenue AS SUM(amount),
+    invoices.enterprise_revenue FILTER (WHERE account.segment = 'enterprise') AS SUM(amount),
+    invoices.big_enterprise_revenue FILTER (WHERE account.segment = 'enterprise') AS SUM(amount) FILTER (WHERE amount >= 1000),
+    invoices.enterprise_invoices FILTER (WHERE account.segment = 'enterprise') AS COUNT(*),
+    lines.quantity AS SUM(qty),
+    costs.cost AS SUM(cost),
+    margin AS (invoices.revenue - costs.cost) / invoices.revenue,
+    enterprise_margin FILTER (WHERE account.segment = 'enterprise') AS margin,
+    fr_enterprise_margin FILTER (WHERE account.country = 'FR') AS enterprise_margin
+  );
+
+# filtered table metrics, next to the unfiltered one; combined with the aggregate's own FILTER; COUNT(*)
+query IIIII
+SELECT * FROM SEMANTIC_VIEW(fin DIMENSIONS account.country
+  METRICS invoices.revenue, invoices.enterprise_revenue, invoices.big_enterprise_revenue, invoices.enterprise_invoices)
+ORDER BY country;
+----
+DE	1500	1500	NULL	2
+FR	3550	3000	2200	3
+US	900	NULL	NULL	0
+
+# filtered derived metric over two tables, and stacked filters
+query IIII
+SELECT country, round(margin, 6), round(enterprise_margin, 6), round(fr_enterprise_margin, 6)
+FROM SEMANTIC_VIEW(fin DIMENSIONS account.country METRICS margin, enterprise_margin, fr_enterprise_margin)
+ORDER BY country;
+----
+DE	0.766667	0.766667	NULL
+FR	0.884507	0.863333	0.863333
+US	0.811111	NULL	NULL
+
+query II
+SELECT round(enterprise_margin, 6), round(fr_enterprise_margin, 6)
+FROM SEMANTIC_VIEW(fin METRICS enterprise_margin, fr_enterprise_margin);
+----
+0.831111	0.863333
+
+# the query's WHERE still applies
+query II
+SELECT * FROM SEMANTIC_VIEW(fin DIMENSIONS account.segment METRICS invoices.enterprise_revenue WHERE invoices.year = 2026)
+ORDER BY segment;
+----
+enterprise	3100
+startup	NULL
+
+# querying by name
+query II
+SELECT account.country, AGG(invoices.enterprise_revenue) FROM fin GROUP BY ALL ORDER BY ALL;
+----
+DE	1500
+FR	3000
+US	NULL
+
+# the filter survives the definition round trip
+statement ok
+ALTER SEMANTIC VIEW fin RENAME TO fin_renamed;
+
+query I
+SELECT round(enterprise_margin, 6) FROM SEMANTIC_VIEW(fin_renamed METRICS enterprise_margin);
+----
+0.831111
+
+statement ok
+ALTER SEMANTIC VIEW fin_renamed RENAME TO fin;
+
+query II
+SELECT object_kind, property_value FROM (DESCRIBE SEMANTIC VIEW fin) WHERE object_name = 'enterprise_revenue' AND property = 'FILTER';
+----
+METRIC	(account.segment = 'enterprise')
+
+# a filtered metric can be materialized and read back
+statement ok
+ALTER SEMANTIC VIEW fin ADD MATERIALIZATION enterprise_by_country AS DIMENSIONS account.country METRICS invoices.enterprise_revenue;
+
+statement ok
+ALTER SEMANTIC VIEW fin SET MAX_STALENESS = 3600;
+
+query I
+SELECT sql ILIKE '%fin__enterprise_by_country__0%' FROM semantic_view_sql('SELECT * FROM SEMANTIC_VIEW(fin DIMENSIONS account.country METRICS invoices.enterprise_revenue)');
+----
+true
+
+query II
+SELECT * FROM SEMANTIC_VIEW(fin DIMENSIONS account.country METRICS invoices.enterprise_revenue) ORDER BY country;
+----
+DE	1500
+FR	3000
+US	NULL
+
+# USING: the filter follows the metric's relationship path
+statement ok
+CREATE SEMANTIC VIEW resale
+  TABLES (account AS accounts PRIMARY KEY (account_id), invoices PRIMARY KEY (invoice_id))
+  RELATIONSHIPS (owner AS invoices (account_id) REFERENCES account, reseller AS invoices (reseller_id) REFERENCES account)
+  DIMENSIONS (account.segment AS segment)
+  METRICS (
+    invoices.owner_enterprise_revenue USING (owner) FILTER (WHERE account.segment = 'enterprise') AS SUM(amount),
+    invoices.reseller_enterprise_revenue USING (reseller) FILTER (WHERE account.segment = 'enterprise') AS SUM(amount)
+  );
+
+query II
+SELECT * FROM SEMANTIC_VIEW(resale METRICS invoices.owner_enterprise_revenue, invoices.reseller_enterprise_revenue);
+----
+4500	2050
+
+# a filter reading a finer table would change what the aggregate counts
+statement error
+CREATE SEMANTIC VIEW bad TABLES (invoices PRIMARY KEY (invoice_id), lines AS invoice_lines PRIMARY KEY (invoice_id, line_no))
+  RELATIONSHIPS (lines (invoice_id) REFERENCES invoices)
+  METRICS (invoices.multi_line_revenue FILTER (WHERE lines.qty > 1) AS SUM(amount));
+----
+which is not reachable from "invoices"
+
+# ... also for one input of a derived metric
+statement error
+CREATE SEMANTIC VIEW bad TABLES (account AS accounts PRIMARY KEY (account_id), invoices PRIMARY KEY (invoice_id), costs PRIMARY KEY (cost_id))
+  RELATIONSHIPS (invoices (account_id) REFERENCES account, costs (account_id) REFERENCES account)
+  METRICS (invoices.revenue AS SUM(amount), costs.cost AS SUM(cost), bad_margin FILTER (WHERE invoices.amount > 0) AS invoices.revenue - costs.cost);
+----
+which is not reachable from "costs"
+
+statement error
+CREATE SEMANTIC VIEW bad TABLES (invoices PRIMARY KEY (invoice_id))
+  METRICS (invoices.revenue AS SUM(amount), invoices.x FILTER (WHERE SUM(amount) > 1) AS SUM(amount));
+----
+FILTER must be a row-level condition
+
+statement error
+CREATE SEMANTIC VIEW bad TABLES (invoices PRIMARY KEY (invoice_id))
+  METRICS (invoices.revenue AS SUM(amount), invoices.x FILTER (WHERE revenue > 1) AS SUM(amount));
+----
+FILTER must be a row-level condition
+
+statement error
+CREATE SEMANTIC VIEW bad TABLES (invoices PRIMARY KEY (invoice_id))
+  DIMENSIONS (invoices.year FILTER (WHERE amount > 1) AS year(invoiced_at));
+----
+FILTER is only allowed on metrics
+
+# a cycle through a metric filter is reported, like any circular reference
+statement error
+CREATE SEMANTIC VIEW bad TABLES (account AS accounts PRIMARY KEY (account_id), invoices PRIMARY KEY (invoice_id))
+  RELATIONSHIPS (invoices (account_id) REFERENCES account)
+  FACTS (account.ltv AS invoices.big_revenue)
+  DIMENSIONS (account.big AS ltv > 1000)
+  METRICS (invoices.big_revenue FILTER (WHERE account.big) AS SUM(amount));
+----
+Circular reference
+
+# semi-additive metrics: the filter applies before the last snapshot is picked, like a query WHERE
+statement ok
+CREATE TABLE snapshots (id INTEGER, account_id INTEGER, snapshot_date DATE, balance INTEGER);
+
+statement ok
+INSERT INTO snapshots VALUES (1, 1, '2025-01-10', 100), (2, 1, '2025-01-20', 150), (3, 2, '2025-01-31', 50);
+
+statement ok
+CREATE SEMANTIC VIEW balances
+  TABLES (account AS accounts PRIMARY KEY (account_id), s AS snapshots PRIMARY KEY (id))
+  RELATIONSHIPS (s (account_id) REFERENCES account)
+  DIMENSIONS (s.day AS snapshot_date, s.month AS DATE_TRUNC('month', snapshot_date)::DATE, account.segment AS segment)
+  METRICS (
+    s.balance NON ADDITIVE BY (s.day) AS SUM(balance),
+    s.enterprise_balance FILTER (WHERE account.segment = 'enterprise') AS balance
+  );
+
+query III
+SELECT * FROM SEMANTIC_VIEW(balances DIMENSIONS s.month METRICS s.balance, s.enterprise_balance);
+----
+2025-01-01	50	150
+
+query II
+SELECT * FROM SEMANTIC_VIEW(balances DIMENSIONS s.month METRICS s.balance WHERE account.segment = 'enterprise');
+----
+2025-01-01	150

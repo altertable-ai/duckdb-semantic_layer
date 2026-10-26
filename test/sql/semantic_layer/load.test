@@ -1,0 +1,10 @@
+# name: test/sql/semantic_layer/load.test
+# description: the semantic_layer extension loads
+# group: [semantic_layer]
+
+require semantic_layer
+
+query I
+SELECT extension_name FROM duckdb_extensions() WHERE extension_name = 'semantic_layer' AND loaded;
+----
+semantic_layer

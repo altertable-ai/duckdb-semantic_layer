@@ -1,5 +1,5 @@
 //===----------------------------------------------------------------------===//
-//                         DuckDB - semantic_views
+//                         DuckDB - semantic_layer
 //
 // semantic_change_tracking.hpp
 //
@@ -88,7 +88,7 @@ public:
 	static unique_ptr<TableRef> AtSnapshot(const SemanticSourceTable &table, idx_t snapshot);
 
 private:
-	unique_ptr<MaterializedQueryResult> Run(const string &sql);
+	unique_ptr<QueryResult> Run(const string &sql);
 
 	Connection connection;
 };

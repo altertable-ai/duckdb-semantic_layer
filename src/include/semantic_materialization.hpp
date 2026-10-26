@@ -1,5 +1,5 @@
 //===----------------------------------------------------------------------===//
-//                         DuckDB - semantic_views
+//                         DuckDB - semantic_layer
 //
 // semantic_materialization.hpp
 //
@@ -95,7 +95,7 @@ struct SemanticMaterializationState {
 	//! Held for the duration of a refresh (refreshes of a materialization are serialized)
 	mutex refresh_lock;
 	//! Current metadata owner, shared across renamed models and their already-bound refreshes.
-	QualifiedName owner;
+	SemanticQualifiedName owner;
 	//! Physical location, set by the first build
 	string catalog;
 	string schema;
@@ -152,7 +152,7 @@ struct SemanticStoredMaterialization {
 	string catalog;
 	string schema;
 	vector<string> tables;
-	QualifiedName view;
+	SemanticQualifiedName view;
 	string name;
 };
 //! Adds to `model` (being created) the materializations stored for its view in the attached databases that it does not

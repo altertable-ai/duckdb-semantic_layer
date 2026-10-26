@@ -1,5 +1,5 @@
 //===----------------------------------------------------------------------===//
-//                         DuckDB - semantic_views
+//                         DuckDB - semantic_layer
 //
 // semantic_materialization_internal.hpp
 //
@@ -17,7 +17,7 @@
 namespace duckdb {
 
 inline string QuoteIdentifier(const string &identifier) {
-	return KeywordHelper::WriteOptionallyQuoted(identifier, '"');
+	return SQLIdentifier::ToString(identifier);
 }
 
 //! Default schema of materialization tables, and of the metadata recording them (in every database holding some)

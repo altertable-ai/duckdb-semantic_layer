@@ -1,5 +1,5 @@
 //===----------------------------------------------------------------------===//
-//                         DuckDB - semantic_views
+//                         DuckDB - semantic_layer
 //
 // semantic_lowering.hpp
 //
@@ -54,22 +54,24 @@ static constexpr const char *SEMANTIC_VIEW_QUERY_FUNCTION = "__semantic_view_que
 
 struct SemanticLowering {
 	static unique_ptr<TableRef> Create(const ParsedSemanticView &view, OnCreateConflict on_conflict);
-	static unique_ptr<TableRef> Drop(const QualifiedName &name, bool if_exists);
-	static unique_ptr<TableRef> Rename(const QualifiedName &name, bool if_exists, const string &new_name);
-	static unique_ptr<TableRef> SetComment(const QualifiedName &name, bool if_exists, const Value &comment);
-	static unique_ptr<TableRef> SetMaxStaleness(const QualifiedName &name, bool if_exists, const Value &seconds);
-	static unique_ptr<TableRef> AddMaterialization(const QualifiedName &name, bool if_exists,
+	static unique_ptr<TableRef> Drop(const SemanticQualifiedName &name, bool if_exists);
+	static unique_ptr<TableRef> Rename(const SemanticQualifiedName &name, bool if_exists, const string &new_name);
+	static unique_ptr<TableRef> SetComment(const SemanticQualifiedName &name, bool if_exists, const Value &comment);
+	static unique_ptr<TableRef> SetMaxStaleness(const SemanticQualifiedName &name, bool if_exists,
+	                                            const Value &seconds);
+	static unique_ptr<TableRef> AddMaterialization(const SemanticQualifiedName &name, bool if_exists,
 	                                               const ParsedSemanticMaterialization &materialization,
 	                                               bool if_not_exists);
-	static unique_ptr<TableRef> DropMaterialization(const QualifiedName &name, bool if_exists,
+	static unique_ptr<TableRef> DropMaterialization(const SemanticQualifiedName &name, bool if_exists,
 	                                                const string &materialization, bool materialization_if_exists);
-	static unique_ptr<TableRef> RefreshMaterialization(const QualifiedName &name, bool if_exists,
+	static unique_ptr<TableRef> RefreshMaterialization(const SemanticQualifiedName &name, bool if_exists,
 	                                                   const string &materialization, const Value &mode);
-	static unique_ptr<TableRef> ShowMaterializations(const QualifiedName &view);
-	static unique_ptr<TableRef> Describe(const QualifiedName &name);
-	static unique_ptr<TableRef> ShowViews(const QualifiedName &scope);
-	static unique_ptr<TableRef> ShowMembers(SemanticMemberKind kind, const QualifiedName &view);
-	static unique_ptr<TableRef> ShowDimensionsForMetric(const QualifiedName &view, const vector<string> &metric);
+	static unique_ptr<TableRef> ShowMaterializations(const SemanticQualifiedName &view);
+	static unique_ptr<TableRef> Describe(const SemanticQualifiedName &name);
+	static unique_ptr<TableRef> ShowViews(const SemanticQualifiedName &scope);
+	static unique_ptr<TableRef> ShowMembers(SemanticMemberKind kind, const SemanticQualifiedName &view);
+	static unique_ptr<TableRef> ShowDimensionsForMetric(const SemanticQualifiedName &view,
+	                                                    const vector<string> &metric);
 	static unique_ptr<TableRef> Query(const ParsedSemanticQuery &query);
 
 	//! Restricts a SHOW / DESCRIBE result to the rows whose `name` matches `pattern` (case-insensitive LIKE)

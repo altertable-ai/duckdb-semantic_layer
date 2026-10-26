@@ -21,7 +21,7 @@ public:
 		if (entry != connections.end()) {
 			return *entry->second;
 		}
-		if (Catalog::GetCatalog(context, catalog).GetAttached().IsReadOnly()) {
+		if (Catalog::GetCatalog(context, Identifier(catalog)).GetAttached().IsReadOnly()) {
 			throw BinderException("database \"%s\" is read-only", catalog);
 		}
 		auto connection = make_uniq<Connection>(*context.db);

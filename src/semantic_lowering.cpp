@@ -16,18 +16,18 @@ namespace duckdb {
 static unique_ptr<TableRef> Call(const string &function, vector<Value> args) {
 	vector<unique_ptr<ParsedExpression>> children;
 	for (auto &arg : args) {
-		children.push_back(make_uniq<ConstantExpression>(std::move(arg)));
+		children.push_back(ConstantExpression::FromValue(std::move(arg)));
 	}
 	auto ref = make_uniq<TableFunctionRef>();
-	ref->function = make_uniq<FunctionExpression>(function, std::move(children));
+	ref->function = make_uniq<FunctionExpression>(Identifier(function), std::move(children));
 	return std::move(ref);
 }
 
-static vector<Value> NameValues(const QualifiedName &name) {
+static vector<Value> NameValues(const SemanticQualifiedName &name) {
 	return {Value(name.catalog), Value(name.schema), Value(name.name)};
 }
 
-static vector<Value> NameValues(const QualifiedName &name, vector<Value> extra) {
+static vector<Value> NameValues(const SemanticQualifiedName &name, vector<Value> extra) {
 	auto result = NameValues(name);
 	for (auto &value : extra) {
 		result.push_back(std::move(value));
@@ -39,24 +39,26 @@ unique_ptr<TableRef> SemanticLowering::Create(const ParsedSemanticView &view, On
 	return Call(SEMANTIC_VIEW_CREATE_FUNCTION, {Encode(view), Value(EnumUtil::ToString(on_conflict))});
 }
 
-unique_ptr<TableRef> SemanticLowering::Drop(const QualifiedName &name, bool if_exists) {
+unique_ptr<TableRef> SemanticLowering::Drop(const SemanticQualifiedName &name, bool if_exists) {
 	return Call(SEMANTIC_VIEW_DROP_FUNCTION, NameValues(name, {Value::BOOLEAN(if_exists)}));
 }
 
-unique_ptr<TableRef> SemanticLowering::Rename(const QualifiedName &name, bool if_exists, const string &new_name) {
+unique_ptr<TableRef> SemanticLowering::Rename(const SemanticQualifiedName &name, bool if_exists,
+                                              const string &new_name) {
 	return Call(SEMANTIC_VIEW_RENAME_FUNCTION, NameValues(name, {Value::BOOLEAN(if_exists), Value(new_name)}));
 }
 
-unique_ptr<TableRef> SemanticLowering::SetComment(const QualifiedName &name, bool if_exists, const Value &comment) {
+unique_ptr<TableRef> SemanticLowering::SetComment(const SemanticQualifiedName &name, bool if_exists,
+                                                  const Value &comment) {
 	return Call(SEMANTIC_VIEW_SET_COMMENT_FUNCTION, NameValues(name, {Value::BOOLEAN(if_exists), comment}));
 }
 
-unique_ptr<TableRef> SemanticLowering::SetMaxStaleness(const QualifiedName &name, bool if_exists,
+unique_ptr<TableRef> SemanticLowering::SetMaxStaleness(const SemanticQualifiedName &name, bool if_exists,
                                                        const Value &seconds) {
 	return Call(SEMANTIC_VIEW_SET_MAX_STALENESS_FUNCTION, NameValues(name, {Value::BOOLEAN(if_exists), seconds}));
 }
 
-unique_ptr<TableRef> SemanticLowering::AddMaterialization(const QualifiedName &name, bool if_exists,
+unique_ptr<TableRef> SemanticLowering::AddMaterialization(const SemanticQualifiedName &name, bool if_exists,
                                                           const ParsedSemanticMaterialization &materialization,
                                                           bool if_not_exists) {
 	ParsedSemanticMaterializationPayload payload;
@@ -65,7 +67,7 @@ unique_ptr<TableRef> SemanticLowering::AddMaterialization(const QualifiedName &n
 	            NameValues(name, {Value::BOOLEAN(if_exists), Encode(payload), Value::BOOLEAN(if_not_exists)}));
 }
 
-unique_ptr<TableRef> SemanticLowering::DropMaterialization(const QualifiedName &name, bool if_exists,
+unique_ptr<TableRef> SemanticLowering::DropMaterialization(const SemanticQualifiedName &name, bool if_exists,
                                                            const string &materialization,
                                                            bool materialization_if_exists) {
 	return Call(SEMANTIC_VIEW_DROP_MATERIALIZATION_FUNCTION,
@@ -73,25 +75,25 @@ unique_ptr<TableRef> SemanticLowering::DropMaterialization(const QualifiedName &
 	                              Value::BOOLEAN(materialization_if_exists)}));
 }
 
-unique_ptr<TableRef> SemanticLowering::RefreshMaterialization(const QualifiedName &name, bool if_exists,
+unique_ptr<TableRef> SemanticLowering::RefreshMaterialization(const SemanticQualifiedName &name, bool if_exists,
                                                               const string &materialization, const Value &mode) {
 	return Call(SEMANTIC_VIEW_REFRESH_MATERIALIZATION_FUNCTION,
 	            NameValues(name, {Value::BOOLEAN(if_exists), Value(materialization), mode}));
 }
 
-unique_ptr<TableRef> SemanticLowering::ShowMaterializations(const QualifiedName &view) {
+unique_ptr<TableRef> SemanticLowering::ShowMaterializations(const SemanticQualifiedName &view) {
 	return Call(SEMANTIC_VIEW_SHOW_MATERIALIZATIONS_FUNCTION, NameValues(view));
 }
 
-unique_ptr<TableRef> SemanticLowering::Describe(const QualifiedName &name) {
+unique_ptr<TableRef> SemanticLowering::Describe(const SemanticQualifiedName &name) {
 	return Call(SEMANTIC_VIEW_DESCRIBE_FUNCTION, NameValues(name));
 }
 
-unique_ptr<TableRef> SemanticLowering::ShowViews(const QualifiedName &scope) {
+unique_ptr<TableRef> SemanticLowering::ShowViews(const SemanticQualifiedName &scope) {
 	return Call(SEMANTIC_VIEW_SHOW_VIEWS_FUNCTION, {Value(scope.catalog), Value(scope.schema)});
 }
 
-unique_ptr<TableRef> SemanticLowering::ShowMembers(SemanticMemberKind kind, const QualifiedName &view) {
+unique_ptr<TableRef> SemanticLowering::ShowMembers(SemanticMemberKind kind, const SemanticQualifiedName &view) {
 	vector<Value> args {Value(SemanticMemberKindToString(kind))};
 	for (auto &value : NameValues(view)) {
 		args.push_back(value);
@@ -99,7 +101,7 @@ unique_ptr<TableRef> SemanticLowering::ShowMembers(SemanticMemberKind kind, cons
 	return Call(SEMANTIC_VIEW_SHOW_MEMBERS_FUNCTION, std::move(args));
 }
 
-unique_ptr<TableRef> SemanticLowering::ShowDimensionsForMetric(const QualifiedName &view,
+unique_ptr<TableRef> SemanticLowering::ShowDimensionsForMetric(const SemanticQualifiedName &view,
                                                                const vector<string> &metric) {
 	vector<Value> parts;
 	for (auto &part : metric) {
@@ -119,7 +121,7 @@ unique_ptr<TableRef> SemanticLowering::WhereNameLike(unique_ptr<TableRef> ref, c
 	node->from_table = std::move(ref);
 	vector<unique_ptr<ParsedExpression>> arguments;
 	arguments.push_back(ColumnRef("name"));
-	arguments.push_back(make_uniq<ConstantExpression>(Value(pattern)));
+	arguments.push_back(ConstantExpression::FromValue(Value(pattern)));
 	// `name ILIKE pattern`
 	node->where_clause = make_uniq<FunctionExpression>("~~*", std::move(arguments), nullptr, nullptr, false, true);
 	return MakeSubqueryRef(std::move(node), "__sv_show");

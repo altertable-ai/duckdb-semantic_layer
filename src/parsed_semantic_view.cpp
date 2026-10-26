@@ -56,14 +56,25 @@ unique_ptr<ParsedSemanticView> ParsedSemanticView::Copy() const {
 //===--------------------------------------------------------------------===//
 // Serialization
 //===--------------------------------------------------------------------===//
-static void WriteName(Serializer &serializer, field_id_t first_field, const QualifiedName &name) {
+SemanticQualifiedName SemanticQualifiedName::FromQualifiedName(const QualifiedName &qualified_name) {
+	if (qualified_name.Path().size() > 3) {
+		throw ParserException("Expected a name of the form catalog.schema.name, got \"%s\"", qualified_name.ToString());
+	}
+	SemanticQualifiedName result;
+	result.catalog = qualified_name.Catalog().GetIdentifierName();
+	result.schema = qualified_name.Schema().GetIdentifierName();
+	result.name = qualified_name.Name().GetIdentifierName();
+	return result;
+}
+
+static void WriteName(Serializer &serializer, field_id_t first_field, const SemanticQualifiedName &name) {
 	serializer.WriteProperty(first_field, "catalog", name.catalog);
 	serializer.WriteProperty(first_field + 1, "schema", name.schema);
 	serializer.WriteProperty(first_field + 2, "name", name.name);
 }
 
-static QualifiedName ReadName(Deserializer &deserializer, field_id_t first_field) {
-	QualifiedName name;
+static SemanticQualifiedName ReadName(Deserializer &deserializer, field_id_t first_field) {
+	SemanticQualifiedName name;
 	name.catalog = deserializer.ReadProperty<string>(first_field, "catalog");
 	name.schema = deserializer.ReadProperty<string>(first_field + 1, "schema");
 	name.name = deserializer.ReadProperty<string>(first_field + 2, "name");
