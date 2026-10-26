@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.5)
 
-set(TARGET_NAME semantic_views)
+set(TARGET_NAME semantic_layer)
 
 set(EXTENSION_NAME ${TARGET_NAME}_extension)
 set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
@@ -15,9 +15,9 @@ include_directories(BEFORE third_party/duckdb_peg_parser/include)
 include_directories(third_party/duckdb_peg_parser)
 
 set(EXTENSION_SOURCES
-    src/semantic_views_extension.cpp
-    src/semantic_views_binding.cpp
-    src/semantic_views_functions.cpp
+    src/semantic_layer_extension.cpp
+    src/semantic_layer_binding.cpp
+    src/semantic_layer_functions.cpp
     src/semantic_expression_compiler.cpp
     src/semantic_ddl_functions.cpp
     src/semantic_show_functions.cpp
@@ -43,7 +43,7 @@ set(EXTENSION_SOURCES
     src/semantic_sql_rewrite.cpp
     src/semantic_time_reads.cpp
     src/semantic_statement_visitor.cpp
-    src/semantic_view_registry.cpp
+    src/semantic_layer_registry.cpp
     src/parser/semantic_views_parser.cpp)
 
 # Vendored DuckDB PEG parser (appends to EXTENSION_SOURCES)

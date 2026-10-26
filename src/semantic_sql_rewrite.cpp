@@ -17,7 +17,7 @@
 #include "semantic_catalog.hpp"
 #include "semantic_lowering.hpp"
 #include "semantic_statement_visitor.hpp"
-#include "semantic_view_registry.hpp"
+#include "semantic_layer_registry.hpp"
 
 namespace duckdb {
 

@@ -1,11 +1,11 @@
-# semantic_views
+# semantic_layer
 
 **A semantic layer inside DuckDB.** Define your business metrics once, in SQL, next to your data. Then query any
 combination of dimensions and metrics from SQL or from a BI tool, and get correct numbers every time.
 
 Aggregating across joined tables is where analytics quietly goes wrong. Join orders to their line items and every
 order total is counted once per line. Compute "revenue per customer" in two dashboards and the two rarely agree.
-`semantic_views` lets you describe your data once: logical tables, the relationships between them, and the facts,
+`semantic_layer` lets you describe your data once: logical tables, the relationships between them, and the facts,
 dimensions and metrics that matter to the business. Every query then gets its joins and aggregations generated at the
 right grain.
 
@@ -132,7 +132,7 @@ GEN=ninja make
 The build produces:
 
 - `./build/release/duckdb`, a DuckDB shell with the extension (and `tpch`) statically linked, ready to use;
-- `./build/release/extension/semantic_views/semantic_views.duckdb_extension`, a loadable extension for DuckDB v1.5.5.
+- `./build/release/extension/semantic_layer/semantic_layer.duckdb_extension`, a loadable extension for DuckDB v1.5.5.
 
 To load the extension into another DuckDB v1.5.5 client, allow unsigned extensions and load the file:
 
@@ -141,7 +141,7 @@ duckdb -unsigned
 ```
 
 ```sql
-LOAD '/path/to/semantic_views.duckdb_extension';
+LOAD '/path/to/semantic_layer.duckdb_extension';
 ```
 
 ## Defining a semantic view
@@ -589,11 +589,11 @@ relationships are about 9x faster than a hand-written range join. See [docs/benc
 ```bash
 GEN=ninja make                                   # release build (debug builds are much slower)
 make test                                        # all SQL tests
-./build/release/test/unittest test/sql/semantic_views/many_to_many.test   # a single test file
+./build/release/test/unittest test/sql/semantic_layer/many_to_many.test   # a single test file
 make format-fix                                  # DuckDB code style (make format-check in CI)
 ```
 
-Tests are [sqllogictest](https://duckdb.org/dev/sqllogictest/intro.html) files in `test/sql/semantic_views/`. Most
+Tests are [sqllogictest](https://duckdb.org/dev/sqllogictest/intro.html) files in `test/sql/semantic_layer/`. Most
 compare semantic queries with hand-written SQL on data that contains deliberate fan-out traps.
 
 The benchmark generates a 100M-row star schema and compares every semantic query with its hand-written equivalent

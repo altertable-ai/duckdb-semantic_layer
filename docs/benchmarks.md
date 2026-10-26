@@ -1,11 +1,11 @@
 # Benchmarks
 
 `scripts/bench_semantic_views.py` compares every `SEMANTIC_VIEW(...)` query in
-`benchmark/semantic_views/queries.sql` with an equivalent hand-written query: it checks that both return the same
+`benchmark/semantic_layer/queries.sql` with an equivalent hand-written query: it checks that both return the same
 rows and reports the median wall time of each (DuckDB CLI `.timer`, queries alternated).
 
-Data (`benchmark/semantic_views/generate.sql`): 100,000,000 `sales` rows, 1,000,000 `customers`, 10,000 `products`,
-25 `nations`, stored in a DuckDB file. Semantic view: `benchmark/semantic_views/semantic_view.sql`.
+Data (`benchmark/semantic_layer/generate.sql`): 100,000,000 `sales` rows, 1,000,000 `customers`, 10,000 `products`,
+25 `nations`, stored in a DuckDB file. Semantic view: `benchmark/semantic_layer/semantic_view.sql`.
 
 ## Results
 

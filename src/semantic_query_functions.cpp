@@ -13,8 +13,8 @@
 #include "semantic_sql_rewrite.hpp"
 #include "semantic_time_reads.hpp"
 #include "semantic_statement_visitor.hpp"
-#include "semantic_view_registry.hpp"
-#include "semantic_views_functions.hpp"
+#include "semantic_layer_registry.hpp"
+#include "semantic_layer_functions.hpp"
 #include "semantic_views_parser.hpp"
 
 namespace duckdb {

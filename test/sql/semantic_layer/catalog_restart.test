@@ -1,0 +1,87 @@
+# name: test/sql/semantic_layer/catalog_restart.test
+# description: catalog placeholders of semantic views in database files, across restarts; read-only databases
+# group: [semantic_layer]
+
+require semantic_layer
+
+load __TEST_DIR__/semantic_catalog_restart.db
+
+statement ok
+CREATE TABLE orders (id INTEGER, amount INTEGER);
+INSERT INTO orders VALUES (1, 10), (2, 20);
+
+statement ok
+CREATE SEMANTIC VIEW sv TABLES (o AS orders PRIMARY KEY (id)) METRICS (o.total AS SUM(amount));
+
+restart
+
+# definitions are not persisted: the placeholder stays listed but explains what to do
+query I
+SELECT table_name FROM information_schema.tables WHERE table_type = 'VIEW';
+----
+sv
+
+statement error
+SELECT AGG(total) FROM sv;
+----
+Semantic view "sv" is not defined in this session
+
+query I
+SELECT count(*) FROM (SHOW SEMANTIC VIEWS);
+----
+0
+
+# re-creating it replaces the leftover placeholder (no OR REPLACE needed)
+statement ok
+CREATE SEMANTIC VIEW sv TABLES (o AS orders PRIMARY KEY (id)) METRICS (o.total AS SUM(amount));
+
+query I
+SELECT AGG(total) FROM sv;
+----
+30
+
+restart
+
+# dropping a leftover placeholder works too
+statement ok
+DROP SEMANTIC VIEW sv;
+
+query I
+SELECT count(*) FROM information_schema.tables WHERE table_type = 'VIEW';
+----
+0
+
+statement error
+DROP SEMANTIC VIEW sv;
+----
+does not exist
+
+# read-only databases get no placeholder; the semantic view still works
+statement ok
+ATTACH '__TEST_DIR__/semantic_catalog_ro.db' AS ro;
+
+statement ok
+CREATE TABLE ro.items (id INTEGER, price INTEGER);
+INSERT INTO ro.items VALUES (1, 5), (2, 7);
+
+statement ok
+DETACH ro;
+
+statement ok
+ATTACH '__TEST_DIR__/semantic_catalog_ro.db' AS ro (READ_ONLY);
+
+statement ok
+CREATE SEMANTIC VIEW ro.main.prices TABLES (i AS ro.main.items PRIMARY KEY (id)) METRICS (i.total AS SUM(price));
+
+query I
+SELECT * FROM SEMANTIC_VIEW(ro.main.prices METRICS i.total);
+----
+12
+
+query I
+SELECT count(*) FROM information_schema.tables WHERE table_catalog = 'ro' AND table_type = 'VIEW';
+----
+0
+
+statement ok
+DROP SEMANTIC VIEW ro.main.prices;

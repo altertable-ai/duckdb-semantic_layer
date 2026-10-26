@@ -4,8 +4,8 @@
 Usage:
     python3 scripts/bench_semantic_views.py --db /path/to/bench.duckdb [--rows 100000000] [--runs 5]
 
-The database is generated on first use (benchmark/semantic_views/generate.sql).
-For every query pair in benchmark/semantic_views/queries.sql the script checks that
+The database is generated on first use (benchmark/semantic_layer/generate.sql).
+For every query pair in benchmark/semantic_layer/queries.sql the script checks that
 both queries return the same rows (numeric tolerance 1e-9 relative) and reports the
 median wall time of each, as measured by the DuckDB CLI's `.timer`.
 """
@@ -23,7 +23,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-BENCH_DIR = ROOT / "benchmark" / "semantic_views"
+BENCH_DIR = ROOT / "benchmark" / "semantic_layer"
 
 
 def run_cli(duckdb: str, db: str, script: str, env: dict | None = None) -> str:

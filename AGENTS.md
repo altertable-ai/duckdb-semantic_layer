@@ -1,4 +1,4 @@
-# DuckDB semantic_views extension
+# DuckDB semantic_layer extension
 
 Instructions for AI agents working in this repository.
 
@@ -32,7 +32,7 @@ Instructions for AI agents working in this repository.
 ## Testing
 
 - SQL tests: `make test` or `./build/release/test/unittest "test/sql/*"`
-- Single test: `./build/release/test/unittest test/sql/semantic_views/<file>.test`
+- Single test: `./build/release/test/unittest test/sql/semantic_layer/<file>.test`
 
 ## PEG parser maintenance
 
