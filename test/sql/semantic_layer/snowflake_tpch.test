@@ -1,0 +1,118 @@
+# name: test/sql/semantic_layer/snowflake_tpch.test
+# description: the TPC-H example of Snowflake's semantic view documentation, checked against hand-written SQL
+# group: [semantic_layer]
+
+require semantic_layer
+
+require tpch
+
+statement ok
+CALL dbgen(sf = 0.01);
+
+statement ok
+CREATE SEMANTIC VIEW tpch_rev_analysis
+  TABLES (
+    orders AS orders
+      PRIMARY KEY (o_orderkey)
+      WITH SYNONYMS ('sales orders')
+      COMMENT = 'All orders table for the sales domain',
+    customers AS customer
+      PRIMARY KEY (c_custkey)
+      COMMENT = 'Main table for customer data',
+    line_items AS lineitem
+      PRIMARY KEY (l_orderkey, l_linenumber)
+      COMMENT = 'Line items in orders'
+  )
+  RELATIONSHIPS (
+    orders_to_customers AS
+      orders (o_custkey) REFERENCES customers,
+    line_item_to_orders AS
+      line_items (l_orderkey) REFERENCES orders
+  )
+  FACTS (
+    line_items.line_item_id AS CONCAT(l_orderkey, '-', l_linenumber),
+    orders.count_line_items AS COUNT(line_items.line_item_id),
+    line_items.discounted_price AS l_extendedprice * (1 - l_discount)
+      COMMENT = 'Extended price after discount'
+  )
+  DIMENSIONS (
+    customers.customer_name AS customers.c_name
+      WITH SYNONYMS = ('customer name')
+      COMMENT = 'Name of the customer',
+    customers.customer_market_segment AS c_mktsegment,
+    orders.order_date AS o_orderdate
+      COMMENT = 'Date when the order was placed',
+    orders.order_year AS YEAR(o_orderdate)
+      COMMENT = 'Year when the order was placed'
+  )
+  METRICS (
+    customers.customer_count AS COUNT(c_custkey)
+      COMMENT = 'Count of number of customers',
+    orders.order_average_value AS AVG(orders.o_totalprice)
+      COMMENT = 'Average order value across all orders',
+    orders.average_line_items_per_order AS AVG(orders.count_line_items)
+      COMMENT = 'Average number of line items per order',
+    line_items.total_discounted_revenue AS SUM(line_items.discounted_price)
+  )
+  COMMENT = 'Semantic view for revenue analysis';
+
+query I
+SELECT customer_count = (SELECT count(c_custkey) FROM customer) FROM SEMANTIC_VIEW(tpch_rev_analysis METRICS customers.customer_count);
+----
+true
+
+# grouping metric data by a dimension
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM SEMANTIC_VIEW(tpch_rev_analysis DIMENSIONS customers.customer_market_segment METRICS orders.order_average_value))
+  EXCEPT
+  (SELECT c_mktsegment, AVG(o_totalprice) FROM orders LEFT JOIN customer ON o_custkey = c_custkey GROUP BY 1)
+);
+----
+0
+
+# a metric built on a fact that aggregates line items per order
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM SEMANTIC_VIEW(tpch_rev_analysis DIMENSIONS customers.customer_name METRICS orders.average_line_items_per_order))
+  EXCEPT
+  (SELECT c_name, AVG((SELECT count(l_linenumber) FROM lineitem WHERE l_orderkey = o_orderkey)) FROM orders LEFT JOIN customer ON o_custkey = c_custkey GROUP BY 1)
+);
+----
+0
+
+query I
+SELECT count(*) FROM SEMANTIC_VIEW(tpch_rev_analysis DIMENSIONS customers.customer_name METRICS orders.average_line_items_per_order);
+----
+1000
+
+# revenue by segment and year with a filter, compared in both directions
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM SEMANTIC_VIEW(tpch_rev_analysis DIMENSIONS customers.customer_market_segment, orders.order_year METRICS line_items.total_discounted_revenue, orders.order_average_value WHERE orders.order_date >= '1995-01-01'))
+  EXCEPT
+  (SELECT r.seg, r.yr, r.rev, a.avg_value FROM
+     (SELECT c_mktsegment AS seg, YEAR(o_orderdate) AS yr, SUM(l_extendedprice * (1 - l_discount)) AS rev FROM lineitem LEFT JOIN orders ON l_orderkey = o_orderkey LEFT JOIN customer ON o_custkey = c_custkey WHERE o_orderdate >= '1995-01-01' GROUP BY 1, 2) r
+     FULL OUTER JOIN
+     (SELECT c_mktsegment AS seg, YEAR(o_orderdate) AS yr, AVG(o_totalprice) AS avg_value FROM orders LEFT JOIN customer ON o_custkey = c_custkey WHERE o_orderdate >= '1995-01-01' GROUP BY 1, 2) a
+     ON r.seg IS NOT DISTINCT FROM a.seg AND r.yr IS NOT DISTINCT FROM a.yr)
+);
+----
+0
+
+query I
+SELECT count(*) FROM SEMANTIC_VIEW(tpch_rev_analysis DIMENSIONS customers.customer_market_segment, orders.order_year METRICS line_items.total_discounted_revenue WHERE orders.order_date >= '1995-01-01');
+----
+20
+
+# scalar expressions over dimensions
+query I
+SELECT list(year ORDER BY year) FROM SEMANTIC_VIEW(tpch_rev_analysis DIMENSIONS DATE_PART('year', orders.order_date) AS year);
+----
+[1992, 1993, 1994, 1995, 1996, 1997, 1998]
+
+# the documented granularity error
+statement error
+SELECT * FROM SEMANTIC_VIEW(tpch_rev_analysis DIMENSIONS orders.order_date METRICS customers.customer_count);
+----
+Invalid dimension specified: The dimension entity 'orders' must be related to and have an equal or lower level of granularity compared to the base metric or dimension entity 'customers'.

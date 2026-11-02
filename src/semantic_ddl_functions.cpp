@@ -5,8 +5,8 @@
 #include "semantic_catalog.hpp"
 #include "semantic_lowering.hpp"
 #include "semantic_materialization.hpp"
-#include "semantic_view_registry.hpp"
-#include "semantic_views_functions.hpp"
+#include "semantic_layer_registry.hpp"
+#include "semantic_layer_functions.hpp"
 
 namespace duckdb {
 

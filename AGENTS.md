@@ -1,4 +1,4 @@
-# DuckDB semantic_views extension
+# DuckDB semantic_layer extension
 
 Instructions for AI agents working in this repository.
 
@@ -8,7 +8,7 @@ Instructions for AI agents working in this repository.
   (`CREATE SEMANTIC VIEW`, `SEMANTIC_VIEW(...)` queries, `SHOW` / `DESCRIBE`).
 - Design overview: `README.md` ("How it works"). Local design notes and plans go in `docs/superpowers/`
   (git-ignored, like `.superpowers/` and `.cache/`).
-- Parsing is a grammar extension of DuckDB's PEG parser (`src/parser/semantic_views_grammar.cpp`): rules added to
+- Parsing is a grammar extension of DuckDB's PEG parser (`src/parser/semantic_layer_grammar.cpp`): rules added to
   DuckDB's grammar and transforms lowering the statements onto internal table functions. It is activated on every
   connection when the extension loads.
 - Semantic queries are expanded at bind time into plain DuckDB SQL ASTs (no custom operators).
@@ -33,7 +33,7 @@ Instructions for AI agents working in this repository.
 ## Testing
 
 - SQL tests: `make test` or `./build/release/test/unittest "test/sql/*"`
-- Single test: `./build/release/test/unittest test/sql/semantic_views/<file>.test`
+- Single test: `./build/release/test/unittest test/sql/semantic_layer/<file>.test`
 
 ## Grammar
 

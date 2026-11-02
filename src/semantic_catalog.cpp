@@ -20,8 +20,8 @@
 #include "duckdb/planner/binder.hpp"
 #include "semantic_ast_helpers.hpp"
 #include "semantic_catalog_lookup.hpp"
-#include "semantic_view_registry.hpp"
-#include "semantic_views_functions.hpp"
+#include "semantic_layer_registry.hpp"
+#include "semantic_layer_functions.hpp"
 
 namespace duckdb {
 

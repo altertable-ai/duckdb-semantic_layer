@@ -1,0 +1,260 @@
+# name: test/sql/semantic_layer/catalog.test
+# description: semantic views appear in the catalog as views (information_schema, duckdb_views, duckdb_columns)
+# group: [semantic_layer]
+
+require semantic_layer
+
+statement ok
+CREATE TABLE orders (id INTEGER, customer_id INTEGER, amount DECIMAL(10, 2), status VARCHAR);
+INSERT INTO orders VALUES (1, 1, 100, 'open'), (2, 1, 50, 'closed'), (3, 2, 200, 'open');
+CREATE TABLE customers (id INTEGER, name VARCHAR, segment VARCHAR);
+INSERT INTO customers VALUES (1, 'Alice', 'retail'), (2, 'Bob', 'pro');
+
+statement ok
+CREATE SEMANTIC VIEW shop
+  TABLES (o AS orders PRIMARY KEY (id), c AS customers PRIMARY KEY (id))
+  RELATIONSHIPS (o (customer_id) REFERENCES c)
+  FACTS (
+    o.amount_fact AS amount COMMENT = 'order amount',
+    PRIVATE o.secret AS amount * 2
+  )
+  DIMENSIONS (
+    o.status AS status COMMENT = 'order status',
+    c.name AS c.name,
+    o.name AS 'order ' || id
+  )
+  METRICS (
+    o.revenue AS SUM(amount) COMMENT = 'total revenue',
+    c.customer_count AS COUNT(*),
+    PRIVATE o.hidden AS COUNT(*)
+  )
+  COMMENT = 'shop model';
+
+query III
+SELECT table_name, table_type, TABLE_COMMENT FROM information_schema.tables WHERE table_name = 'shop';
+----
+shop	VIEW	shop model
+
+# public members in clause order (facts, dimensions, metrics); shared names are qualified; private ones are hidden
+query IIII
+SELECT column_name, data_type, ordinal_position, COLUMN_COMMENT FROM information_schema.columns WHERE table_name = 'shop' ORDER BY ordinal_position;
+----
+amount_fact	DECIMAL(10,2)	1	order amount
+status	VARCHAR	2	order status
+c.name	VARCHAR	3	NULL
+o.name	VARCHAR	4	NULL
+revenue	DECIMAL(38,2)	5	total revenue
+customer_count	BIGINT	6	NULL
+
+query IIII
+SELECT view_name, comment, internal, temporary FROM duckdb_views() WHERE view_name = 'shop';
+----
+shop	shop model	false	false
+
+# the placeholder is marked with a tag
+query I
+SELECT tags FROM duckdb_views() WHERE view_name = 'shop';
+----
+{semantic_view=true}
+
+query II
+SELECT column_name, comment FROM duckdb_columns() WHERE table_name = 'shop' AND comment IS NOT NULL ORDER BY column_index;
+----
+amount_fact	order amount
+status	order status
+revenue	total revenue
+
+# IF NOT EXISTS on an existing semantic view leaves it (and its columns) unchanged
+statement ok
+CREATE SEMANTIC VIEW IF NOT EXISTS shop TABLES (o AS orders PRIMARY KEY (id)) METRICS (o.n AS COUNT(*));
+
+query I
+SELECT count(*) FROM information_schema.columns WHERE table_name = 'shop';
+----
+6
+
+# a table or view of the same name conflicts
+statement ok
+CREATE TABLE taken (x INTEGER);
+
+statement error
+CREATE SEMANTIC VIEW taken TABLES (o AS orders PRIMARY KEY (id)) METRICS (o.n AS COUNT(*));
+----
+Cannot create semantic view "taken": a table or view with that name already exists
+
+statement error
+CREATE OR REPLACE SEMANTIC VIEW taken TABLES (o AS orders PRIMARY KEY (id)) METRICS (o.n AS COUNT(*));
+----
+Cannot create semantic view "taken": a table or view with that name already exists
+
+statement error
+CREATE SEMANTIC VIEW IF NOT EXISTS taken TABLES (o AS orders PRIMARY KEY (id)) METRICS (o.n AS COUNT(*));
+----
+Cannot create semantic view "taken": a table or view with that name already exists
+
+statement error
+CREATE TABLE shop (x INTEGER);
+----
+already exists
+
+statement error
+ALTER SEMANTIC VIEW shop RENAME TO taken;
+----
+Cannot create semantic view "taken": a table or view with that name already exists
+
+# CREATE OR REPLACE replaces the columns
+statement ok
+CREATE OR REPLACE SEMANTIC VIEW shop TABLES (o AS orders PRIMARY KEY (id)) DIMENSIONS (o.status AS status) METRICS (o.order_count AS COUNT(*));
+
+query II
+SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'shop' ORDER BY ordinal_position;
+----
+status	VARCHAR
+order_count	BIGINT
+
+# SET / UNSET COMMENT update the view comment
+statement ok
+ALTER SEMANTIC VIEW shop SET COMMENT = 'orders only';
+
+query I
+SELECT comment FROM duckdb_views() WHERE view_name = 'shop';
+----
+orders only
+
+statement ok
+ALTER SEMANTIC VIEW shop UNSET COMMENT;
+
+query I
+SELECT comment FROM duckdb_views() WHERE view_name = 'shop';
+----
+NULL
+
+# RENAME moves the view, within its schema
+statement ok
+CREATE SCHEMA analytics;
+
+statement ok
+CREATE SEMANTIC VIEW analytics.sales TABLES (o AS main.orders PRIMARY KEY (id)) METRICS (o.n AS COUNT(*));
+
+statement ok
+ALTER SEMANTIC VIEW analytics.sales RENAME TO revenue;
+
+query II
+SELECT table_schema, table_name FROM information_schema.tables WHERE table_type = 'VIEW' ORDER BY ALL;
+----
+analytics	revenue
+main	shop
+
+# DROP removes it
+statement ok
+DROP SEMANTIC VIEW analytics.revenue;
+
+statement ok
+DROP SEMANTIC VIEW shop;
+
+query I
+SELECT count(*) FROM information_schema.tables WHERE table_type = 'VIEW';
+----
+0
+
+# BI tools query the catalog columns by name, quoting qualified names
+statement ok
+CREATE SEMANTIC VIEW shop2
+  TABLES (o AS orders PRIMARY KEY (id), c AS customers PRIMARY KEY (id))
+  RELATIONSHIPS (o (customer_id) REFERENCES c)
+  DIMENSIONS (o.status AS status, c.name AS c.name, o.name AS 'order ' || id)
+  METRICS (o.revenue AS SUM(amount));
+
+query II
+SELECT "c.name", AGG("revenue") FROM main.shop2 GROUP BY "c.name" ORDER BY 1;
+----
+Alice	150.00
+Bob	200.00
+
+query II
+SELECT "o.name", AGG(revenue) FROM memory.main.shop2 WHERE status = 'open' GROUP BY 1 ORDER BY 1;
+----
+order 1	100.00
+order 3	200.00
+
+# DESCRIBE reports the catalog columns
+query II
+SELECT column_name, column_type FROM (DESCRIBE shop2);
+----
+status	VARCHAR
+c.name	VARCHAR
+o.name	VARCHAR
+revenue	DECIMAL(38,2)
+
+statement error
+SUMMARIZE shop2;
+----
+SELECT * is not supported
+
+statement error
+SELECT * FROM shop2;
+----
+SELECT * is not supported
+
+# where the rewrite does not apply, the placeholder explains how to query the semantic view
+statement error
+CREATE VIEW v AS SELECT status FROM shop2 GROUP BY status;
+----
+Semantic view "shop2" cannot be read as a table here
+
+# a statement whose placeholder change fails leaves the semantic view unchanged
+statement ok con1
+BEGIN;
+
+statement ok con1
+CREATE SEMANTIC VIEW racy TABLES (o AS orders PRIMARY KEY (id)) METRICS (o.first_metric AS COUNT(*));
+
+statement error con2
+CREATE OR REPLACE SEMANTIC VIEW racy TABLES (o AS orders PRIMARY KEY (id)) METRICS (o.second_metric AS COUNT(*));
+----
+Catalog write-write conflict
+
+statement ok con1
+COMMIT;
+
+query I
+SELECT name FROM (SHOW SEMANTIC METRICS IN racy);
+----
+first_metric
+
+# like DROP VIEW / ALTER VIEW: IF EXISTS tolerates a missing schema, not a missing database
+statement ok
+DROP SEMANTIC VIEW IF EXISTS nosuchschema.x;
+
+statement ok
+ALTER SEMANTIC VIEW IF EXISTS nosuchschema.x RENAME TO y;
+
+statement error
+DROP SEMANTIC VIEW nosuchschema.x;
+----
+Schema with name nosuchschema does not exist
+
+statement error
+DROP SEMANTIC VIEW IF EXISTS nosuchdb.main.x;
+----
+Catalog "nosuchdb" does not exist!
+
+# a read-only transaction cannot drop the catalog view of a semantic view, but statements that change nothing pass
+statement ok
+BEGIN TRANSACTION READ ONLY;
+
+statement ok
+DROP SEMANTIC VIEW IF EXISTS missing;
+
+statement error
+DROP SEMANTIC VIEW shop2;
+----
+read-only mode
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM (SHOW SEMANTIC VIEWS LIKE 'shop2');
+----
+1

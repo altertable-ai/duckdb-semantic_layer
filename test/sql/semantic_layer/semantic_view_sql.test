@@ -1,0 +1,92 @@
+# name: test/sql/semantic_layer/semantic_view_sql.test
+# description: semantic_view_sql() shows the generated SQL (join pruning, block structure)
+# group: [semantic_layer]
+
+require semantic_layer
+
+statement ok
+PRAGMA enable_verification
+
+statement ok
+CREATE TABLE regions (id INTEGER, name VARCHAR);
+INSERT INTO regions VALUES (1, 'EMEA'), (2, 'AMER');
+CREATE TABLE customers (id INTEGER, name VARCHAR, region_id INTEGER);
+INSERT INTO customers VALUES (1, 'Alice', 1), (2, 'Bob', 1), (3, 'Carol', 2), (4, 'Dan', NULL);
+CREATE TABLE orders (id INTEGER, customer_id INTEGER, amount DECIMAL(10, 2), order_date DATE, status VARCHAR);
+INSERT INTO orders VALUES (1, 1, 100, '2024-01-01', 'open'), (2, 1, 50, '2024-01-02', 'closed'), (3, 2, 200, '2024-02-01', 'open'), (4, 3, 10, '2024-02-15', 'open'), (5, 99, 7, '2024-03-01', 'open');
+CREATE TABLE line_items (order_id INTEGER, line_no INTEGER, qty INTEGER, price DECIMAL(10, 2));
+INSERT INTO line_items VALUES (1, 1, 2, 30), (1, 2, 1, 40), (2, 1, 5, 10), (3, 1, 1, 200), (3, 2, 1, 0);
+CREATE SEMANTIC VIEW shop
+  TABLES (
+    r AS regions PRIMARY KEY (id),
+    c AS customers PRIMARY KEY (id),
+    o AS orders PRIMARY KEY (id),
+    li AS line_items PRIMARY KEY (order_id, line_no)
+  )
+  RELATIONSHIPS (
+    customer_region AS c (region_id) REFERENCES r,
+    order_customer AS o (customer_id) REFERENCES c,
+    line_order AS li (order_id) REFERENCES o
+  )
+  FACTS (
+    li.line_total AS qty * price,
+    o.line_count AS COUNT(li.line_no)
+  )
+  DIMENSIONS (
+    r.region_name AS r.name,
+    c.customer_name AS c.name,
+    c.revenue_tier AS CASE WHEN o.revenue > 100 THEN 'big' ELSE 'small' END,
+    o.order_date AS order_date,
+    o.order_month AS DATE_TRUNC('month', order_date),
+    o.status AS status,
+    o.customer_region AS r.region_name,
+    li.line_number AS line_no
+  )
+  METRICS (
+    o.revenue AS SUM(amount),
+    o.order_count AS COUNT(*),
+    o.avg_lines AS AVG(o.line_count),
+    li.units AS SUM(qty),
+    li.line_revenue AS SUM(li.line_total),
+    c.customer_count AS COUNT(*),
+    c.avg_customer_revenue AS AVG(SUM(o.amount)),
+    PRIVATE o.secret AS MAX(amount),
+    revenue_per_customer AS o.revenue / c.customer_count,
+    avg_order AS o.revenue / o.order_count
+  );
+
+# single table: no join at all
+query I
+SELECT sql NOT ILIKE '%JOIN%' FROM semantic_view_sql('SELECT * FROM SEMANTIC_VIEW(shop DIMENSIONS o.status METRICS o.revenue)');
+----
+true
+
+# join pruning: only the tables on the path to the requested dimension are joined
+query II
+SELECT sql ILIKE '%LEFT JOIN%customers%', sql NOT ILIKE '%line_items%' AND sql NOT ILIKE '%regions%' FROM semantic_view_sql('SELECT * FROM SEMANTIC_VIEW(shop DIMENSIONS c.customer_name METRICS o.revenue)');
+----
+true	true
+
+# two grains: one block per home table, merged with UNION ALL
+query I
+SELECT sql ILIKE '%UNION ALL%' FROM semantic_view_sql('SELECT * FROM SEMANTIC_VIEW(shop DIMENSIONS c.customer_name METRICS o.revenue, li.units)');
+----
+true
+
+# the rest of the statement is kept
+query I
+SELECT sql ILIKE '%ORDER BY%' FROM semantic_view_sql('SELECT * FROM SEMANTIC_VIEW(shop METRICS o.revenue) AS s ORDER BY 1');
+----
+true
+
+# statements without semantic views are returned unchanged
+query I
+SELECT sql FROM semantic_view_sql('SELECT 42 AS x');
+----
+SELECT 42 AS x
+
+# DESCRIBE wraps the query in a SHOW reference; it is expanded too
+query I
+SELECT sql NOT ILIKE '%__semantic_view_query%' FROM semantic_view_sql('DESCRIBE SELECT * FROM SEMANTIC_VIEW(shop METRICS o.revenue)');
+----
+true

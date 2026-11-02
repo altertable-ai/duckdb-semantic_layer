@@ -1,0 +1,107 @@
+# name: test/sql/semantic_layer/materializations_ownership.test
+# description: storage belongs to a qualified view and materialization, including quoted identifiers
+# group: [semantic_layer]
+
+require semantic_layer
+
+statement ok
+PRAGMA enable_verification
+
+statement ok
+CREATE SCHEMA other;
+CREATE TABLE t1 (id INTEGER, amount INTEGER);
+INSERT INTO t1 VALUES (1, 10);
+CREATE TABLE t2 (id INTEGER, amount INTEGER);
+INSERT INTO t2 VALUES (1, 100);
+CREATE SEMANTIC VIEW main.v TABLES (t AS t1 PRIMARY KEY (id)) METRICS (t.total AS SUM(amount));
+ALTER SEMANTIC VIEW main.v ADD MATERIALIZATION m AS METRICS t.total;
+ALTER SEMANTIC VIEW main.v SET MAX_STALENESS = 3600;
+CREATE SEMANTIC VIEW other.v TABLES (t AS t2 PRIMARY KEY (id)) METRICS (t.total AS SUM(amount));
+ALTER SEMANTIC VIEW other.v ADD MATERIALIZATION m AS METRICS t.total;
+
+query I
+SELECT * FROM SEMANTIC_VIEW(main.v METRICS t.total);
+----
+10
+
+query I
+SELECT count(DISTINCT tables) FROM __semantic_materializations.__sv_materializations;
+----
+2
+
+statement ok
+DROP SEMANTIC VIEW other.v;
+
+query I
+SELECT usable FROM (SHOW SEMANTIC MATERIALIZATIONS IN main.v);
+----
+true
+
+statement ok
+ALTER SEMANTIC VIEW main.v ADD MATERIALIZATION "m!" AS METRICS t.total;
+ALTER SEMANTIC VIEW main.v ADD MATERIALIZATION "m?" AS METRICS t.total;
+
+query I
+SELECT count(DISTINCT tables) FROM __semantic_materializations.__sv_materializations;
+----
+3
+
+statement ok
+ALTER SEMANTIC VIEW main.v RENAME TO renamed;
+CREATE SEMANTIC VIEW main.v TABLES (t AS t2 PRIMARY KEY (id)) METRICS (t.total AS SUM(amount));
+ALTER SEMANTIC VIEW main.v ADD MATERIALIZATION m AS METRICS t.total;
+ALTER SEMANTIC VIEW main.v SET MAX_STALENESS = 3600;
+
+query I
+SELECT * FROM SEMANTIC_VIEW(renamed METRICS t.total);
+----
+10
+
+query I
+SELECT * FROM SEMANTIC_VIEW(main.v METRICS t.total);
+----
+100
+
+# Legacy sanitized allocations can already have collided. Reject only the affected owners and preserve data.
+load __TEST_DIR__/materializations_legacy_ownership.db
+
+statement ok
+PRAGMA enable_verification
+
+statement ok
+CREATE TABLE t (id INTEGER, amount INTEGER);
+INSERT INTO t VALUES (1, 10);
+CREATE SEMANTIC VIEW legacy_a TABLES (t AS t PRIMARY KEY (id)) METRICS (t.total AS SUM(amount));
+CREATE SEMANTIC VIEW legacy_b TABLES (t AS t PRIMARY KEY (id)) METRICS (t.total AS SUM(amount));
+CREATE SEMANTIC VIEW unrelated TABLES (t AS t PRIMARY KEY (id)) METRICS (t.total AS SUM(amount));
+ALTER SEMANTIC VIEW legacy_a ADD MATERIALIZATION m AS METRICS t.total;
+ALTER SEMANTIC VIEW legacy_b ADD MATERIALIZATION m AS METRICS t.total;
+ALTER SEMANTIC VIEW unrelated ADD MATERIALIZATION m AS METRICS t.total;
+UPDATE __semantic_materializations.__sv_materializations
+  SET tables = (SELECT tables FROM __semantic_materializations.__sv_materializations WHERE view_name = 'legacy_a')
+  WHERE view_name = 'legacy_b';
+
+restart
+
+statement error
+CREATE OR REPLACE SEMANTIC VIEW legacy_a TABLES (t AS t PRIMARY KEY (id)) METRICS (t.total AS SUM(amount));
+----
+multiple owners claim table
+
+statement error
+CREATE OR REPLACE SEMANTIC VIEW legacy_b TABLES (t AS t PRIMARY KEY (id)) METRICS (t.total AS SUM(amount));
+----
+multiple owners claim table
+
+statement ok
+CREATE OR REPLACE SEMANTIC VIEW unrelated TABLES (t AS t PRIMARY KEY (id)) METRICS (t.total AS SUM(amount));
+
+query I
+SELECT count(*) FROM __semantic_materializations.__sv_materializations;
+----
+3
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE schema_name = '__semantic_materializations' AND table_name <> '__sv_materializations';
+----
+3

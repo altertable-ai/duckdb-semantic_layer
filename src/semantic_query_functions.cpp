@@ -14,9 +14,9 @@
 #include "semantic_sql_rewrite.hpp"
 #include "semantic_statement_visitor.hpp"
 #include "semantic_time_reads.hpp"
-#include "semantic_view_registry.hpp"
-#include "semantic_views_functions.hpp"
-#include "semantic_views_grammar.hpp"
+#include "semantic_layer_registry.hpp"
+#include "semantic_layer_functions.hpp"
+#include "semantic_layer_grammar.hpp"
 
 namespace duckdb {
 
@@ -94,14 +94,14 @@ static unique_ptr<FunctionData> SemanticViewSqlBind(ClientContext &context, Tabl
 }
 
 //===--------------------------------------------------------------------===//
-// semantic_views_peg_parse(sql) - how the semantic-view parser lowers a statement
+// semantic_layer_peg_parse(sql) - how the semantic-view parser lowers a statement
 //===--------------------------------------------------------------------===//
 static unique_ptr<FunctionData> PegParseBind(ClientContext &context, TableFunctionBindInput &input,
                                              vector<LogicalType> &return_types, vector<Identifier> &names) {
 	names.emplace_back("rewritten_sql");
 	return_types.emplace_back(LogicalType::VARCHAR);
 	if (input.inputs[0].IsNull()) {
-		throw BinderException("semantic_views_peg_parse: the query cannot be NULL");
+		throw BinderException("semantic_layer_peg_parse: the query cannot be NULL");
 	}
 	auto result = make_uniq<RowsFunctionData>();
 	for (auto &statement : SemanticViewsGrammarExtension::Parse(context, StringValue::Get(input.inputs[0]))) {
@@ -117,7 +117,7 @@ void RegisterSemanticQueryFunctions(ExtensionLoader &loader, shared_ptr<Semantic
 	loader.RegisterFunction(query);
 	loader.RegisterFunction(SemanticViewsTableFunction("semantic_view_sql", {LogicalType::VARCHAR}, RowsFunctionScan,
 	                                                   SemanticViewSqlBind, RowsFunctionInit, state));
-	loader.RegisterFunction(SemanticViewsTableFunction("semantic_views_peg_parse", {LogicalType::VARCHAR},
+	loader.RegisterFunction(SemanticViewsTableFunction("semantic_layer_peg_parse", {LogicalType::VARCHAR},
 	                                                   RowsFunctionScan, PegParseBind, RowsFunctionInit, state));
 }
 

@@ -682,7 +682,7 @@ private:
 				auto any_value = make_uniq<FunctionExpression>("any_value", std::move(children));
 				any_value->FilterMutable() =
 				    Compare(ExpressionType::COMPARE_EQUAL, ColumnRef(BLOCK_COLUMN),
-					        ConstantExpression::FromValue(Value::BIGINT(NumericCast<int64_t>(b))));
+				            ConstantExpression::FromValue(Value::BIGINT(NumericCast<int64_t>(b))));
 				any_value->SetAlias(Identifier(AtomColumn(a)));
 				merged->select_list.push_back(std::move(any_value));
 			}
@@ -903,6 +903,11 @@ unique_ptr<SelectStatement> SemanticQueryCompiler::CompileRowQuery(SemanticExpre
 	}
 	if (base == DConstants::INVALID_INDEX) {
 		throw SemanticDefinitionException("SEMANTIC_VIEW must reference at least one dimension or fact");
+	}
+	if (!has_facts && model.IsTimeSpine(base)) {
+		throw SemanticDefinitionException(
+		    "Invalid SEMANTIC_VIEW query: \"%s\" is the time spine and has no rows; query a metric or a fact with it",
+		    model.tables[base].name);
 	}
 	if (has_facts && has_dimensions && row_tables.size() > 1) {
 		throw SemanticDefinitionException(

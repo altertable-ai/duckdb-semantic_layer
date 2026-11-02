@@ -1,5 +1,5 @@
 //===----------------------------------------------------------------------===//
-//                         DuckDB - semantic_views
+//                         DuckDB - semantic_layer
 //
 // semantic_ast_helpers.hpp
 //
@@ -40,6 +40,12 @@ inline const ParsedExpression &Argument(const FunctionExpression &function, idx_
 }
 inline unique_ptr<ParsedExpression> &ArgumentMutable(FunctionExpression &function, idx_t index) {
 	return function.GetArgumentsMutable()[index].GetExpressionMutable();
+}
+
+//! name(children...), or an operator such as "-" when `is_operator`
+inline unique_ptr<ParsedExpression> Call(const string &name, vector<unique_ptr<ParsedExpression>> children,
+                                         bool is_operator = false) {
+	return make_uniq<FunctionExpression>(Identifier(name), std::move(children), nullptr, nullptr, false, is_operator);
 }
 
 inline unique_ptr<ParsedExpression> Compare(ExpressionType type, unique_ptr<ParsedExpression> left,

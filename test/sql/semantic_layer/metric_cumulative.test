@@ -1,0 +1,687 @@
+# name: test/sql/semantic_layer/metric_cumulative.test
+# description: cumulative metrics (CUMULATIVE (<dimension> [OVER <interval> | TO <part>] [FIRST | LAST | AVERAGE])):
+# group: [semantic_layer]
+
+# every row counts for each anchor date whose window contains its date
+
+require semantic_layer
+
+statement ok
+PRAGMA enable_verification
+
+statement ok
+CREATE TABLE users (user_id INTEGER, country VARCHAR);
+
+statement ok
+INSERT INTO users VALUES (1, 'FR'), (2, 'US'), (3, 'FR');
+
+statement ok
+CREATE TABLE teams (team_id INTEGER, name VARCHAR);
+
+statement ok
+INSERT INTO teams VALUES (1, 'red'), (2, 'blue');
+
+statement ok
+CREATE TABLE memberships (user_id INTEGER, team_id INTEGER);
+
+statement ok
+INSERT INTO memberships VALUES (1, 1), (2, 1), (3, 2), (1, 2);
+
+statement ok
+CREATE TABLE events (event_id INTEGER, user_id INTEGER, event_date DATE, amount INTEGER);
+
+statement ok
+INSERT INTO events VALUES
+  (1, 1, '2026-01-01', 10), (2, 1, '2026-01-02', 20), (3, 2, '2026-01-02', 30), (4, 1, '2026-01-05', 40),
+  (5, 3, '2026-01-08', 50), (6, 2, '2026-01-20', 60), (7, 1, '2026-02-03', 70), (8, 3, '2026-02-03', 80),
+  (9, 2, '2026-03-31', 90);
+
+statement ok
+CREATE TABLE costs (cost_id INTEGER, cost_date DATE, cost INTEGER);
+
+statement ok
+INSERT INTO costs VALUES (1, '2026-01-02', 5), (2, '2026-01-20', 15), (3, '2026-02-10', 25), (4, '2026-03-15', 35);
+
+# a date table running well past the data (anchors stop at the latest row)
+statement ok
+CREATE TABLE dates AS SELECT range::DATE AS day, year(range)::INTEGER AS year FROM range(DATE '2025-12-01', DATE '2027-01-01', INTERVAL 1 DAY);
+
+statement ok
+CREATE SEMANTIC VIEW activity
+  TABLES (
+    users PRIMARY KEY (user_id),
+    teams PRIMARY KEY (team_id),
+    memberships PRIMARY KEY (user_id, team_id),
+    dates PRIMARY KEY (day),
+    events PRIMARY KEY (event_id),
+    costs PRIMARY KEY (cost_id)
+  )
+  RELATIONSHIPS (
+    events (user_id) REFERENCES users,
+    events (event_date) REFERENCES dates,
+    costs (cost_date) REFERENCES dates,
+    memberships (user_id) REFERENCES users,
+    memberships (team_id) REFERENCES teams
+  )
+  DIMENSIONS (
+    users.country AS country,
+    teams.team AS name,
+    dates.day AS day,
+    dates.week AS DATE_TRUNC('week', day)::DATE,
+    dates.month AS DATE_TRUNC('month', day)::DATE,
+    dates.stored_year AS year,
+    events.event_month AS DATE_TRUNC('month', event_date)::DATE
+  )
+  METRICS (
+    events.revenue AS SUM(amount),
+    events.revenue_total CUMULATIVE (dates.day) AS revenue,
+    events.revenue_mtd CUMULATIVE (dates.day TO MONTH) AS revenue,
+    events.revenue_ytd CUMULATIVE (dates.day TO YEAR) AS revenue,
+    events.revenue_7d CUMULATIVE (dates.day OVER INTERVAL 7 DAYS) AS revenue,
+    events.wau CUMULATIVE (dates.day OVER INTERVAL 7 DAYS) AS COUNT(DISTINCT user_id),
+    events.wau_first CUMULATIVE (dates.day OVER INTERVAL 7 DAYS FIRST) AS COUNT(DISTINCT user_id),
+    events.wau_avg CUMULATIVE (dates.day OVER INTERVAL 7 DAYS AVERAGE) AS COUNT(DISTINCT user_id),
+    events.events_7d CUMULATIVE (dates.day OVER INTERVAL 7 DAYS) AS COUNT(*),
+    events.avg_7d CUMULATIVE (dates.day OVER INTERVAL 7 DAYS) AS AVG(amount),
+    events.min_7d CUMULATIVE (dates.day OVER INTERVAL 7 DAYS) AS MIN(amount),
+    events.max_7d CUMULATIVE (dates.day OVER INTERVAL 7 DAYS) AS MAX(amount),
+    events.median_7d CUMULATIVE (dates.day OVER INTERVAL 7 DAYS) AS MEDIAN(amount),
+    events.fr_wau FILTER (WHERE users.country = 'FR') CUMULATIVE (dates.day OVER INTERVAL 7 DAYS) AS COUNT(DISTINCT user_id),
+    fr_revenue_total FILTER (WHERE users.country = 'FR') AS events.revenue_total,
+    events.revenue_total_lm OFFSET (dates.day BY INTERVAL 1 MONTH) AS revenue_total,
+    costs.cost AS SUM(cost),
+    margin_total CUMULATIVE (dates.day) AS events.revenue - costs.cost,
+    revenue_total_prev AS LAG(events.revenue_total) OVER (ORDER BY dates.month)
+  );
+
+# DESCRIBE shows the clause, with its period
+query II
+SELECT object_name, property_value FROM (DESCRIBE SEMANTIC VIEW activity)
+WHERE property = 'CUMULATIVE' AND object_name IN ('revenue_total', 'revenue_mtd', 'margin_total') ORDER BY 1;
+----
+margin_total	dates.day LAST
+revenue_mtd	dates.day TO MONTH LAST
+revenue_total	dates.day LAST
+
+query II
+SELECT object_name, property_value LIKE 'dates.day OVER % FIRST' FROM (DESCRIBE SEMANTIC VIEW activity)
+WHERE property = 'CUMULATIVE' AND object_name = 'wau_first';
+----
+wau_first	true
+
+# the clause survives copies of the definition
+statement ok
+ALTER SEMANTIC VIEW activity RENAME TO activity_renamed;
+
+query I
+SELECT count(*) FROM (DESCRIBE SEMANTIC VIEW activity_renamed) WHERE property = 'CUMULATIVE' AND object_name = 'wau_avg' AND property_value LIKE '% AVERAGE';
+----
+1
+
+statement ok
+ALTER SEMANTIC VIEW activity_renamed RENAME TO activity;
+
+# grammar: lower case, TO ... FIRST, a bare period, a string interval
+statement ok
+CREATE SEMANTIC VIEW grammar
+  TABLES (dates PRIMARY KEY (day), events PRIMARY KEY (event_id))
+  RELATIONSHIPS (events (event_date) REFERENCES dates)
+  DIMENSIONS (dates.day AS day)
+  METRICS (
+    events.a cumulative (dates.day over interval 7 days first) AS SUM(amount),
+    events.b CUMULATIVE (dates.day TO MONTH FIRST) AS SUM(amount),
+    events.c CUMULATIVE (dates.day AVERAGE) AS SUM(amount),
+    events.d CUMULATIVE (dates.day OVER INTERVAL '7 days' LAST) AS SUM(amount)
+  );
+
+query II
+SELECT object_name, property_value FROM (DESCRIBE SEMANTIC VIEW grammar) WHERE property = 'CUMULATIVE' AND object_name IN ('b', 'c') ORDER BY 1;
+----
+b	dates.day TO MONTH FIRST
+c	dates.day AVERAGE
+
+query I
+SELECT count(*) FROM (DESCRIBE SEMANTIC VIEW grammar) WHERE property = 'CUMULATIVE' AND object_name IN ('a', 'd') AND property_value LIKE 'dates.day OVER %';
+----
+2
+
+# errors
+statement error
+CREATE SEMANTIC VIEW bad TABLES (dates PRIMARY KEY (day)) DIMENSIONS (dates.d2 CUMULATIVE (dates.day) AS day);
+----
+CUMULATIVE is only allowed on metrics
+
+statement error
+CREATE SEMANTIC VIEW bad TABLES (dates PRIMARY KEY (day), events PRIMARY KEY (event_id)) RELATIONSHIPS (events (event_date) REFERENCES dates)
+  DIMENSIONS (dates.month AS DATE_TRUNC('month', day)) METRICS (events.x CUMULATIVE (dates.month) AS SUM(amount));
+----
+must be defined as a column of its logical table
+
+statement error
+CREATE SEMANTIC VIEW bad TABLES (dates PRIMARY KEY (day), events PRIMARY KEY (event_id)) RELATIONSHIPS (events (event_date) REFERENCES dates)
+  DIMENSIONS (dates.day AS day) METRICS (events.x CUMULATIVE (dates.nope) AS SUM(amount));
+----
+nope
+
+statement error
+CREATE SEMANTIC VIEW bad TABLES (dates PRIMARY KEY (day), events PRIMARY KEY (event_id)) RELATIONSHIPS (events (event_date) REFERENCES dates)
+  DIMENSIONS (dates.day AS day) METRICS (events.x CUMULATIVE (dates.day OVER events.amount) AS SUM(amount));
+----
+the window must be a constant expression
+
+statement error
+CREATE SEMANTIC VIEW bad TABLES (dates PRIMARY KEY (day), events PRIMARY KEY (event_id)) RELATIONSHIPS (events (event_date) REFERENCES dates)
+  DIMENSIONS (dates.day AS day) METRICS (events.x CUMULATIVE (dates.day OVER TRUE) AS SUM(amount));
+----
+as the window of column "dates.day"
+
+statement error
+CREATE SEMANTIC VIEW bad TABLES (dates PRIMARY KEY (day), events PRIMARY KEY (event_id)) RELATIONSHIPS (events (event_date) REFERENCES dates)
+  DIMENSIONS (dates.day AS day) METRICS (events.x CUMULATIVE (dates.day TO fortnight) AS SUM(amount));
+----
+"fortnight" is not a date part to truncate to
+
+statement error
+CREATE SEMANTIC VIEW bad TABLES (dates PRIMARY KEY (day), events PRIMARY KEY (event_id)) RELATIONSHIPS (events (event_date) REFERENCES dates)
+  DIMENSIONS (dates.day AS day) METRICS (events.x CUMULATIVE (dates.day TO dow) AS SUM(amount));
+----
+"dow" is not a date part to truncate to
+
+statement error
+CREATE SEMANTIC VIEW bad TABLES (dates PRIMARY KEY (day), events PRIMARY KEY (event_id)) RELATIONSHIPS (events (event_date) REFERENCES dates)
+  DIMENSIONS (dates.y AS year) METRICS (events.x CUMULATIVE (dates.y TO MONTH) AS SUM(amount));
+----
+cannot truncate column "dates.year" (INTEGER) to month
+
+# CREATE-time rules of the analysis
+statement error
+CREATE SEMANTIC VIEW bad TABLES (users PRIMARY KEY (user_id), dates PRIMARY KEY (day), costs PRIMARY KEY (cost_id))
+  RELATIONSHIPS (costs (cost_date) REFERENCES dates) DIMENSIONS (users.country AS country)
+  METRICS (costs.x CUMULATIVE (users.country) AS SUM(cost));
+----
+is not reachable from logical table "costs"
+
+statement error
+CREATE SEMANTIC VIEW bad TABLES (dates PRIMARY KEY (day), events PRIMARY KEY (event_id)) RELATIONSHIPS (events (event_date) REFERENCES dates)
+  DIMENSIONS (dates.day AS day) METRICS (events.x CUMULATIVE (dates.day AVERAGE) AS SUM(amount) / COUNT(*));
+----
+AVERAGE requires a metric computed from a single aggregate
+
+statement error
+CREATE SEMANTIC VIEW bad TABLES (dates PRIMARY KEY (day), events PRIMARY KEY (event_id)) RELATIONSHIPS (events (event_date) REFERENCES dates)
+  DIMENSIONS (dates.day AS day)
+  METRICS (events.revenue_lm OFFSET (dates.day BY INTERVAL 1 MONTH) AS SUM(amount), events.x CUMULATIVE (dates.day) AS revenue_lm);
+----
+which uses OFFSET
+
+statement error
+CREATE SEMANTIC VIEW bad TABLES (dates PRIMARY KEY (day), events PRIMARY KEY (event_id)) RELATIONSHIPS (events (event_date) REFERENCES dates)
+  DIMENSIONS (dates.day AS day)
+  METRICS (events.total CUMULATIVE (dates.day) AS SUM(amount), events.x CUMULATIVE (dates.day TO MONTH) AS total);
+----
+which uses CUMULATIVE
+
+statement error
+CREATE SEMANTIC VIEW bad TABLES (dates PRIMARY KEY (day), events PRIMARY KEY (event_id)) RELATIONSHIPS (events (event_date) REFERENCES dates)
+  DIMENSIONS (dates.day AS day)
+  METRICS (events.x NON ADDITIVE BY (dates.day) CUMULATIVE (dates.day) AS SUM(amount));
+----
+cannot combine CUMULATIVE and NON ADDITIVE BY
+
+statement error
+CREATE SEMANTIC VIEW bad TABLES (dates PRIMARY KEY (day), events PRIMARY KEY (event_id)) RELATIONSHIPS (events (event_date) REFERENCES dates)
+  DIMENSIONS (dates.day AS day)
+  METRICS (events.last_day NON ADDITIVE BY (dates.day) AS SUM(amount), events.x CUMULATIVE (dates.day) AS last_day);
+----
+which uses NON ADDITIVE BY
+
+statement error
+CREATE SEMANTIC VIEW bad TABLES (dates PRIMARY KEY (day), events PRIMARY KEY (event_id)) RELATIONSHIPS (events (event_date) REFERENCES dates)
+  DIMENSIONS (dates.day AS day)
+  METRICS (events.total CUMULATIVE (dates.day) AS SUM(amount), events.x NON ADDITIVE BY (dates.day) AS total);
+----
+which uses CUMULATIVE
+
+statement error
+CREATE SEMANTIC VIEW bad TABLES (users PRIMARY KEY (user_id), dates PRIMARY KEY (day), events PRIMARY KEY (event_id))
+  RELATIONSHIPS (events (user_id) REFERENCES users, events (event_date) REFERENCES dates)
+  FACTS (users.lifetime AS events.total)
+  DIMENSIONS (dates.day AS day)
+  METRICS (events.total CUMULATIVE (dates.day) AS SUM(amount));
+----
+which uses CUMULATIVE
+
+statement error
+CREATE SEMANTIC VIEW bad TABLES (dates PRIMARY KEY (day), events PRIMARY KEY (event_id)) RELATIONSHIPS (events (event_date) REFERENCES dates)
+  DIMENSIONS (dates.day AS day)
+  METRICS (events.x CUMULATIVE (dates.day) AS SUM(amount) OVER (ORDER BY dates.day));
+----
+CUMULATIVE metrics cannot use window functions
+
+# the nesting rules hold through intermediate metrics
+statement error
+CREATE SEMANTIC VIEW bad TABLES (dates PRIMARY KEY (day), events PRIMARY KEY (event_id)) RELATIONSHIPS (events (event_date) REFERENCES dates)
+  DIMENSIONS (dates.day AS day)
+  METRICS (events.revenue_lm OFFSET (dates.day BY INTERVAL 1 MONTH) AS SUM(amount), events.mid AS revenue_lm + 1,
+           events.x CUMULATIVE (dates.day) AS mid);
+----
+uses CUMULATIVE and cannot reference metric "events.revenue_lm", which uses OFFSET
+
+statement error
+CREATE SEMANTIC VIEW bad TABLES (dates PRIMARY KEY (day), events PRIMARY KEY (event_id)) RELATIONSHIPS (events (event_date) REFERENCES dates)
+  DIMENSIONS (dates.day AS day)
+  METRICS (events.total CUMULATIVE (dates.day) AS SUM(amount), events.mid AS total + 1,
+           events.x NON ADDITIVE BY (dates.day) AS mid);
+----
+is semi-additive and cannot reference metric "events.total", which uses CUMULATIVE
+
+# cumulative metrics cannot be materialized
+statement error
+ALTER SEMANTIC VIEW activity ADD MATERIALIZATION bad AS DIMENSIONS dates.month METRICS events.revenue_total;
+----
+uses CUMULATIVE and cannot be materialized
+
+# day grain: running total, month-to-date, 7-day window, weekly active users
+query IIIII
+SELECT day, revenue_total, revenue_mtd, revenue_7d, wau
+FROM SEMANTIC_VIEW(activity DIMENSIONS dates.day METRICS events.revenue_total, events.revenue_mtd, events.revenue_7d, events.wau)
+WHERE day <= DATE '2026-01-10' ORDER BY day;
+----
+2026-01-01	10	10	10	1
+2026-01-02	60	60	60	2
+2026-01-03	60	60	60	2
+2026-01-04	60	60	60	2
+2026-01-05	100	100	100	2
+2026-01-06	100	100	100	2
+2026-01-07	100	100	100	2
+2026-01-08	150	150	140	3
+2026-01-09	150	150	90	2
+2026-01-10	150	150	90	2
+
+# coarser grain: the value at the last anchor (default), the first one, or the average over them
+query IIII
+SELECT week, wau, wau_first, round(wau_avg, 4)
+FROM SEMANTIC_VIEW(activity DIMENSIONS dates.week METRICS events.wau, events.wau_first, events.wau_avg) ORDER BY week;
+----
+2025-12-29	2	1	1.75
+2026-01-05	2	2	2.1429
+2026-01-12	1	1	1.0
+2026-01-19	1	1	1.0
+2026-01-26	1	1	1.0
+2026-02-02	2	2	2.0
+2026-02-09	2	2	2.0
+2026-03-30	1	1	1.0
+
+query IIIII
+SELECT * FROM SEMANTIC_VIEW(activity DIMENSIONS dates.month METRICS events.revenue_total, events.revenue_mtd, events.revenue_ytd, events.wau)
+ORDER BY month;
+----
+2026-01-01	210	210	210	1
+2026-02-01	360	150	360	2
+2026-03-01	450	90	450	1
+
+# without a time dimension: the value at the latest anchor
+query IIII
+SELECT * FROM SEMANTIC_VIEW(activity METRICS events.revenue_total, events.revenue_mtd, events.wau, events.revenue);
+----
+450	90	1	450
+
+# a WHERE on time selects anchors; their windows still read earlier rows
+query III
+SELECT * FROM SEMANTIC_VIEW(activity DIMENSIONS dates.day METRICS events.revenue_total, events.revenue_7d
+  WHERE dates.day BETWEEN DATE '2026-01-05' AND DATE '2026-01-09') ORDER BY day;
+----
+2026-01-05	100	100
+2026-01-06	100	100
+2026-01-07	100	100
+2026-01-08	150	140
+2026-01-09	150	90
+
+# another dimension defined as the date column is the anchor too: one anchor per dimension tuple
+statement ok
+CREATE SEMANTIC VIEW activity_days TABLES (dates PRIMARY KEY (day), events PRIMARY KEY (event_id))
+  RELATIONSHIPS (events (event_date) REFERENCES dates)
+  DIMENSIONS (dates.day AS day, dates.same_day AS day)
+  METRICS (events.wau_first CUMULATIVE (dates.day OVER INTERVAL 7 DAYS FIRST) AS COUNT(DISTINCT user_id),
+           events.wau_avg CUMULATIVE (dates.day OVER INTERVAL 7 DAYS AVERAGE) AS COUNT(DISTINCT user_id));
+
+query III
+SELECT * FROM SEMANTIC_VIEW(activity_days DIMENSIONS dates.same_day METRICS events.wau_first, events.wau_avg
+  WHERE dates.same_day BETWEEN DATE '2026-01-07' AND DATE '2026-01-09') ORDER BY same_day;
+----
+2026-01-07	2	2
+2026-01-08	3	3
+2026-01-09	2	2
+
+# a WHERE on another dimension filters the rows; anchors stop at their latest date (2026-02-03 for FR)
+query II
+SELECT * FROM SEMANTIC_VIEW(activity DIMENSIONS dates.month METRICS events.revenue_total WHERE users.country = 'FR') ORDER BY month;
+----
+2026-01-01	120
+2026-02-01	270
+
+# other dimensions group the rows of every anchor
+query III
+SELECT * FROM SEMANTIC_VIEW(activity DIMENSIONS users.country, dates.month METRICS events.revenue_total) ORDER BY country, month;
+----
+FR	2026-01-01	120
+FR	2026-02-01	270
+FR	2026-03-01	270
+US	2026-01-01	90
+US	2026-02-01	90
+US	2026-03-01	180
+
+# anchors whose window holds no row are absent (2026-01-15 .. 2026-01-19)
+query II
+SELECT * FROM SEMANTIC_VIEW(activity DIMENSIONS dates.day METRICS events.wau WHERE dates.day BETWEEN DATE '2026-01-13' AND DATE '2026-01-21') ORDER BY day;
+----
+2026-01-13	1
+2026-01-14	1
+2026-01-20	1
+2026-01-21	1
+
+# decomposable and opaque aggregates
+query IIIIII
+SELECT * FROM SEMANTIC_VIEW(activity DIMENSIONS dates.day METRICS events.events_7d, events.avg_7d, events.min_7d, events.max_7d, events.median_7d
+  WHERE dates.day <= DATE '2026-01-09') ORDER BY day;
+----
+2026-01-01	1	10.0	10	10	10.0
+2026-01-02	3	20.0	10	30	20.0
+2026-01-03	3	20.0	10	30	20.0
+2026-01-04	3	20.0	10	30	20.0
+2026-01-05	4	25.0	10	40	25.0
+2026-01-06	4	25.0	10	40	25.0
+2026-01-07	4	25.0	10	40	25.0
+2026-01-08	4	35.0	20	50	35.0
+2026-01-09	2	45.0	40	50	45.0
+
+# a metric FILTER filters the aggregates, not the anchors: FR weekly actives are 0 in the last week of January
+query III
+SELECT * FROM SEMANTIC_VIEW(activity DIMENSIONS dates.month METRICS events.fr_wau, fr_revenue_total) ORDER BY month;
+----
+2026-01-01	0	120
+2026-02-01	2	270
+2026-03-01	0	270
+
+# OFFSET of a cumulative metric shifts the anchor
+query III
+SELECT * FROM SEMANTIC_VIEW(activity DIMENSIONS dates.month METRICS events.revenue_total, events.revenue_total_lm) ORDER BY month;
+----
+2026-01-01	210	NULL
+2026-02-01	360	210
+2026-03-01	450	360
+2026-04-01	NULL	450
+
+# a derived cumulative metric over two tables (costs end on 2026-03-15)
+query II
+SELECT * FROM SEMANTIC_VIEW(activity DIMENSIONS dates.month METRICS margin_total) ORDER BY month;
+----
+2026-01-01	190
+2026-02-01	315
+2026-03-01	370
+
+# a dimension of the fact table is not moved to the anchor
+query II
+SELECT * FROM SEMANTIC_VIEW(activity DIMENSIONS events.event_month METRICS events.revenue_total) ORDER BY event_month;
+----
+2026-01-01	210
+2026-02-01	150
+2026-03-01	90
+
+# many-to-many bridge
+query II
+SELECT * FROM SEMANTIC_VIEW(activity DIMENSIONS teams.team METRICS events.revenue_total) ORDER BY team;
+----
+blue	270
+red	320
+
+# window function metric over a cumulative metric
+query II
+SELECT * FROM SEMANTIC_VIEW(activity DIMENSIONS dates.month METRICS revenue_total_prev) ORDER BY month;
+----
+2026-01-01	NULL
+2026-02-01	210
+2026-03-01	360
+
+# mixed with plain metrics
+query IIII
+SELECT * FROM SEMANTIC_VIEW(activity DIMENSIONS dates.month METRICS events.revenue, events.revenue_total, costs.cost) ORDER BY month;
+----
+2026-01-01	210	210	20
+2026-02-01	150	360	25
+2026-03-01	90	450	35
+
+# querying by name, with HAVING
+query II
+SELECT dates.month, AGG(events.wau) FROM activity GROUP BY dates.month ORDER BY 1;
+----
+2026-01-01	1
+2026-02-01	2
+2026-03-01	1
+
+query II
+SELECT dates.month, AGG(events.revenue_total) FROM activity GROUP BY dates.month HAVING AGG(events.revenue_total) > 300 ORDER BY 1;
+----
+2026-02-01	360
+2026-03-01	450
+
+# output types are the base metric's (AVERAGE: avg's)
+query IIIII
+SELECT typeof(revenue_total), typeof(wau), typeof(wau_avg), typeof(avg_7d), typeof(median_7d)
+FROM SEMANTIC_VIEW(activity METRICS events.revenue_total, events.wau, events.wau_avg, events.avg_7d, events.median_7d);
+----
+HUGEINT	BIGINT	DOUBLE	DOUBLE	DOUBLE
+
+# a WHERE that filters out every row
+query I
+SELECT * FROM SEMANTIC_VIEW(activity METRICS events.revenue_total WHERE users.country = 'XX');
+----
+NULL
+
+query I
+SELECT count(*) FROM SEMANTIC_VIEW(activity DIMENSIONS dates.month METRICS events.revenue_total WHERE users.country = 'XX');
+----
+0
+
+# stored columns of the date table do not move with the anchor
+statement error
+SELECT * FROM SEMANTIC_VIEW(activity DIMENSIONS dates.stored_year METRICS events.revenue_total);
+----
+would not move with the CUMULATIVE anchor date of metric "revenue_total"
+
+# a TIMESTAMP column of the fact table itself; rows without a date are in no window
+statement ok
+CREATE TABLE pings (ping_id INTEGER, pinged_at TIMESTAMP, user_id INTEGER);
+
+statement ok
+INSERT INTO pings VALUES (1, '2026-01-01 10:00', 1), (2, '2026-01-01 10:30', 2), (3, '2026-01-01 11:15', 1), (4, '2026-01-02 09:00', 3), (5, NULL, 4);
+
+statement ok
+CREATE SEMANTIC VIEW pinged TABLES (pings PRIMARY KEY (ping_id)) DIMENSIONS (pings.at_ts AS pinged_at)
+  METRICS (
+    pings.pings AS COUNT(*),
+    pings.pings_total CUMULATIVE (pings.at_ts) AS COUNT(*),
+    pings.hau CUMULATIVE (pings.at_ts OVER INTERVAL 1 HOUR) AS COUNT(DISTINCT user_id),
+    pings.pings_today CUMULATIVE (pings.at_ts TO DAY) AS COUNT(*)
+  );
+
+query III
+SELECT at_ts, hau, pings_today FROM SEMANTIC_VIEW(pinged DIMENSIONS pings.at_ts METRICS pings.hau, pings.pings_today) ORDER BY at_ts;
+----
+2026-01-01 10:00:00	1	1
+2026-01-01 10:30:00	2	2
+2026-01-01 11:15:00	2	3
+2026-01-02 09:00:00	1	1
+
+query III
+SELECT pings, pings_total, typeof(hau) FROM SEMANTIC_VIEW(pinged METRICS pings.pings, pings.pings_total, pings.hau);
+----
+5	4	BIGINT
+
+query I
+SELECT typeof(at_ts) FROM SEMANTIC_VIEW(pinged DIMENSIONS pings.at_ts METRICS pings.hau) LIMIT 1;
+----
+TIMESTAMP
+
+# other blocks of a query still read materializations
+statement ok
+ALTER SEMANTIC VIEW activity ADD MATERIALIZATION revenue_by_month AS DIMENSIONS dates.month METRICS events.revenue;
+
+statement ok
+ALTER SEMANTIC VIEW activity SET MAX_STALENESS = 3600;
+
+query I
+SELECT sql ILIKE '%activity__revenue_by_month__0%' FROM semantic_view_sql('SELECT * FROM SEMANTIC_VIEW(activity DIMENSIONS dates.month METRICS events.revenue, events.revenue_total)');
+----
+true
+
+query III
+SELECT * FROM SEMANTIC_VIEW(activity DIMENSIONS dates.month METRICS events.revenue, events.revenue_total) ORDER BY month;
+----
+2026-01-01	210	210
+2026-02-01	150	360
+2026-03-01	90	450
+
+# pre-aggregation: decomposable aggregates are rolled up from states grouped by date ...
+query I
+SELECT sql LIKE '%__sv_s0_sum%' FROM semantic_view_sql('SELECT * FROM SEMANTIC_VIEW(activity DIMENSIONS dates.month METRICS events.revenue_total)');
+----
+true
+
+# ... DISTINCT aggregates from rows deduplicated on their arguments ...
+query I
+SELECT sql LIKE '%GROUP BY __sv_c, __sv_x0%' FROM semantic_view_sql('SELECT * FROM SEMANTIC_VIEW(activity DIMENSIONS dates.month METRICS events.wau)');
+----
+true
+
+# ... and a block with an opaque aggregate fans out its raw rows
+query I
+SELECT sql LIKE '%__sv_s0_%' FROM semantic_view_sql('SELECT * FROM SEMANTIC_VIEW(activity DIMENSIONS dates.month METRICS events.median_7d)');
+----
+false
+
+# pre-aggregated blocks equal the hand-written time-spine query over the raw rows
+statement ok
+CREATE TABLE big_events AS SELECT range AS event_id, (hash(range) % 50)::INTEGER AS user_id,
+  DATE '2026-01-01' + (hash(range * 7) % 200)::INTEGER AS event_date, (hash(range * 13) % 100)::INTEGER AS amount
+FROM range(3000);
+
+statement ok
+CREATE SEMANTIC VIEW big TABLES (dates PRIMARY KEY (day), e AS big_events PRIMARY KEY (event_id))
+  RELATIONSHIPS (e (event_date) REFERENCES dates)
+  DIMENSIONS (dates.day AS day, dates.week AS DATE_TRUNC('week', day)::DATE, dates.month AS DATE_TRUNC('month', day)::DATE,
+    e.user_bucket AS user_id % 5)
+  METRICS (
+    e.wau CUMULATIVE (dates.day OVER INTERVAL 7 DAYS) AS COUNT(DISTINCT user_id),
+    e.revenue_7d CUMULATIVE (dates.day OVER INTERVAL 7 DAYS) AS SUM(amount),
+    e.avg_7d CUMULATIVE (dates.day OVER INTERVAL 7 DAYS) AS AVG(amount),
+    e.revenue_mtd CUMULATIVE (dates.day TO MONTH FIRST) AS SUM(amount),
+    e.users_total CUMULATIVE (dates.day AVERAGE) AS COUNT(DISTINCT user_id)
+  );
+
+query I
+WITH s AS (
+  SELECT week, user_bucket, wau, revenue_7d, round(avg_7d, 9) AS avg_7d
+  FROM SEMANTIC_VIEW(big DIMENSIONS dates.week, e.user_bucket METRICS e.wau, e.revenue_7d, e.avg_7d)
+), a AS (
+  SELECT d.day AS t, e.user_id % 5 AS b, count(DISTINCT e.user_id) AS wau, sum(e.amount) AS r, avg(e.amount) AS av
+  FROM dates d JOIN big_events e ON e.event_date <= d.day AND e.event_date > d.day - INTERVAL 7 DAY
+  WHERE d.day <= (SELECT max(event_date) FROM big_events) GROUP BY ALL
+), r AS (
+  SELECT date_trunc('week', t)::DATE AS week, b AS user_bucket, arg_max(wau, t) AS wau, arg_max(r, t) AS revenue_7d,
+    round(arg_max(av, t), 9) AS avg_7d
+  FROM a GROUP BY ALL
+)
+SELECT count(*) FROM ((SELECT * FROM s EXCEPT ALL SELECT * FROM r) UNION ALL (SELECT * FROM r EXCEPT ALL SELECT * FROM s));
+----
+0
+
+query I
+WITH s AS (
+  SELECT month, revenue_mtd, round(users_total, 9) AS users_total FROM SEMANTIC_VIEW(big DIMENSIONS dates.month METRICS e.revenue_mtd, e.users_total)
+), a1 AS (
+  SELECT d.day AS t, sum(e.amount) AS v
+  FROM dates d JOIN big_events e ON e.event_date <= d.day AND e.event_date >= date_trunc('month', d.day)
+  WHERE d.day <= (SELECT max(event_date) FROM big_events) GROUP BY ALL
+), a2 AS (
+  SELECT d.day AS t, count(DISTINCT e.user_id) AS v
+  FROM dates d JOIN big_events e ON e.event_date <= d.day
+  WHERE d.day <= (SELECT max(event_date) FROM big_events) GROUP BY ALL
+), r AS (
+  SELECT month, revenue_mtd, users_total FROM
+    (SELECT date_trunc('month', t)::DATE AS month, arg_min(v, t) AS revenue_mtd FROM a1 GROUP BY 1)
+    FULL JOIN (SELECT date_trunc('month', t)::DATE AS month, round(avg(v), 9) AS users_total FROM a2 GROUP BY 1) USING (month)
+)
+SELECT count(*) FROM ((SELECT * FROM s EXCEPT ALL SELECT * FROM r) UNION ALL (SELECT * FROM r EXCEPT ALL SELECT * FROM s));
+----
+0
+
+# OFFSET by a month maps several anchors to one date (Jan 29, 30 and 31 + 1 month = Feb 28): LAST still picks one
+statement ok
+CREATE TABLE clamp_dates AS SELECT range::DATE AS day FROM range(DATE '2026-01-01', DATE '2026-04-01', INTERVAL 1 DAY);
+
+statement ok
+CREATE TABLE clamp_events (event_id INTEGER, event_date DATE, amount INTEGER);
+
+statement ok
+INSERT INTO clamp_events VALUES (1, '2026-01-29', 1), (2, '2026-01-30', 2), (3, '2026-01-31', 4), (4, '2026-03-31', 8);
+
+statement ok
+CREATE SEMANTIC VIEW clamp TABLES (dates AS clamp_dates PRIMARY KEY (day), events AS clamp_events PRIMARY KEY (event_id))
+  RELATIONSHIPS (events (event_date) REFERENCES dates) DIMENSIONS (dates.day AS day)
+  METRICS (
+    events.revenue AS SUM(amount),
+    events.rev_1d CUMULATIVE (dates.day OVER INTERVAL 1 DAY) AS SUM(amount),
+    events.rev_1d_lm OFFSET (dates.day BY INTERVAL 1 MONTH) AS rev_1d
+  );
+
+query II
+SELECT * FROM SEMANTIC_VIEW(clamp DIMENSIONS dates.day METRICS events.rev_1d_lm WHERE dates.day = DATE '2026-02-28');
+----
+2026-02-28	4
+
+query III
+SELECT * FROM SEMANTIC_VIEW(clamp DIMENSIONS dates.day METRICS events.rev_1d_lm, events.revenue WHERE dates.day = DATE '2026-02-28');
+----
+2026-02-28	4	NULL
+
+# tables reached through the date table, and aggregations on it, do not move with the anchor either
+statement ok
+CREATE TABLE cal_months (month_start DATE, label VARCHAR);
+
+statement ok
+INSERT INTO cal_months VALUES ('2026-01-01', 'Jan'), ('2026-02-01', 'Feb'), ('2026-03-01', 'Mar');
+
+statement ok
+CREATE TABLE cal_days AS SELECT range::DATE AS day, date_trunc('month', range)::DATE AS month_start FROM range(DATE '2026-01-01', DATE '2026-04-01', INTERVAL 1 DAY);
+
+statement ok
+CREATE SEMANTIC VIEW calendar
+  TABLES (months AS cal_months PRIMARY KEY (month_start), dates AS cal_days PRIMARY KEY (day), events PRIMARY KEY (event_id))
+  RELATIONSHIPS (events (event_date) REFERENCES dates, dates (month_start) REFERENCES months)
+  DIMENSIONS (dates.day AS day, dates.month AS date_trunc('month', day), dates.event_count AS COUNT(events.event_id), months.label AS label)
+  METRICS (events.revenue_total CUMULATIVE (dates.day) AS SUM(amount));
+
+query II
+SELECT * FROM SEMANTIC_VIEW(calendar DIMENSIONS dates.month METRICS events.revenue_total) ORDER BY month;
+----
+2026-01-01 00:00:00	210
+2026-02-01 00:00:00	360
+2026-03-01 00:00:00	450
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(calendar DIMENSIONS months.label METRICS events.revenue_total);
+----
+would not move with the CUMULATIVE anchor date of metric "revenue_total"
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(calendar DIMENSIONS dates.event_count METRICS events.revenue_total);
+----
+would not move with the CUMULATIVE anchor date of metric "revenue_total"
+
+# AVERAGE averages the metric's value: only a bare aggregate qualifies
+statement error
+CREATE SEMANTIC VIEW bad TABLES (dates PRIMARY KEY (day), events PRIMARY KEY (event_id)) RELATIONSHIPS (events (event_date) REFERENCES dates)
+  DIMENSIONS (dates.day AS day) METRICS (events.x CUMULATIVE (dates.day AVERAGE) AS SQRT(SUM(amount)));
+----
+AVERAGE requires a metric computed from a single aggregate

@@ -1,7 +1,7 @@
 PROJ_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
 # Configuration of extension
-EXT_NAME=semantic_views
+EXT_NAME=semantic_layer
 EXT_CONFIG=${PROJ_DIR}extension_config.cmake
 
 # AGENTS.md: always build with Ninja (override with GEN= to use the CMake default).

@@ -7,8 +7,8 @@
 #include "semantic_bridge.hpp"
 #include "semantic_lowering.hpp"
 #include "semantic_materialization.hpp"
-#include "semantic_view_registry.hpp"
-#include "semantic_views_functions.hpp"
+#include "semantic_layer_registry.hpp"
+#include "semantic_layer_functions.hpp"
 
 namespace duckdb {
 
@@ -222,7 +222,7 @@ static unique_ptr<FunctionData> DescribeBind(ClientContext &context, TableFuncti
 			add(kind, object, null_value, "BASE_TABLE_DATABASE_NAME", table.catalog_name);
 			add(kind, object, null_value, "BASE_TABLE_SCHEMA_NAME", table.schema_name);
 			add(kind, object, null_value, "BASE_TABLE_NAME", table.table_name);
-		} else {
+		} else if (!model->IsTimeSpine(t)) {
 			add(kind, object, null_value, "BASE_QUERY", table.source->ToString());
 		}
 		if (!table.primary_key.empty()) {
@@ -235,7 +235,8 @@ static unique_ptr<FunctionData> DescribeBind(ClientContext &context, TableFuncti
 			add(kind, object, null_value, "SYNONYMS", BracketList(table.synonyms));
 		}
 		add(kind, object, null_value, "COMMENT", table.comment);
-		add(kind, object, null_value, "TAGS", TagList(definition.tables[t].tags));
+		add(kind, object, null_value, "TIME", table.time_column);
+		add(kind, object, null_value, "TAGS", TagList(table.tags));
 	}
 	for (auto &rel : model->relationships) {
 		Value kind("RELATIONSHIP");
@@ -365,14 +366,14 @@ static unique_ptr<FunctionData> ShowMaterializationsBind(ClientContext &context,
 			}
 			result->rows.push_back(
 			    {Value(name.catalog), Value(name.schema), Value(name.name), Value(materialization->name),
-				 StringList(materialization->dimension_names), StringList(materialization->metric_names),
-				 Value(SemanticRefreshModeToString(materialization->refresh_mode)),
-				 Value::BOOLEAN(materialization->incremental), OptionalString(materialization->incremental_reason),
-				 Value(materialization->storage_catalog + "." + materialization->storage_schema), StringList(tables),
-				 OptionalString(state.last_refresh), OptionalString(state.last_refresh_detail),
-				 state.verified_at.value == 0 ? Value(LogicalType::TIMESTAMP) : Value::TIMESTAMP(state.verified_at),
-				 OptionalString(StringUtil::Join(watermark, ", ")), Value::BOOLEAN(status.usable),
-				 OptionalString(status.reason)});
+			     StringList(materialization->dimension_names), StringList(materialization->metric_names),
+			     Value(SemanticRefreshModeToString(materialization->refresh_mode)),
+			     Value::BOOLEAN(materialization->incremental), OptionalString(materialization->incremental_reason),
+			     Value(materialization->storage_catalog + "." + materialization->storage_schema), StringList(tables),
+			     OptionalString(state.last_refresh), OptionalString(state.last_refresh_detail),
+			     state.verified_at.value == 0 ? Value(LogicalType::TIMESTAMP) : Value::TIMESTAMP(state.verified_at),
+			     OptionalString(StringUtil::Join(watermark, ", ")), Value::BOOLEAN(status.usable),
+			     OptionalString(status.reason)});
 		}
 	}
 	return std::move(result);

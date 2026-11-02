@@ -19,7 +19,7 @@ import sys
 from pathlib import Path
 
 from bench_materializations import ROOT, setup_script
-from bench_semantic_views import as_rows, parse_queries
+from bench_semantic_layer import as_rows, parse_queries
 
 QUERIES = ROOT / "benchmark" / "materializations" / "queries.sql"
 PATHS = ("plain", "sources", "materialized")

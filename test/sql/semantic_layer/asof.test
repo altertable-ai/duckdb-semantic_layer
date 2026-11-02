@@ -1,0 +1,136 @@
+# name: test/sql/semantic_layer/asof.test
+# description: ASOF relationships (Snowflake customer address / orders example)
+# group: [semantic_layer]
+
+require semantic_layer
+
+statement ok
+PRAGMA enable_verification
+
+statement ok
+CREATE TABLE customer (c_cust_id VARCHAR, c_first_name VARCHAR, c_last_name VARCHAR);
+
+statement ok
+INSERT INTO customer VALUES ('cust001', 'Mary', 'Smith'), ('cust002', 'Bill', 'Wilson');
+
+statement ok
+CREATE TABLE customer_address (ca_cust_id VARCHAR, ca_zipcode VARCHAR, ca_street_addr VARCHAR, ca_start_date DATE, ca_end_date DATE);
+
+statement ok
+INSERT INTO customer_address VALUES
+  ('cust001', '94025', '100 Main Street', '2024-01-01', '2024-03-31'),
+  ('cust001', '94026', '200 Main Street', '2024-04-01', '2024-06-30'),
+  ('cust001', '94027', '300 Main Street', '2024-07-01', NULL),
+  ('cust002', '94028', '400 Main Street', '2024-01-01', '2024-04-30'),
+  ('cust002', '94029', '500 Main Street', '2024-05-01', '2024-07-31'),
+  ('cust002', '94030', '600 Main Street', '2024-08-01', NULL);
+
+statement ok
+CREATE TABLE orders (o_ord_id VARCHAR, o_cust_id VARCHAR, o_ord_date DATE, o_amount INTEGER);
+
+statement ok
+INSERT INTO orders VALUES
+  ('ord100', 'cust001', '2024-02-01', 100), ('ord101', 'cust001', '2024-02-02', 200),
+  ('ord102', 'cust001', '2024-05-01', 300), ('ord103', 'cust001', '2024-05-02', 400),
+  ('ord104', 'cust001', '2024-08-01', 500), ('ord105', 'cust001', '2024-08-02', 600),
+  ('ord106', 'cust002', '2024-03-01', 100), ('ord107', 'cust002', '2024-03-02', 200),
+  ('ord108', 'cust002', '2024-06-01', 300), ('ord109', 'cust002', '2024-06-02', 400),
+  ('ord110', 'cust002', '2024-09-01', 500), ('ord111', 'cust002', '2024-09-02', 600);
+
+statement ok
+CREATE OR REPLACE SEMANTIC VIEW customer_orders_view
+  TABLES (
+    customer_address UNIQUE (ca_cust_id, ca_start_date),
+    customer UNIQUE (c_cust_id),
+    orders UNIQUE (o_ord_id)
+  )
+  RELATIONSHIPS (
+    customer_address(ca_cust_id) REFERENCES customer,
+    -- Defines an ASOF JOIN on the date columns.
+    orders(o_cust_id, o_ord_date)
+      REFERENCES
+        customer_address(ca_cust_id, ASOF ca_start_date)
+  )
+  FACTS (
+    customer_address.f_zipcode AS ca_zipcode
+  )
+  DIMENSIONS (
+    orders.f_cust_zipcode AS customer_address.f_zipcode,
+    orders.dim_year_month AS DATE_TRUNC('month', o_ord_date)
+  )
+  METRICS (
+    orders.m_order_amount AS SUM(o_amount)
+  );
+
+query III
+SELECT * FROM SEMANTIC_VIEW(
+  customer_orders_view
+  DIMENSIONS orders.dim_year_month, orders.f_cust_zipcode
+  METRICS orders.m_order_amount
+) ORDER BY 2;
+----
+2024-02-01 00:00:00	94025	300
+2024-05-01 00:00:00	94026	700
+2024-08-01 00:00:00	94027	1100
+2024-03-01 00:00:00	94028	300
+2024-06-01 00:00:00	94029	700
+2024-09-01 00:00:00	94030	1100
+
+# orders older than every address keep a NULL zip code
+statement ok
+INSERT INTO orders VALUES ('ord000', 'cust001', '2023-12-31', 50);
+
+query II
+SELECT * FROM SEMANTIC_VIEW(customer_orders_view DIMENSIONS orders.f_cust_zipcode METRICS orders.m_order_amount) WHERE f_cust_zipcode IS NULL OR f_cust_zipcode = '94025' ORDER BY 1 NULLS FIRST;
+----
+NULL	50
+94025	300
+
+# dimensions of the customer reached through the ASOF relationship
+statement ok
+CREATE OR REPLACE SEMANTIC VIEW customer_orders_view2
+  TABLES (
+    customer_address UNIQUE (ca_cust_id, ca_start_date),
+    customer UNIQUE (c_cust_id),
+    orders UNIQUE (o_ord_id)
+  )
+  RELATIONSHIPS (
+    customer_address(ca_cust_id) REFERENCES customer,
+    orders(o_cust_id, o_ord_date) REFERENCES customer_address(ca_cust_id, ASOF ca_start_date)
+  )
+  DIMENSIONS (customer.last_name AS c_last_name, customer_address.street AS ca_street_addr)
+  METRICS (orders.amount AS SUM(o_amount), customer_address.addresses AS COUNT(*));
+
+query II
+SELECT * FROM SEMANTIC_VIEW(customer_orders_view2 DIMENSIONS customer.last_name METRICS orders.amount) ORDER BY 1 NULLS FIRST;
+----
+NULL	50
+Smith	2100
+Wilson	2100
+
+# address dimensions through the ASOF relationship; orders cannot be reached from addresses
+query II
+SELECT * FROM SEMANTIC_VIEW(customer_orders_view2 DIMENSIONS customer_address.street METRICS orders.amount) ORDER BY 1 NULLS FIRST;
+----
+NULL	50
+100 Main Street	300
+200 Main Street	700
+300 Main Street	1100
+400 Main Street	300
+500 Main Street	700
+600 Main Street	1100
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(customer_orders_view2 DIMENSIONS orders.o_ord_id METRICS customer_address.addresses);
+----
+Invalid dimension specified
+
+# aggregating the referencing rows through an ASOF relationship is rejected rather than approximated
+statement error
+CREATE SEMANTIC VIEW bad_asof
+  TABLES (customer_address UNIQUE (ca_cust_id, ca_start_date), orders UNIQUE (o_ord_id))
+  RELATIONSHIPS (orders(o_cust_id, o_ord_date) REFERENCES customer_address(ca_cust_id, ASOF ca_start_date))
+  FACTS (customer_address.order_count AS COUNT(orders.o_ord_id))
+  DIMENSIONS (customer_address.zip AS ca_zipcode);
+----
+through the ASOF / range relationship

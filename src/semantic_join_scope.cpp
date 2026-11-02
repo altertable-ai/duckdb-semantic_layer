@@ -5,6 +5,7 @@
 #include "duckdb/parser/expression/operator_expression.hpp"
 #include "duckdb/parser/tableref/joinref.hpp"
 #include "semantic_ast_helpers.hpp"
+#include "semantic_time_spine.hpp"
 
 namespace duckdb {
 
@@ -56,6 +57,9 @@ string SemanticJoinScope::Ensure(idx_t table) {
 			                      "relationship \"%s\" and cannot be used here",
 			                      model.Name().name, model.tables[table].name, rel.name);
 		}
+		if (model.IsTimeSpine(edge.target)) {
+			throw InternalException("semantic view time spine \"%s\" must not be joined", model.tables[table].name);
+		}
 		if (present.insert(edge.target).second) {
 			joins.push_back(Joined {edge.target, edge, current});
 		}
@@ -69,6 +73,9 @@ unique_ptr<ParsedExpression> SemanticJoinScope::ColumnReference(idx_t table, con
 		reads_outer = true;
 		return outer->ColumnReference(table, column);
 	}
+	if (model.IsTimeSpine(table) && table != base) {
+		return TimeColumn(table);
+	}
 	auto path = model.Path(base, table, using_relationships);
 	for (idx_t i = 0; i < path.size(); i++) {
 		if (model.relationships[path[i].relationship].is_range) {
@@ -76,6 +83,14 @@ unique_ptr<ParsedExpression> SemanticJoinScope::ColumnReference(idx_t table, con
 		}
 	}
 	return ColumnRef(column, Ensure(table));
+}
+
+unique_ptr<ParsedExpression> SemanticJoinScope::TimeColumn(idx_t spine) {
+	auto edge = model.Path(base, spine, using_relationships).back();
+	auto &rel = model.relationships[edge.relationship];
+	auto &from = model.tables[rel.from_table];
+	auto &column = rel.from_columns[0];
+	return SemanticTimeSpineDay(ColumnReference(rel.from_table, column), from.column_types[from.columns.at(column)]);
 }
 
 //! (SELECT <column> FROM <range table> [joins] WHERE (start IS NULL OR key >= start) AND (end IS NULL OR key < end))
