@@ -756,9 +756,8 @@ private:
 		if (member.cumulative.IsValid() && SemanticAnalyzer::ContainsWindow(*member.resolved)) {
 			Fail("%s: CUMULATIVE metrics cannot use window functions", what);
 		}
-		if (member.filter &&
-		    (analyzer.ContainsAggregateOrMetric(*member.filter) || SemanticAnalyzer::ContainsWindow(*member.filter))) {
-			Fail("%s: FILTER must be a row-level condition (dimensions, facts and columns only)", what);
+		if (member.filter && !SemanticIsRowLevelCondition(analyzer, *member.filter)) {
+			Fail("%s: %s", what, SEMANTIC_ROW_LEVEL_FILTER_ERROR);
 		}
 		if (SemanticAnalyzer::ContainsWindow(*member.resolved)) {
 			set<idx_t> dimensions;

@@ -28,8 +28,8 @@ struct SemanticMetricContext {
 	vector<idx_t> using_relationships;
 	//! Metric whose NON ADDITIVE BY applies, or INVALID_INDEX
 	idx_t non_additive_member = DConstants::INVALID_INDEX;
-	//! While decomposing: metrics whose FILTER applies (outer metrics first). Applied, then cleared, when an atom is
-	//! created (SemanticAnalyzer::ApplyMetricContext).
+	//! While decomposing: FILTERs (SemanticTransforms::Filter: metrics' or query-local) that apply, outer ones first.
+	//! Applied, then cleared, when an atom is created (SemanticAnalyzer::ApplyMetricContext).
 	vector<idx_t> filters;
 	//! Offsets (SemanticModel::offsets) that apply, in the order the shifts are applied (innermost metric first)
 	vector<idx_t> offsets;
@@ -51,7 +51,8 @@ struct SemanticBlockKey {
 	vector<idx_t> using_relationships;
 	//! Metric whose NON ADDITIVE BY picks the last snapshot, or INVALID_INDEX
 	idx_t non_additive_member;
-	//! Metrics whose FILTER filters the rows (semi-additive atoms only, see SemanticAtom::row_filters)
+	//! FILTERs (SemanticTransforms::Filter) filtering the rows (semi-additive atoms only, see
+	//! SemanticAtom::row_filters)
 	vector<idx_t> row_filters;
 	//! Offsets (SemanticModel::offsets) shifting the query's dimensions and WHERE, in application order
 	vector<idx_t> offsets;
@@ -72,8 +73,8 @@ struct SemanticAtom {
 	//! The aggregate expression (resolved; marker references), metric FILTERs included
 	unique_ptr<ParsedExpression> aggregate;
 	SemanticMetricContext context;
-	//! Metrics whose FILTER filters the rows of the atom's block instead of its aggregate: semi-additive atoms pick
-	//! their last snapshot among the filtered rows
+	//! FILTERs (SemanticTransforms::Filter) filtering the rows of the atom's block instead of its aggregate:
+	//! semi-additive atoms pick their last snapshot among the filtered rows
 	vector<idx_t> row_filters;
 
 	SemanticAtom() = default;
@@ -112,7 +113,7 @@ public:
 	ClientContext &Context() const {
 		return context;
 	}
-	//! The OFFSETs and CUMULATIVEs of the query: the model's, plus those the query adds
+	//! The OFFSETs, CUMULATIVEs and FILTERs of the query: the model's, plus those the query adds
 	SemanticTransforms &Transforms() {
 		return transforms;
 	}

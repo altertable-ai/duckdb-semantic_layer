@@ -69,6 +69,96 @@ idx_t SemanticTransforms::AddCumulative(SemanticCumulative cumulative) {
 	return model.cumulatives.size() + cumulatives.size() - 1;
 }
 
+const ParsedExpression &SemanticTransforms::Filter(idx_t index) const {
+	if (index < model.members.size()) {
+		D_ASSERT(model.members[index].filter);
+		return *model.members[index].filter;
+	}
+	D_ASSERT(index - model.members.size() < filters.size());
+	return *filters[index - model.members.size()];
+}
+
+idx_t SemanticTransforms::AddFilter(unique_ptr<ParsedExpression> condition) {
+	for (idx_t i = 0; i < filters.size(); i++) {
+		if (filters[i]->Equals(*condition)) {
+			return model.members.size() + i;
+		}
+	}
+	filters.push_back(std::move(condition));
+	return model.members.size() + filters.size() - 1;
+}
+
+idx_t SemanticTransforms::CanonicalFilter(idx_t index) const {
+	auto &condition = Filter(index);
+	for (idx_t i = 0; i < model.members.size(); i++) {
+		if (i == index) {
+			return i;
+		}
+		if (model.members[i].filter && model.members[i].filter->Equals(condition)) {
+			return i;
+		}
+	}
+	for (idx_t i = 0; i < filters.size(); i++) {
+		if (filters[i]->Equals(condition)) {
+			return model.members.size() + i;
+		}
+	}
+	throw InternalException("semantic filter %d is not in the store", index);
+}
+
+vector<unique_ptr<ParsedExpression>> SemanticTransforms::LocalFilters() const {
+	vector<unique_ptr<ParsedExpression>> result;
+	for (auto &filter : filters) {
+		result.push_back(filter->Copy());
+	}
+	return result;
+}
+
+void SemanticTransforms::RegisterFilters(const vector<unique_ptr<ParsedExpression>> &conditions) {
+	for (idx_t i = 0; i < conditions.size(); i++) {
+		if (i < filters.size()) {
+			if (!filters[i]->Equals(*conditions[i])) {
+				throw InternalException("semantic filter %d is registered with another condition", i);
+			}
+			continue;
+		}
+		filters.push_back(conditions[i]->Copy());
+	}
+}
+
+//! A resolved expression as the user could have written it: markers replaced by the names they stand for
+static unique_ptr<ParsedExpression> DisplayExpression(const SemanticModel &model, const ParsedExpression &expr) {
+	auto result = expr.Copy();
+	std::function<void(unique_ptr<ParsedExpression> &)> replace = [&](unique_ptr<ParsedExpression> &node) {
+		auto ref = SemanticMarkers::Classify(*node);
+		vector<string> names;
+		if (ref.Is(SemanticRefKind::MEMBER)) {
+			auto &member = model.members[ref.index];
+			if (!member.IsDerived()) {
+				names.push_back(model.tables[member.table].name);
+			}
+			names.push_back(member.Name());
+		} else if (ref.Is(SemanticRefKind::COLUMN)) {
+			names = {model.tables[ref.index].name, ref.column};
+		} else {
+			ParsedExpressionIterator::EnumerateChildren(*node, replace);
+			return;
+		}
+		auto alias = node->GetAlias();
+		node = make_uniq<ColumnRefExpression>(StringsToIdentifiers(names));
+		node->SetAlias(alias);
+	};
+	replace(result);
+	return result;
+}
+
+string SemanticTransforms::FilterDisplayName(idx_t index) const {
+	if (index < model.members.size()) {
+		return "metric \"" + model.MemberDisplayName(index) + "\"";
+	}
+	return "FILTER (WHERE " + DisplayExpression(model, Filter(index))->ToString() + ")";
+}
+
 //===--------------------------------------------------------------------===//
 // Validation shared with the definition clauses
 //===--------------------------------------------------------------------===//
@@ -94,6 +184,35 @@ string SemanticBindError(ClientContext &context, unique_ptr<ParsedExpression> ex
 		return error.RawMessage();
 	}
 	return string();
+}
+
+//! Whether `expr` calls AGG(...) (unqualified)
+static bool IsAggCall(const ParsedExpression &expr) {
+	if (expr.GetExpressionClass() != ExpressionClass::FUNCTION) {
+		return false;
+	}
+	auto &call = expr.Cast<FunctionExpression>();
+	return !call.IsOperator() && call.GetQualifiedName().Path().size() == 1 &&
+	       StringUtil::CIEquals(call.FunctionName().GetIdentifierName(), "agg");
+}
+
+//! The first AGG(...) call in `expr`, or nullptr
+static optional_ptr<const FunctionExpression> FindAggCall(const ParsedExpression &expr) {
+	if (IsAggCall(expr)) {
+		return &expr.Cast<FunctionExpression>();
+	}
+	optional_ptr<const FunctionExpression> result;
+	ParsedExpressionIterator::EnumerateChildren(expr, [&](const ParsedExpression &child) {
+		if (!result) {
+			result = FindAggCall(child);
+		}
+	});
+	return result;
+}
+
+bool SemanticIsRowLevelCondition(SemanticAnalyzer &analyzer, const ParsedExpression &condition) {
+	return !analyzer.ContainsAggregateOrMetric(condition) && !SemanticAnalyzer::ContainsWindow(condition) &&
+	       !FindAggCall(condition) && !SemanticFindTransformCall(condition);
 }
 
 //! The checks of an OFFSET's interval that do not depend on its dimension
@@ -269,7 +388,8 @@ public:
 	}
 
 	//! Innermost calls first, so that the argument of a call holds markers only
-	void Rewrite(unique_ptr<ParsedExpression> &node, bool in_aggregate) {
+	//! AGG() calls are resolved where a metric is expected (`metric`): not in the other arguments of a transform call
+	void Rewrite(unique_ptr<ParsedExpression> &node, bool in_aggregate, bool metric = true) {
 		if (IsTransformCall(*node)) {
 			auto &call = node->Cast<FunctionExpression>();
 			auto &name = call.FunctionName().GetIdentifierName();
@@ -281,23 +401,59 @@ public:
 			    call.ExportState()) {
 				throw SemanticDefinitionException(
 				    "%s: %s() does not take FILTER, DISTINCT or ORDER BY; write them on the aggregate inside it: "
-				    "%s(SUM(x) FILTER (WHERE ...), ...)",
-				    what, name, name);
+				    "%s(SUM(x) FILTER (WHERE ...), ...), or filter a metric with %s(AGG(<metric>) FILTER (WHERE ...), "
+				    "...)",
+				    what, name, name, name);
 			}
+			bool first_positional = true;
 			for (auto &argument : call.GetArgumentsMutable()) {
-				Rewrite(argument.GetExpressionMutable(), false);
+				auto positional = ArgumentName(argument).empty();
+				Rewrite(argument.GetExpressionMutable(), false, positional && first_positional);
+				first_positional = first_positional && !positional;
 			}
 			auto alias = node->GetAlias();
 			node = IsTimeShift(call) ? TimeShift(call) : Cumulative(call);
 			node->SetAlias(alias);
 			return;
 		}
+		if (metric && IsAggCall(*node)) {
+			auto alias = node->GetAlias();
+			node = Agg(node->Cast<FunctionExpression>(), in_aggregate);
+			node->SetAlias(alias);
+			return;
+		}
 		auto aggregate = in_aggregate || analyzer.IsAggregate(*node);
 		ParsedExpressionIterator::EnumerateChildren(
-		    *node, [&](unique_ptr<ParsedExpression> &child) { Rewrite(child, aggregate); });
+		    *node, [&](unique_ptr<ParsedExpression> &child) { Rewrite(child, aggregate, metric); });
 	}
 
 private:
+	//! AGG(<metric>) [FILTER (WHERE <condition>)]: the metric, filtered like a metric defined with that FILTER
+	unique_ptr<ParsedExpression> Agg(FunctionExpression &call, bool in_aggregate) {
+		if (in_aggregate) {
+			throw SemanticDefinitionException("%s: AGG() cannot be used inside an aggregate", what);
+		}
+		auto &arguments = call.GetArgumentsMutable();
+		if (arguments.size() != 1 || !ArgumentName(arguments[0]).empty() || call.Distinct() ||
+		    (call.OrderBy() && !call.OrderBy()->orders.empty()) || call.ExportState()) {
+			throw SemanticDefinitionException("%s: AGG() takes exactly one metric", what);
+		}
+		auto &metric = arguments[0].GetExpressionMutable();
+		Rewrite(metric, false);
+		if (!analyzer.ContainsAggregateOrMetric(*metric)) {
+			throw SemanticDefinitionException("%s: AGG() requires a metric; \"%s\" is not a metric", what,
+			                                  DisplayExpression(model, *metric)->ToString());
+		}
+		if (!call.Filter()) {
+			return std::move(metric);
+		}
+		if (!SemanticIsRowLevelCondition(analyzer, *call.Filter())) {
+			throw SemanticDefinitionException("%s: %s", what, SEMANTIC_ROW_LEVEL_FILTER_ERROR);
+		}
+		auto index = analyzer.Transforms().AddFilter(std::move(call.FilterMutable()));
+		return SemanticMarkers::Transform(SemanticTransformKind::FILTER, index, std::move(metric));
+	}
+
 	//! time_shift(<metric>, <interval> [, dimension := <dimension>])
 	unique_ptr<ParsedExpression> TimeShift(const FunctionExpression &call) {
 		auto call_what = CallWhat(call, what);
@@ -415,8 +571,9 @@ private:
 	//! Like CUMULATIVE metrics, cumulative() builds on plain metrics only: no OFFSET, CUMULATIVE or NON ADDITIVE BY
 	//! below it (time_shift() / cumulative() calls are markers by now)
 	void CheckCumulativeComposition(const ParsedExpression &expr, const string &call_what) {
+		// a filtered metric (AGG(...) FILTER (WHERE ...)) can be cumulated, like a metric defined with FILTER
 		auto transform = SemanticMarkers::ClassifyTransform(expr);
-		if (transform.kind != SemanticTransformKind::NONE) {
+		if (transform.kind == SemanticTransformKind::OFFSET || transform.kind == SemanticTransformKind::CUMULATIVE) {
 			throw SemanticDefinitionException("%s: the metric expression cannot contain %s()", call_what,
 			                                  transform.kind == SemanticTransformKind::OFFSET ? TIME_SHIFT_FUNCTION
 			                                                                                  : CUMULATIVE_FUNCTION);
@@ -602,6 +759,9 @@ unique_ptr<ParsedExpression> SemanticResolveTransforms(ClientContext &context, S
 		if (call) {
 			throw SemanticDefinitionException("%s: %s() is only allowed in METRICS", what,
 			                                  call->FunctionName().GetIdentifierName());
+		}
+		if (FindAggCall(*resolved)) {
+			throw SemanticDefinitionException("%s: AGG() is only allowed in METRICS", what);
 		}
 		return resolved;
 	}

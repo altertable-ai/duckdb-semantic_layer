@@ -3,10 +3,11 @@
 //
 // semantic_transforms.hpp
 //
-// The OFFSETs and CUMULATIVEs a query reads: those of the model (SemanticModel::offsets / cumulatives, shared and
-// immutable) followed by the ones the query adds itself. An atom's metric context holds indices into this store.
-// Query-time transforms (time_shift(...) / cumulative(...) calls in METRICS) are validated with the rules of the
-// definition clauses, stored here, and replaced by markers (semantic_markers.hpp).
+// The OFFSETs, CUMULATIVEs and FILTERs a query reads: those of the model (SemanticModel::offsets / cumulatives and the
+// members' filters, shared and immutable) followed by the ones the query adds itself. An atom's metric context holds
+// indices into this store. Query-time transforms (time_shift(...) / cumulative(...) calls in METRICS) and filters
+// (AGG(<metric>) FILTER (WHERE ...)) are validated with the rules of the definition clauses, stored here, and replaced
+// by markers (semantic_markers.hpp).
 //
 //===----------------------------------------------------------------------===//
 
@@ -35,13 +36,34 @@ public:
 	//! Index of an Equals() entry (model's first, then local), or appends; returns its index
 	idx_t AddOffset(SemanticOffset offset);
 	idx_t AddCumulative(SemanticCumulative cumulative);
+	//! Index < model.members.size(): the FILTER of that member; otherwise a query-local condition
+	const ParsedExpression &Filter(idx_t index) const;
+	//! Index (>= model.members.size()) of an Equals() query-local condition, or appends; returns its index
+	idx_t AddFilter(unique_ptr<ParsedExpression> condition);
+	//! The first index (members' FILTERs, then query-local ones) whose condition Equals() that of `index`: filters
+	//! with equal conditions filter the same rows
+	idx_t CanonicalFilter(idx_t index) const;
+	//! For error messages: `metric "<name>"` (a member's FILTER) or `FILTER (WHERE <condition>)` (query-local)
+	string FilterDisplayName(idx_t index) const;
+	//! Copies of the query-local filter conditions, in index order
+	vector<unique_ptr<ParsedExpression>> LocalFilters() const;
+	//! Registers the query-local filter conditions of another store (LocalFilters()), so that the same indices address
+	//! them: this store's must be a prefix of them
+	void RegisterFilters(const vector<unique_ptr<ParsedExpression>> &conditions);
 
 private:
 	const SemanticModel &model;
 	//! Boxed so that references handed out stay valid when entries are added
 	vector<unique_ptr<SemanticOffset>> offsets;
 	vector<unique_ptr<SemanticCumulative>> cumulatives;
+	vector<unique_ptr<ParsedExpression>> filters;
 };
+
+//! The error of a metric FILTER that is not row-level, after "<what>: "
+static constexpr const char *SEMANTIC_ROW_LEVEL_FILTER_ERROR =
+    "FILTER must be a row-level condition (dimensions, facts and columns only)";
+//! Whether a resolved FILTER condition is row-level: no aggregate, metric, window function, AGG() or transform call
+bool SemanticIsRowLevelCondition(SemanticAnalyzer &analyzer, const ParsedExpression &condition);
 
 //! Whether `expr` is a constant: no column, member, aggregate, window or parameter
 bool SemanticIsConstant(SemanticAnalyzer &analyzer, const ParsedExpression &expr);
@@ -78,7 +100,8 @@ idx_t SemanticTransformDimension(const SemanticModel &model, optional_ptr<const 
 //! unquoted period / to_date value fails as an unknown column)
 void SemanticCheckUnresolvedTransforms(const ParsedExpression &expr, const string &what);
 //! Replaces the time_shift / cumulative calls of a resolved METRICS item by markers (validated, stored in
-//! analyzer.Transforms()); throws for calls in other positions
+//! analyzer.Transforms()), and its AGG(<metric>) calls by their metric (with FILTER (WHERE ...): by a filter marker);
+//! throws for calls in other positions
 unique_ptr<ParsedExpression> SemanticResolveTransforms(ClientContext &context, SemanticAnalyzer &analyzer,
                                                        const SemanticModel &model,
                                                        unique_ptr<ParsedExpression> resolved, SemanticMemberKind kind,

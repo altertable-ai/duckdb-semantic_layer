@@ -449,9 +449,9 @@ private:
 			conditions.push_back(
 			    compiler.ShiftedRow(*AndAll(std::move(local_conjuncts)), scope, WHERE_WHAT, block.key.offsets));
 		}
-		for (auto metric : block.key.row_filters) {
+		for (auto filter : block.key.row_filters) {
 			conditions.push_back(
-			    compiler.Row(*model.members[metric].filter, scope, DConstants::INVALID_INDEX, "Invalid metric"));
+			    compiler.Row(analyzer.Transforms().Filter(filter), scope, DConstants::INVALID_INDEX, "Invalid metric"));
 		}
 		if (options.row_filter) {
 			auto filter = options.row_filter(scope, result.dimensions);
@@ -764,12 +764,14 @@ SemanticQuerySpec SemanticQueryCompiler::Resolve(const vector<ParsedSemanticQuer
 		    SemanticResolveTransforms(analyzer.Context(), analyzer, model, model.Resolve(*where, resolve_context),
 		                              SemanticMemberKind::DIMENSION, resolve_context.what);
 	}
+	spec.filters = analyzer.Transforms().LocalFilters();
 	return spec;
 }
 
 void SemanticQueryCompiler::SplitItems(const SemanticQuerySpec &spec, vector<const SemanticQueryItem *> &dimensions,
                                        vector<const SemanticQueryItem *> &facts,
                                        vector<const SemanticQueryItem *> &metrics, set<idx_t> &row_tables) {
+	analyzer.Transforms().RegisterFilters(spec.filters);
 	case_insensitive_set_t output_names;
 	for (auto &item : spec.items) {
 		if (!output_names.insert(item.output_name).second) {

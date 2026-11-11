@@ -15,6 +15,20 @@ static constexpr const char *MEMBER_MARKER = "__sv_mem__";
 static constexpr const char *ATOM_MARKER = "__sv_atom__";
 static constexpr const char *OFFSET_MARKER = "__sv_offset";
 static constexpr const char *CUMULATIVE_MARKER = "__sv_cumulative";
+static constexpr const char *FILTER_MARKER = "__sv_filter";
+
+static const char *TransformMarkerName(SemanticTransformKind kind) {
+	switch (kind) {
+	case SemanticTransformKind::OFFSET:
+		return OFFSET_MARKER;
+	case SemanticTransformKind::CUMULATIVE:
+		return CUMULATIVE_MARKER;
+	case SemanticTransformKind::FILTER:
+		return FILTER_MARKER;
+	default:
+		throw InternalException("no marker for semantic transform kind NONE");
+	}
+}
 
 unique_ptr<ParsedExpression> SemanticMarkers::Column(idx_t table, const string &column) {
 	vector<string> names {COLUMN_MARKER, to_string(table), column};
@@ -63,8 +77,7 @@ unique_ptr<ParsedExpression> SemanticMarkers::Transform(SemanticTransformKind ki
 	vector<unique_ptr<ParsedExpression>> children;
 	children.push_back(ConstantExpression::Integer(NumericCast<int64_t>(index)));
 	children.push_back(std::move(argument));
-	return make_uniq<FunctionExpression>(kind == SemanticTransformKind::OFFSET ? OFFSET_MARKER : CUMULATIVE_MARKER,
-	                                     std::move(children));
+	return make_uniq<FunctionExpression>(TransformMarkerName(kind), std::move(children));
 }
 
 SemanticTransformRef SemanticMarkers::ClassifyTransform(const ParsedExpression &expr) {
@@ -78,6 +91,8 @@ SemanticTransformRef SemanticMarkers::ClassifyTransform(const ParsedExpression &
 		result.kind = SemanticTransformKind::OFFSET;
 	} else if (name == CUMULATIVE_MARKER) {
 		result.kind = SemanticTransformKind::CUMULATIVE;
+	} else if (name == FILTER_MARKER) {
+		result.kind = SemanticTransformKind::FILTER;
 	} else {
 		return result;
 	}
@@ -96,7 +111,8 @@ bool SemanticMarkers::IsTransformMarkerCall(const ParsedExpression &expr) {
 		return false;
 	}
 	auto &name = expr.Cast<FunctionExpression>().FunctionName().GetIdentifierName();
-	return StringUtil::CIEquals(name, OFFSET_MARKER) || StringUtil::CIEquals(name, CUMULATIVE_MARKER);
+	return StringUtil::CIEquals(name, OFFSET_MARKER) || StringUtil::CIEquals(name, CUMULATIVE_MARKER) ||
+	       StringUtil::CIEquals(name, FILTER_MARKER);
 }
 
 } // namespace duckdb

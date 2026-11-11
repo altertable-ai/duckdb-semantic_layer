@@ -203,29 +203,32 @@ void SemanticAnalyzer::ApplyMetricContext(SemanticAtom &atom, const string &what
 		}
 	}
 	auto &aggregate = atom.aggregate->Cast<FunctionExpression>();
-	for (auto metric : atom.context.filters) {
+	for (auto filter : atom.context.filters) {
 		set<idx_t> tables;
-		RowTables(*model.members[metric].filter, DConstants::INVALID_INDEX, tables, what);
+		RowTables(transforms.Filter(filter), DConstants::INVALID_INDEX, tables, what);
 		for (auto table : tables) {
 			if (!model.Reaches(atom.home, table)) {
+				auto name = transforms.FilterDisplayName(filter);
 				throw SemanticDefinitionException(
-				    "%s: FILTER of metric \"%s\" references logical table \"%s\", which is not reachable from \"%s\" "
-				    "(aggregated by %s)",
-				    what, model.MemberDisplayName(metric), model.tables[table].name, model.tables[atom.home].name,
-				    aggregate.ToString());
+				    "%s: %s references logical table \"%s\", which is not reachable from \"%s\" (aggregated by %s)",
+				    what, filter < model.members.size() ? "FILTER of " + name : name, model.tables[table].name,
+				    model.tables[atom.home].name, aggregate.ToString());
 			}
 		}
 	}
 	if (atom.context.non_additive_member != DConstants::INVALID_INDEX) {
-		// the last snapshot is picked among the filtered rows
-		atom.row_filters = std::move(atom.context.filters);
+		// the last snapshot is picked among the filtered rows; equal conditions (of metrics or query-time filters)
+		// filter the same rows, so they share an aggregation
+		for (auto filter : atom.context.filters) {
+			atom.row_filters.push_back(transforms.CanonicalFilter(filter));
+		}
 	} else if (!atom.context.filters.empty()) {
 		vector<unique_ptr<ParsedExpression>> conditions;
 		if (aggregate.Filter()) {
 			conditions.push_back(std::move(aggregate.FilterMutable()));
 		}
-		for (auto metric : atom.context.filters) {
-			conditions.push_back(model.members[metric].filter->Copy());
+		for (auto filter : atom.context.filters) {
+			conditions.push_back(transforms.Filter(filter).Copy());
 		}
 		aggregate.FilterMutable() = AndAll(std::move(conditions));
 	}
@@ -250,6 +253,9 @@ unique_ptr<ParsedExpression> SemanticAnalyzer::Decompose(const ParsedExpression 
 			auto inner = context;
 			if (transform.kind == SemanticTransformKind::OFFSET) {
 				inner.offsets.insert(inner.offsets.begin(), transform.index);
+			} else if (transform.kind == SemanticTransformKind::FILTER) {
+				// outer filters first, as for a metric defined with FILTER (MetricContext)
+				inner.filters.push_back(transform.index);
 			} else {
 				// cumulative() only wraps plain metrics (SemanticResolveTransforms)
 				D_ASSERT(context.cumulative == DConstants::INVALID_INDEX);

@@ -41,6 +41,7 @@ shared_ptr<SemanticMaterialization> PlanSemanticMaterialization(ClientContext &c
 	auto result = make_shared_ptr<SemanticMaterialization>();
 	result->name = parsed.name;
 	result->refresh_mode = parsed.refresh_mode;
+	result->spec.filters = std::move(resolved.filters);
 	// dimensions first: they are the first columns of every block table
 	for (auto kind : {SemanticMemberKind::DIMENSION, SemanticMemberKind::METRIC}) {
 		for (idx_t i = 0; i < resolved.items.size(); i++) {

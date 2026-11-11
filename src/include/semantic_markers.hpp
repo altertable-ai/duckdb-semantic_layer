@@ -10,8 +10,8 @@
 //   semantic member  : "__sv_mem__".<member index>
 //   aggregate atom   : "__sv_atom__".<atom index>      (metric decomposition)
 // and `PARTITION BY EXCLUDING a, b` is parsed as `PARTITION BY __sv_excluding(a, b)`.
-// Query-time metric transforms (time_shift / cumulative) are resolved to
-//   __sv_offset(<index>, <argument>) / __sv_cumulative(<index>, <argument>)
+// Query-time metric transforms (time_shift / cumulative) and filters (AGG(...) FILTER (WHERE ...)) are resolved to
+//   __sv_offset(<index>, <argument>) / __sv_cumulative(<index>, <argument>) / __sv_filter(<index>, <argument>)
 // where <index> addresses the query's SemanticTransforms.
 // This module is the only place that knows the encoding.
 //
@@ -28,12 +28,12 @@ static constexpr const char *SEMANTIC_EXCLUDING_FUNCTION = "__sv_excluding";
 
 enum class SemanticRefKind : uint8_t { NONE, COLUMN, MEMBER, ATOM };
 
-enum class SemanticTransformKind : uint8_t { NONE, OFFSET, CUMULATIVE };
+enum class SemanticTransformKind : uint8_t { NONE, OFFSET, CUMULATIVE, FILTER };
 
 //! A classified transform marker: its argument is child 1
 struct SemanticTransformRef {
 	SemanticTransformKind kind = SemanticTransformKind::NONE;
-	//! Index into SemanticTransforms (offsets or cumulatives)
+	//! Index into SemanticTransforms (offsets, cumulatives or filters)
 	idx_t index = DConstants::INVALID_INDEX;
 };
 
@@ -57,7 +57,7 @@ struct SemanticMarkers {
 	static SemanticRef Classify(const ParsedExpression &expr);
 	//! Whether `expr` is the lowered form of PARTITION BY EXCLUDING
 	static bool IsExcluding(const ParsedExpression &expr);
-	//! __sv_offset(<index>, <argument>) / __sv_cumulative(<index>, <argument>)
+	//! __sv_offset(<index>, <argument>) / __sv_cumulative(<index>, <argument>) / __sv_filter(<index>, <argument>)
 	static unique_ptr<ParsedExpression> Transform(SemanticTransformKind kind, idx_t index,
 	                                              unique_ptr<ParsedExpression> argument);
 	static SemanticTransformRef ClassifyTransform(const ParsedExpression &expr);

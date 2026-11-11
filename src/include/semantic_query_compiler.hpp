@@ -47,6 +47,9 @@ struct SemanticQuerySpec {
 	vector<SemanticQueryItem> items;
 	//! Resolved filter, may be null
 	unique_ptr<ParsedExpression> where;
+	//! The query-local FILTER conditions (AGG(...) FILTER (WHERE ...)) the items' markers address, in index order
+	//! (SemanticTransforms): a compiler other than the resolving one (a materialization's refresh) registers them
+	vector<unique_ptr<ParsedExpression>> filters;
 };
 
 //! Columns of materialized block tables: one per dimension, the number of home rows of each group, then atom states
