@@ -13,6 +13,7 @@
 #pragma once
 
 #include "duckdb/common/optional_ptr.hpp"
+#include <functional>
 #include "semantic_model.hpp"
 
 namespace duckdb {
@@ -69,9 +70,13 @@ struct SemanticTransformArguments {
 SemanticTransformArguments SemanticSplitTransformArguments(const FunctionExpression &call, idx_t positional,
                                                            const vector<string> &names, const string &what);
 //! The dimension member of `dimension := ...`, or metric_time.day when absent and the view has TIME; throws
-//! (listing valid dimensions) otherwise
+//! otherwise, listing the valid dimensions: column-defined, reachable from every atom and `usable` by the call
 idx_t SemanticTransformDimension(const SemanticModel &model, optional_ptr<const ParsedExpression> argument,
-                                 const vector<SemanticAtom> &atoms, const string &what);
+                                 const vector<SemanticAtom> &atoms, const std::function<bool(idx_t)> &usable,
+                                 const string &what);
+//! Checks the time_shift / cumulative calls of an unresolved METRICS item for errors that resolution would hide (an
+//! unquoted period / to_date value fails as an unknown column)
+void SemanticCheckUnresolvedTransforms(const ParsedExpression &expr, const string &what);
 //! Replaces the time_shift / cumulative calls of a resolved METRICS item by markers (validated, stored in
 //! analyzer.Transforms()); throws for calls in other positions
 unique_ptr<ParsedExpression> SemanticResolveTransforms(ClientContext &context, SemanticAnalyzer &analyzer,

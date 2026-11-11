@@ -49,10 +49,12 @@ CREATE SEMANTIC VIEW ledger
     invoices.avg_amount AS AVG(amount),
     invoices.revenue_ly OFFSET (metric_time.day BY INTERVAL 1 YEAR) AS revenue,
     invoices.revenue_lm_by_date OFFSET (invoices.invoice_date BY INTERVAL 1 MONTH) AS revenue,
+    invoices.revenue_ly_lm OFFSET (metric_time.day BY INTERVAL 1 MONTH) AS revenue_ly,
     invoices.revenue_total CUMULATIVE (metric_time.day) AS SUM(amount),
     invoices.revenue_total_avg CUMULATIVE (metric_time.day AVERAGE) AS SUM(amount),
     invoices.revenue_mtd CUMULATIVE (metric_time.day TO MONTH) AS SUM(amount),
     invoices.revenue_7d CUMULATIVE (metric_time.day OVER INTERVAL 7 DAYS) AS SUM(amount),
+    invoices.revenue_7n CUMULATIVE (metric_time.day OVER 7) AS SUM(amount),
     invoices.revenue_ytd_first CUMULATIVE (metric_time.day TO YEAR FIRST) AS SUM(amount),
     invoices.revenue_ytd_ly OFFSET (metric_time.day BY INTERVAL 1 YEAR) AS revenue_ytd_first,
     invoices.buyers_28d CUMULATIVE (metric_time.day OVER INTERVAL 28 DAYS) AS COUNT(DISTINCT account_id),
@@ -102,6 +104,15 @@ SELECT (SELECT sql FROM semantic_view_sql('SELECT * FROM SEMANTIC_VIEW(ledger DI
           METRICS time_shift(revenue, INTERVAL 1 YEAR) AS revenue_ly)'))
      = (SELECT sql FROM semantic_view_sql('SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
           METRICS revenue_ly)'));
+----
+true
+
+# a shift of an OFFSET metric compiles like the metric defined with both offsets
+query I
+SELECT (SELECT sql FROM semantic_view_sql('SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
+          METRICS time_shift(revenue_ly, INTERVAL 1 MONTH) AS revenue_ly_lm)'))
+     = (SELECT sql FROM semantic_view_sql('SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
+          METRICS revenue_ly_lm)'));
 ----
 true
 
@@ -344,11 +355,37 @@ SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
 ----
 <REGEX>:.*must be defined as a column.*valid dimensions:.*metric_time\.day.*
 
+# the valid dimensions listed are those the call can shift (not account.segment, a VARCHAR)
+statement error
+SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
+  METRICS time_shift(revenue, INTERVAL 1 YEAR, dimension := metric_time.month) AS x);
+----
+<REGEX>:.*must be defined as a column of its logical table; valid dimensions: invoices\.invoice_date, metric_time\.day\n.*
+
 statement error
 SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
   METRICS time_shift(revenue, INTERVAL 1 YEAR, dimension := account.segment) AS x);
 ----
 cannot shift column
+
+# an argument that is not a dimension is not printed (it holds internal markers)
+statement error
+SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
+  METRICS time_shift(revenue, INTERVAL 1 YEAR, dimension := revenue + 1) AS x);
+----
+<REGEX>:.*time_shift\(\): the dimension argument must name a dimension; valid dimensions: invoices\.invoice_date, metric_time\.day\n.*
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
+  METRICS time_shift(revenue, INTERVAL 1 YEAR, dimension := time_shift(revenue, INTERVAL 1 DAY)) AS x);
+----
+<!REGEX>:.*__sv_.*
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
+  METRICS time_shift(revenue, INTERVAL 1 YEAR, dimension := revenue) AS x);
+----
+time_shift(): "invoices.revenue" is not a dimension
 
 statement error
 SELECT * FROM SEMANTIC_VIEW(ledger_untimed DIMENSIONS invoices.invoice_month
@@ -389,6 +426,39 @@ statement error
 PREPARE p AS SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month METRICS time_shift(revenue, $1) AS x);
 ----
 the interval must be a constant expression
+
+# FILTER, DISTINCT and ORDER BY belong to the aggregate inside the call
+statement error
+SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
+  METRICS time_shift(revenue, INTERVAL 1 YEAR) FILTER (WHERE account.segment = 'startup') AS x);
+----
+<REGEX>:.*Invalid metric "x": time_shift\(\) does not take FILTER, DISTINCT or ORDER BY; write them on the aggregate inside it: time_shift\(SUM\(x\) FILTER \(WHERE \.\.\.\), \.\.\.\).*
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
+  METRICS time_shift(DISTINCT revenue, INTERVAL 1 YEAR) AS x);
+----
+time_shift() does not take FILTER, DISTINCT or ORDER BY
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
+  METRICS time_shift(revenue, INTERVAL 1 YEAR ORDER BY metric_time.day) AS x);
+----
+time_shift() does not take FILTER, DISTINCT or ORDER BY
+
+# ... also when nested
+statement error
+SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
+  METRICS revenue / time_shift(revenue, INTERVAL 1 YEAR) FILTER (WHERE account.segment = 'startup') AS x);
+----
+time_shift() does not take FILTER, DISTINCT or ORDER BY
+
+# a qualified call is not a transform
+statement error
+SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
+  METRICS main.time_shift(revenue, INTERVAL 1 YEAR) AS x);
+----
+<REGEX>:.*time_shift\(\) can only be used in the METRICS of a semantic query.*unqualified.*
 
 # definitions use OFFSET (...) / CUMULATIVE (...)
 statement error
@@ -715,11 +785,36 @@ SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
 requires a metric computed from a single aggregate
 
 # the arguments
+# trailing_window takes what OVER takes: any window the dimension's type accepts (DATE - 7 is a date)
+query I
+SELECT (SELECT count(*) FROM (
+    (SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.day
+       METRICS cumulative(revenue, trailing_window := 7) AS r)
+     EXCEPT ALL
+     SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.day METRICS revenue_7n AS r))
+    UNION ALL
+    (SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.day METRICS revenue_7n AS r)
+     EXCEPT ALL
+     SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.day
+       METRICS cumulative(revenue, trailing_window := 7) AS r))
+  )) = 0
+   AND (SELECT count(*) FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.day
+       METRICS cumulative(revenue, trailing_window := 7) AS r)) > 0;
+----
+true
+
+# ... and fails with the message of OVER
+statement error
+CREATE SEMANTIC VIEW bad TABLES (invoices PRIMARY KEY (invoice_id) TIME (invoiced_at))
+  METRICS (invoices.x CUMULATIVE (metric_time.day OVER TRUE) AS SUM(amount));
+----
+<REGEX>:.*cannot use true as the window of column "metric_time\.day" \(DATE\).*
+
 statement error
 SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
-  METRICS cumulative(revenue, trailing_window := 42) AS x);
+  METRICS cumulative(revenue, trailing_window := TRUE) AS x);
 ----
-trailing_window must be an interval
+<REGEX>:.*Invalid metric "x": cumulative\(\): cannot use true as the window of column "metric_time\.day" \(DATE\).*
 
 statement error
 SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
@@ -746,9 +841,27 @@ to_date must be
 
 # a non-constant argument is not printed (it holds internal markers)
 statement error
-SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month METRICS cumulative(revenue, to_date := month) AS x);
+SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
+  METRICS cumulative(revenue, to_date := invoices.invoice_date) AS x);
 ----
 <REGEX>:.*to_date must be a date part string \(e\.g\. to_date := 'month'\)\n.*
+
+# an unquoted value is an identifier: the error says to quote it
+statement error
+SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month METRICS cumulative(revenue, to_date := month) AS x);
+----
+cumulative(): to_date must be a date part string (e.g. to_date := 'month'), got identifier month; quote it: to_date := 'month'
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month METRICS cumulative(revenue, period := last) AS x);
+----
+cumulative(): period must be 'first', 'last' or 'average', got identifier last; quote it: period := 'last'
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
+  METRICS revenue / cumulative(revenue, period := "First") AS x);
+----
+cumulative(): period must be 'first', 'last' or 'average', got identifier First; quote it: period := 'First'
 
 statement error
 SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
@@ -771,6 +884,30 @@ SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
   METRICS cumulative(revenue, window_size := INTERVAL 7 DAYS) AS x);
 ----
 <REGEX>:.*unknown argument "window_size".*trailing_window.*
+
+# FILTER, DISTINCT and ORDER BY belong to the aggregate inside the call
+statement error
+SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
+  METRICS cumulative(revenue) FILTER (WHERE account.segment = 'startup') AS x);
+----
+<REGEX>:.*cumulative\(\) does not take FILTER, DISTINCT or ORDER BY; write them on the aggregate inside it: cumulative\(SUM\(x\) FILTER \(WHERE \.\.\.\), \.\.\.\).*
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month METRICS cumulative(DISTINCT revenue) AS x);
+----
+cumulative() does not take FILTER, DISTINCT or ORDER BY
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
+  METRICS cumulative(revenue ORDER BY metric_time.day) AS x);
+----
+cumulative() does not take FILTER, DISTINCT or ORDER BY
+
+# a qualified call is not a transform
+statement error
+SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month METRICS main.cumulative(revenue) AS x);
+----
+<REGEX>:.*cumulative\(\) can only be used in the METRICS of a semantic query.*unqualified.*
 
 # the dimension
 statement error
@@ -951,6 +1088,80 @@ SELECT metric_time.month, time_shift(AGG(revenue) + revenue, INTERVAL 1 YEAR) FR
 ----
 Metric "revenue" must be used with AGG()
 
+# FILTER, DISTINCT and ORDER BY belong to the aggregate inside the call
+statement error
+SELECT metric_time.month, time_shift(AGG(revenue), INTERVAL 1 YEAR) FILTER (WHERE segment = 'startup')
+FROM ledger GROUP BY metric_time.month;
+----
+time_shift() does not take FILTER, DISTINCT or ORDER BY
+
+statement error
+SELECT metric_time.month, time_shift(DISTINCT AGG(revenue), INTERVAL 1 YEAR) FROM ledger GROUP BY metric_time.month;
+----
+time_shift() does not take FILTER, DISTINCT or ORDER BY
+
+statement error
+SELECT metric_time.month, cumulative(AGG(revenue) ORDER BY metric_time.day) FROM ledger GROUP BY metric_time.month;
+----
+cumulative() does not take FILTER, DISTINCT or ORDER BY
+
+statement error
+SELECT metric_time.month, cumulative(AGG(revenue)) FILTER (WHERE segment = 'startup')
+FROM ledger GROUP BY metric_time.month;
+----
+cumulative() does not take FILTER, DISTINCT or ORDER BY
+
+# ... while a filtered aggregate inside it is fine
+query I
+SELECT (SELECT count(*) FROM (
+    (SELECT metric_time.year, time_shift(SUM(invoices.amount) FILTER (WHERE segment = 'startup'), INTERVAL 1 YEAR)
+     FROM ledger GROUP BY metric_time.year
+     EXCEPT ALL
+     SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.year
+       METRICS time_shift(SUM(invoices.amount) FILTER (WHERE account.segment = 'startup'), INTERVAL 1 YEAR) AS x))
+    UNION ALL
+    (SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.year
+       METRICS time_shift(SUM(invoices.amount) FILTER (WHERE account.segment = 'startup'), INTERVAL 1 YEAR) AS x)
+     EXCEPT ALL
+     SELECT metric_time.year, time_shift(SUM(invoices.amount) FILTER (WHERE segment = 'startup'), INTERVAL 1 YEAR)
+     FROM ledger GROUP BY metric_time.year)
+  )) = 0
+   AND (SELECT sum(x) FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.year
+       METRICS time_shift(SUM(invoices.amount) FILTER (WHERE account.segment = 'startup'), INTERVAL 1 YEAR) AS x))
+     < (SELECT sum(x) FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.year
+       METRICS time_shift(SUM(invoices.amount), INTERVAL 1 YEAR) AS x));
+----
+true
+
+# errors teach without internal names
+statement error
+SELECT metric_time.month, cumulative(AGG(revenue), period := last) FROM ledger GROUP BY metric_time.month;
+----
+cumulative(): period must be 'first', 'last' or 'average', got identifier last; quote it: period := 'last'
+
+statement error
+SELECT metric_time.month, time_shift(AGG(revenue), INTERVAL 1 YEAR, dimension := AGG(revenue))
+FROM ledger GROUP BY metric_time.month;
+----
+<REGEX>:.*time_shift\(\): the dimension argument must name a dimension; valid dimensions: invoices\.invoice_date, metric_time\.day\n
+
+statement error
+SELECT metric_time.month, time_shift(AGG(revenue), INTERVAL 1 YEAR, dimension := AGG(revenue))
+FROM ledger GROUP BY metric_time.month;
+----
+<!REGEX>:.*__sv_.*
+
+statement error
+SELECT metric_time.month, cumulative(AGG(revenue), period := 'median') FROM ledger GROUP BY metric_time.month;
+----
+<!REGEX>:.*__sv_.*
+
+# a qualified call is not a transform
+statement error
+SELECT metric_time.month, main.time_shift(AGG(revenue), INTERVAL 1 YEAR) FROM ledger GROUP BY metric_time.month;
+----
+<REGEX>:.*time_shift\(\) can only be used in the METRICS of a semantic query.*unqualified.*
+
 # in ORDER BY
 query I
 SELECT (SELECT count(*) FROM (
@@ -1044,6 +1255,44 @@ SELECT count(*) FROM duckdb_functions()
 WHERE function_name IN ('time_shift', 'cumulative') AND description <> '' AND len(examples) > 0;
 ----
 2
+
+# every catalog example runs as written on a view with the names they use
+statement ok
+CREATE TABLE sales_orders (order_id INTEGER, order_date DATE, amount INTEGER);
+
+statement ok
+INSERT INTO sales_orders VALUES (1, '2025-01-05', 100), (2, '2025-02-11', 150), (3, '2026-01-05', 130),
+  (4, '2026-02-11', 70);
+
+statement ok
+CREATE SEMANTIC VIEW sales
+  TABLES (orders AS sales_orders PRIMARY KEY (order_id) TIME (order_date))
+  DIMENSIONS (orders.order_date AS order_date, orders.order_month AS DATE_TRUNC('month', order_date)::DATE)
+  METRICS (orders.revenue AS SUM(amount));
+
+query T
+SELECT unnest(examples) FROM duckdb_functions() WHERE function_name IN ('time_shift', 'cumulative') ORDER BY ALL;
+----
+SELECT * FROM SEMANTIC_VIEW(sales DIMENSIONS metric_time.day METRICS cumulative(revenue, trailing_window := INTERVAL 7 DAYS) AS revenue_7d)
+SELECT * FROM SEMANTIC_VIEW(sales DIMENSIONS metric_time.month METRICS cumulative(revenue) AS running)
+SELECT * FROM SEMANTIC_VIEW(sales DIMENSIONS metric_time.month METRICS cumulative(revenue, to_date := 'year', period := 'first') AS revenue_ytd)
+SELECT * FROM SEMANTIC_VIEW(sales DIMENSIONS metric_time.month METRICS time_shift(revenue, INTERVAL 1 YEAR) AS revenue_ly)
+SELECT orders.order_month, time_shift(AGG(revenue), INTERVAL 1 MONTH, dimension := orders.order_date) FROM sales GROUP BY orders.order_month
+
+statement ok
+SELECT * FROM SEMANTIC_VIEW(sales DIMENSIONS metric_time.day METRICS cumulative(revenue, trailing_window := INTERVAL 7 DAYS) AS revenue_7d)
+
+statement ok
+SELECT * FROM SEMANTIC_VIEW(sales DIMENSIONS metric_time.month METRICS cumulative(revenue) AS running)
+
+statement ok
+SELECT * FROM SEMANTIC_VIEW(sales DIMENSIONS metric_time.month METRICS cumulative(revenue, to_date := 'year', period := 'first') AS revenue_ytd)
+
+statement ok
+SELECT * FROM SEMANTIC_VIEW(sales DIMENSIONS metric_time.month METRICS time_shift(revenue, INTERVAL 1 YEAR) AS revenue_ly)
+
+statement ok
+SELECT orders.order_month, time_shift(AGG(revenue), INTERVAL 1 MONTH, dimension := orders.order_date) FROM sales GROUP BY orders.order_month
 
 statement error
 SELECT time_shift(1, INTERVAL 1 YEAR);

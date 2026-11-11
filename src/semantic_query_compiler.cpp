@@ -733,6 +733,13 @@ SemanticQuerySpec SemanticQueryCompiler::Resolve(const vector<ParsedSemanticQuer
 			}
 			continue;
 		}
+		// queries by name give their items internal names (__sv_m0, ...): their errors name the expression
+		auto internal_name = StringUtil::StartsWith(item.alias, "__sv_");
+		auto transforms_what = SemanticItemWhat(SemanticQueryItem {
+		    item.kind, nullptr, item.alias.empty() || internal_name ? item.expression->ToString() : item.alias});
+		if (item.kind == SemanticMemberKind::METRIC) {
+			SemanticCheckUnresolvedTransforms(*item.expression, transforms_what);
+		}
 		resolve_context.what = "Invalid " + StringUtil::Lower(SemanticMemberKindToString(item.kind)) + " \"" +
 		                       item.expression->ToString() + "\"";
 		auto resolved = model.Resolve(*item.expression, resolve_context);
@@ -744,9 +751,11 @@ SemanticQuerySpec SemanticQueryCompiler::Resolve(const vector<ParsedSemanticQuer
 			                                                : item.expression->ToString();
 		}
 		SemanticQueryItem query_item {item.kind, std::move(resolved), output_name};
-		query_item.resolved =
-		    SemanticResolveTransforms(analyzer.Context(), analyzer, model, std::move(query_item.resolved), item.kind,
-		                              SemanticItemWhat(query_item));
+		if (!internal_name) {
+			transforms_what = SemanticItemWhat(query_item);
+		}
+		query_item.resolved = SemanticResolveTransforms(analyzer.Context(), analyzer, model,
+		                                                std::move(query_item.resolved), item.kind, transforms_what);
 		spec.items.push_back(std::move(query_item));
 	}
 	if (where) {

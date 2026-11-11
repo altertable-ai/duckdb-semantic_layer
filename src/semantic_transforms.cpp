@@ -7,6 +7,7 @@
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
 #include "duckdb/parser/expression/cast_expression.hpp"
+#include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
@@ -95,6 +96,25 @@ string SemanticBindError(ClientContext &context, unique_ptr<ParsedExpression> ex
 	return string();
 }
 
+//! The checks of an OFFSET's interval that do not depend on its dimension
+static void CheckOffsetInterval(SemanticAnalyzer &analyzer, const ParsedExpression &interval, const string &what) {
+	if (!SemanticIsConstant(analyzer, interval)) {
+		throw SemanticDefinitionException("%s: the interval must be a constant expression", what);
+	}
+}
+
+//! The checks of a CUMULATIVE's window / date part that do not depend on its dimension
+static void CheckCumulativeFrame(SemanticAnalyzer &analyzer, const ParsedExpression *window, const string &part,
+                                 const string &what) {
+	if (window && !SemanticIsConstant(analyzer, *window)) {
+		throw SemanticDefinitionException("%s: the window must be a constant expression", what);
+	}
+	if (!window && !part.empty() && !SemanticIsTruncationPart(part)) {
+		throw SemanticDefinitionException(
+		    "%s: \"%s\" is not a date part to truncate to (e.g. day, week, month, quarter, year)", what, part);
+	}
+}
+
 SemanticOffset SemanticMakeOffset(ClientContext &context, SemanticAnalyzer &analyzer, const SemanticModel &model,
                                   idx_t dimension, const ParsedExpression &interval, const string &what) {
 	auto column = SemanticMarkers::Classify(*model.members[dimension].resolved);
@@ -102,9 +122,7 @@ SemanticOffset SemanticMakeOffset(ClientContext &context, SemanticAnalyzer &anal
 		throw InternalException("OFFSET dimension \"%s\" is not defined as a column",
 		                        model.MemberDisplayName(dimension));
 	}
-	if (!SemanticIsConstant(analyzer, interval)) {
-		throw SemanticDefinitionException("%s: the interval must be a constant expression", what);
-	}
+	CheckOffsetInterval(analyzer, interval, what);
 	auto &table = model.tables[column.index];
 	SemanticOffset offset;
 	offset.dimension = dimension;
@@ -139,17 +157,11 @@ SemanticCumulative SemanticMakeCumulative(ClientContext &context, SemanticAnalyz
 	cumulative.type = table.column_types[table.columns.at(column.column)];
 	cumulative.period = period;
 	cumulative.kind = SemanticCumulativeKind::ALL;
+	CheckCumulativeFrame(analyzer, window, part, what);
 	if (window) {
-		if (!SemanticIsConstant(analyzer, *window)) {
-			throw SemanticDefinitionException("%s: the window must be a constant expression", what);
-		}
 		cumulative.kind = SemanticCumulativeKind::WINDOW;
 		cumulative.window = window->Copy();
 	} else if (!part.empty()) {
-		if (!SemanticIsTruncationPart(part)) {
-			throw SemanticDefinitionException(
-			    "%s: \"%s\" is not a date part to truncate to (e.g. day, week, month, quarter, year)", what, part);
-		}
 		cumulative.kind = SemanticCumulativeKind::GRAIN;
 		cumulative.part = part;
 	}
@@ -233,16 +245,20 @@ optional_idx WindowMetric(const SemanticModel &model, const ParsedExpression &ex
 	return result;
 }
 
-//! The name of a resolved dimension argument, for messages
-string ArgumentName(const SemanticModel &model, const ParsedExpression &argument) {
-	auto ref = SemanticMarkers::Classify(argument);
-	if (ref.Is(SemanticRefKind::MEMBER)) {
-		return model.MemberDisplayName(ref.index);
+//! The name of a named argument (`name := value`; the parser may store the name as the value's alias), or empty
+const string &ArgumentName(const FunctionArgument &argument) {
+	return argument.HasName() ? argument.GetName().GetIdentifierName()
+	                          : argument.GetExpression().GetAlias().GetIdentifierName();
+}
+
+//! Whether `f` runs without a SemanticDefinitionException
+bool Succeeds(const std::function<void()> &f) {
+	try {
+		f();
+		return true;
+	} catch (SemanticDefinitionException &) {
+		return false;
 	}
-	if (ref.Is(SemanticRefKind::COLUMN)) {
-		return model.tables[ref.index].name + "." + ref.column;
-	}
-	return argument.ToString();
 }
 
 class TransformResolver {
@@ -256,9 +272,17 @@ public:
 	void Rewrite(unique_ptr<ParsedExpression> &node, bool in_aggregate) {
 		if (IsTransformCall(*node)) {
 			auto &call = node->Cast<FunctionExpression>();
+			auto &name = call.FunctionName().GetIdentifierName();
 			if (in_aggregate) {
-				throw SemanticDefinitionException("%s: %s() cannot be used inside an aggregate", what,
-				                                  call.FunctionName().GetIdentifierName());
+				throw SemanticDefinitionException("%s: %s() cannot be used inside an aggregate", what, name);
+			}
+			// the marker carries the metric only: these would be dropped
+			if (call.Distinct() || call.Filter() || (call.OrderBy() && !call.OrderBy()->orders.empty()) ||
+			    call.ExportState()) {
+				throw SemanticDefinitionException(
+				    "%s: %s() does not take FILTER, DISTINCT or ORDER BY; write them on the aggregate inside it: "
+				    "%s(SUM(x) FILTER (WHERE ...), ...)",
+				    what, name, name);
 			}
 			for (auto &argument : call.GetArgumentsMutable()) {
 				Rewrite(argument.GetExpressionMutable(), false);
@@ -279,7 +303,9 @@ private:
 		auto call_what = CallWhat(call, what);
 		auto arguments = SemanticSplitTransformArguments(call, 2, {"dimension"}, call_what);
 		auto &metric = *arguments.positional[0];
+		auto &interval = *arguments.positional[1];
 		CheckNoWindow(metric, call_what);
+		CheckOffsetInterval(analyzer, interval, call_what);
 		vector<SemanticAtom> atoms;
 		analyzer.Decompose(metric, SemanticMetricContext(), atoms, what);
 		auto entry = arguments.named.find("dimension");
@@ -287,8 +313,11 @@ private:
 		if (entry != arguments.named.end()) {
 			dimension_argument = entry->second;
 		}
-		auto dimension = SemanticTransformDimension(model, dimension_argument, atoms, call_what);
-		auto offset = SemanticMakeOffset(context, analyzer, model, dimension, *arguments.positional[1], call_what);
+		auto shiftable = [&](idx_t candidate) {
+			return Succeeds([&]() { SemanticMakeOffset(context, analyzer, model, candidate, interval, call_what); });
+		};
+		auto dimension = SemanticTransformDimension(model, dimension_argument, atoms, shiftable, call_what);
+		auto offset = SemanticMakeOffset(context, analyzer, model, dimension, interval, call_what);
 		auto index = analyzer.Transforms().AddOffset(std::move(offset));
 		return SemanticMarkers::Transform(SemanticTransformKind::OFFSET, index, metric.Copy());
 	}
@@ -307,14 +336,6 @@ private:
 		auto to_date = named("to_date");
 		if (window && to_date) {
 			throw SemanticDefinitionException("%s: trailing_window and to_date cannot be combined", call_what);
-		}
-		if (window && SemanticIsConstant(analyzer, *window)) {
-			LogicalType type;
-			auto error = SemanticBindError(context, window->Copy(), type);
-			if (!error.empty() || type.id() != LogicalTypeId::INTERVAL) {
-				throw SemanticDefinitionException("%s: trailing_window must be an interval (e.g. INTERVAL 7 DAYS)%s",
-				                                  call_what, Got(*window));
-			}
 		}
 		string part;
 		if (to_date) {
@@ -338,6 +359,7 @@ private:
 				                                  Got(*period_argument));
 			}
 		}
+		CheckCumulativeFrame(analyzer, window.get(), part, call_what);
 		auto &metric = *arguments.positional[0];
 		CheckNoWindow(metric, call_what);
 		// before the dimension's reachability: a metric that cannot be cumulated says why
@@ -360,7 +382,12 @@ private:
 			    "of an expression would not average its value)",
 			    call_what);
 		}
-		auto dimension = SemanticTransformDimension(model, named("dimension"), atoms, call_what);
+		auto orderable = [&](idx_t candidate) {
+			return Succeeds([&]() {
+				SemanticMakeCumulative(context, analyzer, model, candidate, window.get(), part, period, call_what);
+			});
+		};
+		auto dimension = SemanticTransformDimension(model, named("dimension"), atoms, orderable, call_what);
 		auto cumulative =
 		    SemanticMakeCumulative(context, analyzer, model, dimension, window.get(), part, period, call_what);
 		auto index = analyzer.Transforms().AddCumulative(std::move(cumulative));
@@ -458,7 +485,7 @@ SemanticTransformArguments SemanticSplitTransformArguments(const FunctionExpress
 	SemanticTransformArguments result;
 	for (auto &argument : call.GetArguments()) {
 		auto &expr = argument.GetExpression();
-		auto &name = argument.HasName() ? argument.GetName().GetIdentifierName() : expr.GetAlias().GetIdentifierName();
+		auto &name = ArgumentName(argument);
 		if (name.empty()) {
 			result.positional.push_back(&expr);
 			continue;
@@ -481,7 +508,8 @@ SemanticTransformArguments SemanticSplitTransformArguments(const FunctionExpress
 }
 
 idx_t SemanticTransformDimension(const SemanticModel &model, optional_ptr<const ParsedExpression> argument,
-                                 const vector<SemanticAtom> &atoms, const string &what) {
+                                 const vector<SemanticAtom> &atoms, const std::function<bool(idx_t)> &usable,
+                                 const string &what) {
 	auto reaches = [&](idx_t table) {
 		return std::all_of(atoms.begin(), atoms.end(),
 		                   [&](const SemanticAtom &atom) { return model.Reaches(atom.home, table); });
@@ -494,7 +522,7 @@ idx_t SemanticTransformDimension(const SemanticModel &model, optional_ptr<const 
 				continue;
 			}
 			auto column = SemanticMarkers::Classify(*member.resolved);
-			if (column.Is(SemanticRefKind::COLUMN) && reaches(column.index)) {
+			if (column.Is(SemanticRefKind::COLUMN) && reaches(column.index) && usable(m)) {
 				valid.push_back(model.MemberDisplayName(m));
 			}
 		}
@@ -510,8 +538,16 @@ idx_t SemanticTransformDimension(const SemanticModel &model, optional_ptr<const 
 		dimension = model.FindMember(model.time_spine.GetIndex(), SEMANTIC_TIME_SPINE_COLUMN).GetIndex();
 	} else {
 		auto ref = SemanticMarkers::Classify(*argument);
-		if (!ref.Is(SemanticRefKind::MEMBER) || model.members[ref.index].Kind() != SemanticMemberKind::DIMENSION) {
-			fail(StringUtil::Format("%s: \"%s\" is not a dimension", what, ArgumentName(model, *argument)));
+		if (ref.Is(SemanticRefKind::MEMBER) && model.members[ref.index].Kind() != SemanticMemberKind::DIMENSION) {
+			fail(StringUtil::Format("%s: \"%s\" is not a dimension", what, model.MemberDisplayName(ref.index)));
+		}
+		if (ref.Is(SemanticRefKind::COLUMN)) {
+			fail(
+			    StringUtil::Format("%s: \"%s.%s\" is not a dimension", what, model.tables[ref.index].name, ref.column));
+		}
+		if (!ref.Is(SemanticRefKind::MEMBER)) {
+			// other expressions hold internal markers by now: not printed
+			fail(StringUtil::Format("%s: the dimension argument must name a dimension", what));
 		}
 		dimension = ref.index;
 	}
@@ -527,6 +563,34 @@ idx_t SemanticTransformDimension(const SemanticModel &model, optional_ptr<const 
 		}
 	}
 	return dimension;
+}
+
+void SemanticCheckUnresolvedTransforms(const ParsedExpression &expr, const string &what) {
+	if (IsTransformCall(expr)) {
+		auto &call = expr.Cast<FunctionExpression>();
+		for (auto &argument : call.GetArguments()) {
+			auto &name = ArgumentName(argument);
+			auto &value = argument.GetExpression();
+			if (value.GetExpressionClass() != ExpressionClass::COLUMN_REF ||
+			    value.Cast<ColumnRefExpression>().IsQualified()) {
+				continue;
+			}
+			// period and to_date take strings: an unquoted value would fail to resolve as a column
+			auto &identifier = value.Cast<ColumnRefExpression>().GetColumnName().GetIdentifierName();
+			if (StringUtil::CIEquals(name, "period")) {
+				throw SemanticDefinitionException(
+				    "%s: period must be 'first', 'last' or 'average', got identifier %s; quote it: period := '%s'",
+				    CallWhat(call, what), identifier, identifier);
+			}
+			if (StringUtil::CIEquals(name, "to_date")) {
+				throw SemanticDefinitionException("%s: to_date must be a date part string (e.g. to_date := 'month'), "
+				                                  "got identifier %s; quote it: to_date := '%s'",
+				                                  CallWhat(call, what), identifier, identifier);
+			}
+		}
+	}
+	ParsedExpressionIterator::EnumerateChildren(
+	    expr, [&](const ParsedExpression &child) { SemanticCheckUnresolvedTransforms(child, what); });
 }
 
 unique_ptr<ParsedExpression> SemanticResolveTransforms(ClientContext &context, SemanticAnalyzer &analyzer,
@@ -553,8 +617,9 @@ unique_ptr<ParsedExpression> SemanticResolveTransforms(ClientContext &context, S
 // the functions discoverable in duckdb_functions(), and their bind fails anywhere else.
 static unique_ptr<FunctionData> SemanticTransformOutsideQuery(const string &name) {
 	throw BinderException("%s() can only be used in the METRICS of a semantic query (SEMANTIC_VIEW(...) or a query of "
-	                      "a semantic view by name)",
-	                      name);
+	                      "a semantic view by name), and unqualified: a schema-qualified call such as main.%s(...) is "
+	                      "not recognized there",
+	                      name, name);
 }
 
 static unique_ptr<FunctionData> TimeShiftBind(BindScalarFunctionInput &) {
@@ -592,8 +657,8 @@ void RegisterSemanticTransformFunctions(ExtensionLoader &loader) {
 	    "metric_time.day.",
 	    {"SELECT * FROM SEMANTIC_VIEW(sales DIMENSIONS metric_time.month METRICS time_shift(revenue, INTERVAL 1 YEAR) "
 	     "AS revenue_ly)",
-	     "SELECT metric_time.month, time_shift(AGG(revenue), INTERVAL 1 MONTH, dimension := orders.order_date) FROM "
-	     "sales GROUP BY metric_time.month"});
+	     "SELECT orders.order_month, time_shift(AGG(revenue), INTERVAL 1 MONTH, dimension := orders.order_date) FROM "
+	     "sales GROUP BY orders.order_month"});
 	RegisterSemanticTransform(
 	    loader,
 	    ScalarFunction("cumulative",
