@@ -18,6 +18,7 @@
 #include "semantic_lowering.hpp"
 #include "semantic_statement_visitor.hpp"
 #include "semantic_layer_registry.hpp"
+#include "semantic_transforms.hpp"
 
 namespace duckdb {
 
@@ -240,12 +241,21 @@ private:
 		}
 	}
 
+	static bool IsAggCall(const ParsedExpression &expr) {
+		return expr.GetExpressionClass() == ExpressionClass::FUNCTION &&
+		       StringUtil::CIEquals(expr.Cast<FunctionExpression>().FunctionName().GetIdentifierName(), "agg");
+	}
+
+	static bool IsTransformCall(const ParsedExpression &expr) {
+		return SemanticFindTransformCall(expr).get() == &expr;
+	}
+
+	//! AGG(...), an aggregate function, or a time_shift / cumulative call: the boundary of one metric item
 	bool IsAggregateCall(const ParsedExpression &expr) {
 		if (expr.GetExpressionClass() != ExpressionClass::FUNCTION) {
 			return false;
 		}
-		auto &function = expr.Cast<FunctionExpression>();
-		return StringUtil::CIEquals(function.FunctionName().GetIdentifierName(), "agg") || analyzer.IsAggregate(expr);
+		return IsAggCall(expr) || IsTransformCall(expr) || analyzer.IsAggregate(expr);
 	}
 
 	bool ContainsAggregate(const ParsedExpression &expr) {
@@ -334,22 +344,60 @@ private:
 		query.items.push_back(std::move(item));
 	}
 
-	//! Registers the metric item for an aggregate call (deduplicated) and returns its column
+	//! The metric of an AGG(<metric>) call
+	unique_ptr<ParsedExpression> AggMetric(const FunctionExpression &function) {
+		if (ArgumentCount(function) != 1 || function.Distinct() || function.Filter() ||
+		    SemanticFindTransformCall(Argument(function, 0))) {
+			throw BinderException("AGG() takes exactly one metric");
+		}
+		auto metric = WithoutAlias(Argument(function, 0));
+		SemanticResolveContext resolve_context;
+		resolve_context.allow_private = false;
+		resolve_context.what = "AGG(" + metric->ToString() + ")";
+		auto resolved = model.Resolve(*metric, resolve_context);
+		if (!analyzer.ContainsAggregateOrMetric(*resolved)) {
+			throw BinderException("AGG() requires a metric; \"%s\" is not a metric", metric->ToString());
+		}
+		return metric;
+	}
+
+	//! Replaces the AGG(<metric>) calls in `expr` by their metric; ad-hoc aggregates are kept
+	void UnwrapAggCalls(unique_ptr<ParsedExpression> &expr) {
+		if (IsAggCall(*expr)) {
+			auto alias = expr->GetAlias();
+			expr = AggMetric(expr->Cast<FunctionExpression>());
+			expr->SetAlias(alias);
+			return;
+		}
+		if (analyzer.IsAggregate(*expr)) {
+			return;
+		}
+		ParsedExpressionIterator::EnumerateChildren(
+		    *expr, [&](unique_ptr<ParsedExpression> &child) { UnwrapAggCalls(child); });
+	}
+
+	//! A time_shift / cumulative call as one metric item: the AGG() calls of its metric (the first positional
+	//! argument) are unwrapped; the other arguments, named ones included, are kept as written so that they resolve in
+	//! the semantic query
+	unique_ptr<ParsedExpression> TransformMetric(const ParsedExpression &call) {
+		auto result = WithoutAlias(call);
+		for (auto &argument : result->Cast<FunctionExpression>().GetArgumentsMutable()) {
+			auto &expr = argument.GetExpressionMutable();
+			if (!argument.HasName() && expr->GetAlias().empty()) {
+				UnwrapAggCalls(expr);
+				break;
+			}
+		}
+		return result;
+	}
+
+	//! Registers the metric item for an aggregate or transform call (deduplicated) and returns its column
 	string MetricFor(const ParsedExpression &aggregate) {
 		unique_ptr<ParsedExpression> metric;
-		auto &function = aggregate.Cast<FunctionExpression>();
-		if (StringUtil::CIEquals(function.FunctionName().GetIdentifierName(), "agg")) {
-			if (ArgumentCount(function) != 1 || function.Distinct() || function.Filter()) {
-				throw BinderException("AGG() takes exactly one metric");
-			}
-			metric = WithoutAlias(Argument(function, 0));
-			SemanticResolveContext resolve_context;
-			resolve_context.allow_private = false;
-			resolve_context.what = "AGG(" + metric->ToString() + ")";
-			auto resolved = model.Resolve(*metric, resolve_context);
-			if (!analyzer.ContainsAggregateOrMetric(*resolved)) {
-				throw BinderException("AGG() requires a metric; \"%s\" is not a metric", metric->ToString());
-			}
+		if (IsAggCall(aggregate)) {
+			metric = AggMetric(aggregate.Cast<FunctionExpression>());
+		} else if (IsTransformCall(aggregate)) {
+			metric = TransformMetric(aggregate);
 		} else {
 			metric = WithoutAlias(aggregate);
 		}

@@ -794,3 +794,143 @@ statement error
 SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month METRICS SUM(cumulative(invoices.amount)) AS x);
 ----
 cumulative() cannot be used inside an aggregate
+
+#===--------------------------------------------------------------------===#
+# queries by name: SELECT ... FROM <semantic view> GROUP BY ...
+#===--------------------------------------------------------------------===#
+
+# a transform call is one metric item, with the AGG() calls of its first argument unwrapped
+foreach grain day month year
+
+query I
+SELECT (SELECT count(*) FROM (
+    (SELECT metric_time.{grain}, AGG(revenue), time_shift(AGG(revenue), INTERVAL 1 YEAR) AS ly
+     FROM ledger GROUP BY metric_time.{grain}
+     EXCEPT ALL
+     SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.{grain}
+       METRICS revenue, time_shift(revenue, INTERVAL 1 YEAR) AS ly))
+    UNION ALL
+    (SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.{grain}
+       METRICS revenue, time_shift(revenue, INTERVAL 1 YEAR) AS ly)
+     EXCEPT ALL
+     SELECT metric_time.{grain}, AGG(revenue), time_shift(AGG(revenue), INTERVAL 1 YEAR) AS ly
+     FROM ledger GROUP BY metric_time.{grain})
+  )) = 0
+   AND (SELECT count(*) FROM (SELECT metric_time.{grain}, AGG(revenue), time_shift(AGG(revenue), INTERVAL 1 YEAR) AS ly
+     FROM ledger GROUP BY metric_time.{grain})) > 0;
+----
+true
+
+# GROUP BY ALL does not group by the transform call
+query I
+SELECT (SELECT count(*) FROM (
+    (SELECT metric_time.{grain}, AGG(revenue), time_shift(AGG(revenue), INTERVAL 1 YEAR) AS ly
+     FROM ledger GROUP BY ALL
+     EXCEPT ALL
+     SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.{grain}
+       METRICS revenue, time_shift(revenue, INTERVAL 1 YEAR) AS ly))
+    UNION ALL
+    (SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.{grain}
+       METRICS revenue, time_shift(revenue, INTERVAL 1 YEAR) AS ly)
+     EXCEPT ALL
+     SELECT metric_time.{grain}, AGG(revenue), time_shift(AGG(revenue), INTERVAL 1 YEAR) AS ly
+     FROM ledger GROUP BY ALL)
+  )) = 0
+   AND (SELECT count(*) FROM (SELECT metric_time.{grain}, AGG(revenue), time_shift(AGG(revenue), INTERVAL 1 YEAR) AS ly
+     FROM ledger GROUP BY ALL)) > 0;
+----
+true
+
+endloop
+
+# arithmetic around the call stays in the outer query
+query I
+SELECT (SELECT count(*) FROM (
+    (SELECT metric_time.month, AGG(revenue) / time_shift(AGG(revenue), INTERVAL 1 YEAR) - 1 AS growth
+     FROM ledger GROUP BY metric_time.month
+     EXCEPT ALL
+     SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
+       METRICS revenue / time_shift(revenue, INTERVAL 1 YEAR) - 1 AS growth))
+    UNION ALL
+    (SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
+       METRICS revenue / time_shift(revenue, INTERVAL 1 YEAR) - 1 AS growth)
+     EXCEPT ALL
+     SELECT metric_time.month, AGG(revenue) / time_shift(AGG(revenue), INTERVAL 1 YEAR) - 1 AS growth
+     FROM ledger GROUP BY metric_time.month)
+  )) = 0
+   AND (SELECT count(growth) FROM (SELECT metric_time.month, AGG(revenue) / time_shift(AGG(revenue), INTERVAL 1 YEAR) - 1
+     AS growth FROM ledger GROUP BY metric_time.month)) > 0;
+----
+true
+
+# cumulative(...) with a named argument, and a shift of an ad-hoc aggregate
+query I
+SELECT (SELECT count(*) FROM (
+    (SELECT metric_time.day, cumulative(AGG(revenue), to_date := 'month') AS mtd,
+            time_shift(SUM(invoices.amount), INTERVAL 1 YEAR) AS amount_ly
+     FROM ledger GROUP BY metric_time.day
+     EXCEPT ALL
+     SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.day
+       METRICS cumulative(revenue, to_date := 'month') AS mtd,
+               time_shift(SUM(invoices.amount), INTERVAL 1 YEAR) AS amount_ly))
+    UNION ALL
+    (SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.day
+       METRICS cumulative(revenue, to_date := 'month') AS mtd,
+               time_shift(SUM(invoices.amount), INTERVAL 1 YEAR) AS amount_ly)
+     EXCEPT ALL
+     SELECT metric_time.day, cumulative(AGG(revenue), to_date := 'month') AS mtd,
+            time_shift(SUM(invoices.amount), INTERVAL 1 YEAR) AS amount_ly
+     FROM ledger GROUP BY metric_time.day)
+  )) = 0
+   AND (SELECT count(*) FROM (SELECT metric_time.day, cumulative(AGG(revenue), to_date := 'month') AS mtd,
+            time_shift(SUM(invoices.amount), INTERVAL 1 YEAR) AS amount_ly
+     FROM ledger GROUP BY metric_time.day)) > 0;
+----
+true
+
+# named arguments resolve in the semantic query: invoices.invoice_date is not grouped
+query I
+SELECT (SELECT count(*) FROM (
+    (SELECT invoices.invoice_month,
+            time_shift(AGG(revenue), INTERVAL 1 MONTH, dimension := invoices.invoice_date) AS lm
+     FROM ledger GROUP BY invoices.invoice_month
+     EXCEPT ALL
+     SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS invoices.invoice_month METRICS revenue_lm_by_date))
+    UNION ALL
+    (SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS invoices.invoice_month METRICS revenue_lm_by_date)
+     EXCEPT ALL
+     SELECT invoices.invoice_month,
+            time_shift(AGG(revenue), INTERVAL 1 MONTH, dimension := invoices.invoice_date) AS lm
+     FROM ledger GROUP BY invoices.invoice_month)
+  )) = 0
+   AND (SELECT count(*) FROM (SELECT invoices.invoice_month,
+            time_shift(AGG(revenue), INTERVAL 1 MONTH, dimension := invoices.invoice_date) AS lm
+     FROM ledger GROUP BY invoices.invoice_month)) > 0;
+----
+true
+
+# in HAVING
+query I
+SELECT (SELECT count(*) FROM (
+    (SELECT metric_time.month, AGG(revenue) FROM ledger GROUP BY metric_time.month
+     HAVING time_shift(AGG(revenue), INTERVAL 1 YEAR) > 0
+     EXCEPT ALL
+     SELECT month, revenue FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
+       METRICS revenue, time_shift(revenue, INTERVAL 1 YEAR) AS ly) WHERE ly > 0)
+    UNION ALL
+    (SELECT month, revenue FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
+       METRICS revenue, time_shift(revenue, INTERVAL 1 YEAR) AS ly) WHERE ly > 0
+     EXCEPT ALL
+     SELECT metric_time.month, AGG(revenue) FROM ledger GROUP BY metric_time.month
+     HAVING time_shift(AGG(revenue), INTERVAL 1 YEAR) > 0)
+  )) = 0
+   AND (SELECT count(*) FROM (SELECT metric_time.month, AGG(revenue) FROM ledger GROUP BY metric_time.month
+     HAVING time_shift(AGG(revenue), INTERVAL 1 YEAR) > 0)) > 0;
+----
+true
+
+# AGG() takes a metric, not a transform call
+statement error
+SELECT metric_time.month, AGG(time_shift(revenue, INTERVAL 1 YEAR)) FROM ledger GROUP BY metric_time.month;
+----
+AGG() takes exactly one metric
