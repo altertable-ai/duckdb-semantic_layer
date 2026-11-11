@@ -25,7 +25,7 @@ unique_ptr<ParsedExpression> SemanticExpressionCompiler::MappedRow(const ParsedE
 unique_ptr<ParsedExpression> SemanticExpressionCompiler::ShiftedRow(const ParsedExpression &expr,
                                                                     SemanticJoinScope &scope, const string &what,
                                                                     const vector<idx_t> &offsets) {
-	SemanticOffsetMap map(model, offsets);
+	SemanticOffsetMap map(analyzer.Transforms(), offsets);
 	return MappedRow(expr, scope, what, map);
 }
 

@@ -16,6 +16,7 @@
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "semantic_markers.hpp"
 #include "semantic_model.hpp"
+#include "semantic_transforms.hpp"
 
 namespace duckdb {
 
@@ -111,6 +112,13 @@ public:
 	ClientContext &Context() const {
 		return context;
 	}
+	//! The OFFSETs and CUMULATIVEs of the query: the model's, plus those the query adds
+	SemanticTransforms &Transforms() {
+		return transforms;
+	}
+	const SemanticTransforms &Transforms() const {
+		return transforms;
+	}
 
 	//! Whether `expr` is a call to an aggregate function
 	bool IsAggregate(const ParsedExpression &expr);
@@ -145,6 +153,7 @@ private:
 
 	const SemanticModel &model;
 	ClientContext &context;
+	SemanticTransforms transforms;
 	case_insensitive_map_t<bool> aggregate_cache;
 };
 

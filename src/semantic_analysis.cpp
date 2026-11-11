@@ -16,7 +16,7 @@
 namespace duckdb {
 
 SemanticAnalyzer::SemanticAnalyzer(const SemanticModel &model, ClientContext &context)
-    : model(model), context(context) {
+    : model(model), context(context), transforms(model) {
 }
 
 bool SemanticAnalyzer::IsAggregate(const ParsedExpression &expr) {
@@ -187,7 +187,7 @@ SemanticMetricContext SemanticAnalyzer::MetricContext(idx_t metric, const Semant
 
 void SemanticAnalyzer::ApplyMetricContext(SemanticAtom &atom, const string &what) {
 	for (auto o : atom.context.offsets) {
-		auto &offset = model.offsets[o];
+		auto &offset = transforms.Offset(o);
 		if (!model.Reaches(atom.home, offset.table)) {
 			throw SemanticDefinitionException("%s: OFFSET dimension \"%s\" is not reachable from logical table \"%s\"",
 			                                  what, model.MemberDisplayName(offset.dimension),
@@ -195,7 +195,7 @@ void SemanticAnalyzer::ApplyMetricContext(SemanticAtom &atom, const string &what
 		}
 	}
 	if (atom.context.cumulative != DConstants::INVALID_INDEX) {
-		auto &cumulative = model.cumulatives[atom.context.cumulative];
+		auto &cumulative = transforms.Cumulative(atom.context.cumulative);
 		if (!model.Reaches(atom.home, cumulative.table)) {
 			throw SemanticDefinitionException(
 			    "%s: CUMULATIVE dimension \"%s\" is not reachable from logical table \"%s\"", what,

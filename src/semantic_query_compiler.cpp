@@ -466,7 +466,7 @@ private:
 	//! The rows of a block that groups them by the query's dimensions: those shifted by the block's OFFSETs, and
 	//! read by the rows as __sv_d<i>
 	BlockRows BuildDimensionRows(const Block &block, SemanticJoinScope &scope, BlockBridges &bridges) {
-		SemanticOffsetMap map(model, block.key.offsets);
+		SemanticOffsetMap map(analyzer.Transforms(), block.key.offsets);
 		auto result = BuildRows(block, scope, bridges, map, WhereConjuncts());
 		vector<unique_ptr<ParsedExpression>> select_list;
 		for (idx_t d = 0; d < result.dimensions.size(); d++) {
@@ -551,11 +551,11 @@ private:
 	//! A block of CUMULATIVE aggregates (semantic_cumulative.hpp): its rows read the stored date, the query's
 	//! dimensions and WHERE conditions on the date read the anchor
 	unique_ptr<SelectNode> BuildCumulativeBlock(const Block &block, optional_idx tag) {
-		auto &cumulative = model.cumulatives[block.key.cumulative];
+		auto &cumulative = analyzer.Transforms().Cumulative(block.key.cumulative);
 		SemanticJoinScope scope(model, aliases, block.key.home, block.key.using_relationships, string(),
 		                        options.sources);
 		BlockBridges bridges(model, analyzer, compiler, aliases, block.key, options.sources);
-		SemanticAnchorMap anchor_map(model, cumulative, block.key.offsets);
+		SemanticAnchorMap anchor_map(analyzer.Transforms(), cumulative, block.key.offsets);
 		// the WHERE conjuncts reading the date filter the anchors, the others the rows
 		SemanticCumulativeParts parts;
 		vector<const ParsedExpression *> row_where;

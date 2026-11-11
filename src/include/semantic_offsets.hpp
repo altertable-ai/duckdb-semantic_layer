@@ -15,16 +15,17 @@
 
 namespace duckdb {
 
-//! Reads the columns of `offsets` (SemanticModel::offsets) shifted, in order
+//! Reads the columns of `offsets` (SemanticTransforms) shifted, in order
 class SemanticOffsetMap : public SemanticColumnMap {
 public:
-	SemanticOffsetMap(const SemanticModel &model, const vector<idx_t> &offsets) : model(model), offsets(offsets) {
+	SemanticOffsetMap(const SemanticTransforms &transforms, const vector<idx_t> &offsets)
+	    : transforms(transforms), offsets(offsets) {
 	}
 	unique_ptr<ParsedExpression> Column(idx_t table, const string &column,
 	                                    unique_ptr<ParsedExpression> compiled) override;
 
 private:
-	const SemanticModel &model;
+	const SemanticTransforms &transforms;
 	const vector<idx_t> &offsets;
 };
 

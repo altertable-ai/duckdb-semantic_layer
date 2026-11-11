@@ -90,7 +90,7 @@ void CheckSemanticTimeReads(const SemanticModel &model, SemanticAnalyzer &analyz
 		analyzer.Decompose(*item.resolved, SemanticMetricContext(), atoms, SemanticItemWhat(item));
 		for (auto &atom : atoms) {
 			if (atom.context.cumulative != DConstants::INVALID_INDEX) {
-				auto &cumulative = model.cumulatives[atom.context.cumulative];
+				auto &cumulative = analyzer.Transforms().Cumulative(atom.context.cumulative);
 				for (auto &read_item : items) {
 					for (auto &read : read_item.reads) {
 						if (!MovesWith(model, read, cumulative.table, cumulative.column, atom.home)) {
@@ -104,7 +104,7 @@ void CheckSemanticTimeReads(const SemanticModel &model, SemanticAnalyzer &analyz
 				}
 			}
 			for (auto o : atom.context.offsets) {
-				auto &offset = model.offsets[o];
+				auto &offset = analyzer.Transforms().Offset(o);
 				bool shifted = false;
 				for (auto &read_item : items) {
 					for (auto &read : read_item.reads) {

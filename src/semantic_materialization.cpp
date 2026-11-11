@@ -81,13 +81,13 @@ shared_ptr<SemanticMaterialization> PlanSemanticMaterialization(ClientContext &c
 			    model.MemberDisplayName(plan.key.non_additive_member));
 		}
 		if (!plan.key.offsets.empty()) {
-			auto &offset = model.offsets[plan.key.offsets[0]];
+			auto &offset = compiler.Analyzer().Transforms().Offset(plan.key.offsets[0]);
 			throw SemanticDefinitionException("%s: a metric uses OFFSET and cannot be materialized (OFFSET (%s BY %s))",
 			                                  what, model.MemberDisplayName(offset.dimension),
 			                                  offset.interval->ToString());
 		}
 		if (plan.key.cumulative != DConstants::INVALID_INDEX) {
-			auto &cumulative = model.cumulatives[plan.key.cumulative];
+			auto &cumulative = compiler.Analyzer().Transforms().Cumulative(plan.key.cumulative);
 			throw SemanticDefinitionException(
 			    "%s: a metric uses CUMULATIVE and cannot be materialized (CUMULATIVE (%s))", what,
 			    model.MemberDisplayName(cumulative.dimension));
