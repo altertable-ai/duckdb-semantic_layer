@@ -8,17 +8,14 @@
 #include "duckdb/common/to_string.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/client_context.hpp"
-#include "duckdb/common/error_data.hpp"
 #include "duckdb/parser/expression/star_expression.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
-#include "duckdb/parser/tableref/emptytableref.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "semantic_analysis.hpp"
-#include "semantic_definition_exception.hpp"
 #include "semantic_model.hpp"
 #include "semantic_materialization.hpp"
 #include "semantic_query_compiler.hpp"
@@ -98,6 +95,11 @@ private:
 	template <typename... ARGS>
 	[[noreturn]] void Fail(const string &message, ARGS... params) {
 		throw BinderException("Invalid semantic view \"%s\": " + message, model->Name().name, params...);
+	}
+
+	//! The prefix of Fail's messages, for the checks shared with query-time transforms (semantic_transforms.hpp)
+	string ErrorPrefix() const {
+		return "Invalid semantic view \"" + model->Name().name + "\": ";
 	}
 
 	string ResolveColumn(const SemanticTable &table, const string &column, const string &what) {
@@ -530,13 +532,7 @@ private:
 			auto what = What(m) + " OFFSET";
 			idx_t dimension;
 			ResolveColumnDimension(parsed.offset_dimension, m, what, dimension);
-			SemanticOffset offset;
-			try {
-				offset = SemanticMakeOffset(context, analyzer, *model, dimension, *parsed.offset_interval, what);
-			} catch (SemanticDefinitionException &ex) {
-				ErrorData error(ex);
-				Fail("%s", error.RawMessage());
-			}
+			auto offset = SemanticMakeOffset(analyzer, dimension, *parsed.offset_interval, ErrorPrefix() + what);
 			auto existing = std::find_if(model->offsets.begin(), model->offsets.end(),
 			                             [&](const SemanticOffset &other) { return other.Equals(offset); });
 			if (existing == model->offsets.end()) {
@@ -560,15 +556,9 @@ private:
 			auto what = What(m) + " CUMULATIVE";
 			idx_t dimension;
 			ResolveColumnDimension(parsed.cumulative_dimension, m, what, dimension);
-			SemanticCumulative cumulative;
-			try {
-				cumulative =
-				    SemanticMakeCumulative(context, analyzer, *model, dimension, parsed.cumulative_window.get(),
-				                           parsed.cumulative_part, parsed.cumulative_period, what);
-			} catch (SemanticDefinitionException &ex) {
-				ErrorData error(ex);
-				Fail("%s", error.RawMessage());
-			}
+			auto cumulative =
+			    SemanticMakeCumulative(analyzer, dimension, parsed.cumulative_window.get(), parsed.cumulative_part,
+			                           parsed.cumulative_period, ErrorPrefix() + what);
 			auto existing = std::find_if(model->cumulatives.begin(), model->cumulatives.end(),
 			                             [&](const SemanticCumulative &other) { return other.Equals(cumulative); });
 			if (existing == model->cumulatives.end()) {
@@ -643,10 +633,7 @@ private:
 			for (auto below : MetricsBelow(m)) {
 				auto &other = model->members[below];
 				if (cumulative) {
-					const char *clause = other.offset.IsValid()        ? "OFFSET"
-					                     : other.cumulative.IsValid()  ? "CUMULATIVE"
-					                     : !other.non_additive.empty() ? "NON ADDITIVE BY"
-					                                                   : nullptr;
+					auto clause = other.TimeClause();
 					if (clause) {
 						Fail("%s uses CUMULATIVE and cannot reference metric \"%s\", which uses %s", What(m),
 						     model->MemberDisplayName(below), clause);

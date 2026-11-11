@@ -418,6 +418,11 @@ SELECT segment, AGG(revenue / SUM(revenue) OVER ()) FROM sales GROUP BY segment;
 AGG() takes a metric, not a window function
 
 statement error
+SELECT * FROM SEMANTIC_VIEW(sales DIMENSIONS segment METRICS AGG(revenue / SUM(revenue) OVER ()) AS x);
+----
+<REGEX>:.*Invalid metric "x": AGG\(\) takes a metric, not a window function.*
+
+statement error
 SELECT invoice_amount, ROW_NUMBER() OVER (ORDER BY n) AS n FROM sales;
 ----
 Window function alias "n" cannot be referenced in its own definition

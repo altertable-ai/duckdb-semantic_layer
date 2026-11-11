@@ -43,9 +43,8 @@ constexpr const char *BLOCK_COLUMN = "__sv_block";
 
 } // namespace
 
-string SemanticItemWhat(const SemanticQueryItem &item) {
-	auto &name = item.display_name.empty() ? item.output_name : item.display_name;
-	switch (item.kind) {
+string SemanticItemWhat(SemanticMemberKind kind, const string &name) {
+	switch (kind) {
 	case SemanticMemberKind::DIMENSION:
 		return "Invalid dimension \"" + name + "\"";
 	case SemanticMemberKind::FACT:
@@ -53,6 +52,10 @@ string SemanticItemWhat(const SemanticQueryItem &item) {
 	default:
 		return "Invalid metric \"" + name + "\"";
 	}
+}
+
+string SemanticItemWhat(const SemanticQueryItem &item) {
+	return SemanticItemWhat(item.kind, item.Name());
 }
 
 string SemanticDimensionColumn(idx_t dimension) {
@@ -717,6 +720,7 @@ SemanticQueryCompiler::SemanticQueryCompiler(const SemanticModel &model, ClientC
 SemanticQuerySpec SemanticQueryCompiler::Resolve(const vector<ParsedSemanticQueryItem> &items,
                                                  optional_ptr<ParsedExpression> where) {
 	SemanticQuerySpec spec;
+	BindQuery(spec);
 	SemanticResolveContext resolve_context;
 	resolve_context.allow_private = false;
 	for (auto &item : items) {
@@ -734,15 +738,14 @@ SemanticQuerySpec SemanticQueryCompiler::Resolve(const vector<ParsedSemanticQuer
 			}
 			continue;
 		}
-		// queries by name give their items internal names (__sv_m0, ...): their errors name the expression
-		auto internal_name = StringUtil::StartsWith(item.alias, "__sv_");
-		auto transforms_what = SemanticItemWhat(SemanticQueryItem {
-		    item.kind, nullptr, item.alias.empty() || internal_name ? item.expression->ToString() : item.alias});
+		// errors name the item as written (its alias, before resolution gives it an output name)
+		auto what = SemanticItemWhat(item.kind, !item.display_name.empty() ? item.display_name
+		                                        : !item.alias.empty()      ? item.alias
+		                                                                   : item.expression->ToString());
 		if (item.kind == SemanticMemberKind::METRIC) {
-			SemanticCheckUnresolvedTransforms(*item.expression, transforms_what);
+			SemanticCheckUnresolvedTransforms(*item.expression, what);
 		}
-		resolve_context.what = "Invalid " + StringUtil::Lower(SemanticMemberKindToString(item.kind)) + " \"" +
-		                       item.expression->ToString() + "\"";
+		resolve_context.what = what;
 		auto resolved = model.Resolve(*item.expression, resolve_context);
 		auto output_name = item.alias;
 		if (output_name.empty()) {
@@ -751,30 +754,21 @@ SemanticQuerySpec SemanticQueryCompiler::Resolve(const vector<ParsedSemanticQuer
 			              : ref.Is(SemanticRefKind::COLUMN) ? ref.column
 			                                                : item.expression->ToString();
 		}
-		SemanticQueryItem query_item {item.kind, std::move(resolved), output_name};
-		if (internal_name) {
-			query_item.display_name = item.expression->ToString();
-		} else {
-			transforms_what = SemanticItemWhat(query_item);
-		}
-		query_item.resolved = SemanticResolveTransforms(analyzer.Context(), analyzer, model,
-		                                                std::move(query_item.resolved), item.kind, transforms_what);
-		spec.items.push_back(std::move(query_item));
+		resolved = SemanticResolveTransforms(analyzer, std::move(resolved), item.kind, what);
+		spec.items.push_back(SemanticQueryItem {item.kind, std::move(resolved), output_name});
+		spec.items.back().display_name = item.display_name;
 	}
 	if (where) {
 		resolve_context.what = "Invalid WHERE clause";
-		spec.where =
-		    SemanticResolveTransforms(analyzer.Context(), analyzer, model, model.Resolve(*where, resolve_context),
-		                              SemanticMemberKind::DIMENSION, resolve_context.what);
+		spec.where = SemanticResolveTransforms(analyzer, model.Resolve(*where, resolve_context),
+		                                       SemanticMemberKind::DIMENSION, resolve_context.what);
 	}
-	spec.filters = analyzer.Transforms().LocalFilters();
 	return spec;
 }
 
 void SemanticQueryCompiler::SplitItems(const SemanticQuerySpec &spec, vector<const SemanticQueryItem *> &dimensions,
                                        vector<const SemanticQueryItem *> &facts,
                                        vector<const SemanticQueryItem *> &metrics, set<idx_t> &row_tables) {
-	analyzer.Transforms().RegisterFilters(spec.filters);
 	case_insensitive_set_t output_names;
 	for (auto &item : spec.items) {
 		if (!output_names.insert(item.output_name).second) {
@@ -816,6 +810,7 @@ void SemanticQueryCompiler::SplitItems(const SemanticQuerySpec &spec, vector<con
 
 unique_ptr<SelectStatement> SemanticQueryCompiler::Compile(const SemanticQuerySpec &spec,
                                                            const SemanticCompileOptions &options) {
+	BindQuery(spec);
 	vector<const SemanticQueryItem *> dimensions;
 	vector<const SemanticQueryItem *> facts;
 	vector<const SemanticQueryItem *> metrics;
@@ -858,6 +853,7 @@ static void VerifyBoundSources(const SemanticModel &model, LogicalOperator &op, 
 }
 
 vector<SemanticBlockPlan> SemanticQueryCompiler::PlanBlocks(const SemanticQuerySpec &spec) {
+	BindQuery(spec);
 	vector<const SemanticQueryItem *> dimensions;
 	vector<const SemanticQueryItem *> facts;
 	vector<const SemanticQueryItem *> metrics;
@@ -894,6 +890,7 @@ vector<SemanticBlockPlan> SemanticQueryCompiler::PlanBlocks(const SemanticQueryS
 unique_ptr<SelectStatement> SemanticQueryCompiler::CompileStates(const SemanticQuerySpec &spec, idx_t block,
                                                                  const SemanticStateBuilder &states,
                                                                  const SemanticCompileOptions &options) {
+	BindQuery(spec);
 	vector<const SemanticQueryItem *> dimensions;
 	vector<const SemanticQueryItem *> facts;
 	vector<const SemanticQueryItem *> metrics;

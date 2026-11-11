@@ -208,11 +208,10 @@ void SemanticAnalyzer::ApplyMetricContext(SemanticAtom &atom, const string &what
 		RowTables(transforms.Filter(filter), DConstants::INVALID_INDEX, tables, what);
 		for (auto table : tables) {
 			if (!model.Reaches(atom.home, table)) {
-				auto name = transforms.FilterDisplayName(filter);
 				throw SemanticDefinitionException(
 				    "%s: %s references logical table \"%s\", which is not reachable from \"%s\" (aggregated by %s)",
-				    what, filter < model.members.size() ? "FILTER of " + name : name, model.tables[table].name,
-				    model.tables[atom.home].name, SemanticDisplayExpression(model, aggregate)->ToString());
+				    what, transforms.FilterDisplayName(filter), model.tables[table].name, model.tables[atom.home].name,
+				    SemanticDisplayExpression(model, aggregate)->ToString());
 			}
 		}
 	}

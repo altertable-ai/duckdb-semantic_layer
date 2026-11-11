@@ -109,12 +109,14 @@ private:
 	//! place
 	void NormalizeClauses(const SelectNode &node, const vector<unique_ptr<ParsedExpression> *> &orders) {
 		for (auto &expr : node.select_list) {
-			select.push_back(Normalize(*expr));
-			select.back()->SetAlias(expr->GetAlias());
-			select_aliases.push_back(expr->GetAlias().GetIdentifierName());
-			original_text.push_back(expr->ToString());
-			window_items.push_back(SemanticAnalyzer::ContainsWindow(*select.back()));
-			CheckWindowFunctions(*select.back());
+			SelectItem item;
+			item.expr = Normalize(*expr);
+			item.expr->SetAlias(expr->GetAlias());
+			item.alias = expr->GetAlias().GetIdentifierName();
+			item.text = expr->ToString();
+			item.has_window = SemanticAnalyzer::ContainsWindow(*item.expr);
+			CheckWindowFunctions(*item.expr);
+			select.push_back(std::move(item));
 		}
 		if (node.where_clause) {
 			query.where = Normalize(*node.where_clause);
@@ -122,7 +124,7 @@ private:
 		}
 		if (node.having) {
 			having = Normalize(*node.having);
-			CheckNoWindow(*having, "HAVING");
+			CheckNoWindow(*having, "HAVING", "; use QUALIFY");
 		}
 		if (node.qualify) {
 			qualify = Normalize(*node.qualify);
@@ -138,9 +140,9 @@ private:
 	void CollectGroups(const SelectNode &node) {
 		if (node.aggregate_handling == AggregateHandling::FORCE_AGGREGATES) {
 			// like DuckDB's GROUP BY ALL, neither aggregates nor windows are groups
-			for (idx_t i = 0; i < select.size(); i++) {
-				if (!window_items[i] && !ContainsAggregate(*select[i])) {
-					groups.push_back(WithoutAlias(*select[i]));
+			for (auto &item : select) {
+				if (!item.has_window && !ContainsAggregate(*item.expr)) {
+					groups.push_back(WithoutAlias(*item.expr));
 				}
 			}
 			return;
@@ -155,8 +157,8 @@ private:
 		if (!groups.empty() || (having && ContainsAggregate(*having)) || (qualify && ContainsAggregate(*qualify))) {
 			return true;
 		}
-		for (auto &expr : select) {
-			if (ContainsAggregate(*expr)) {
+		for (auto &item : select) {
+			if (ContainsAggregate(*item.expr)) {
 				return true;
 			}
 		}
@@ -176,7 +178,7 @@ private:
 		}
 		vector<unique_ptr<ParsedExpression>> result;
 		for (idx_t i = 0; i < select.size(); i++) {
-			auto expr = Replace(*select[i], false);
+			auto expr = Replace(*select[i].expr, false);
 			expr->SetAlias(Identifier(OutputName(i)));
 			result.push_back(std::move(expr));
 		}
@@ -187,9 +189,9 @@ private:
 	//! the outer query over the fact columns
 	vector<unique_ptr<ParsedExpression>> FactSelect() {
 		for (idx_t i = 0; i < select.size(); i++) {
-			if (!window_items[i]) {
-				CheckNotMetric(*select[i]);
-				AddItem(SemanticMemberKind::FACT, WithoutAlias(*select[i]), FactColumn(i));
+			if (!select[i].has_window) {
+				CheckNotMetric(*select[i].expr);
+				AddItem(SemanticMemberKind::FACT, WithoutAlias(*select[i].expr), FactColumn(i));
 			}
 		}
 		vector<unique_ptr<ParsedExpression>> result;
@@ -202,16 +204,16 @@ private:
 
 	//! The fact column of select item `index`, or its window expression over fact columns
 	unique_ptr<ParsedExpression> SelectedFact(idx_t index) {
-		if (!window_items[index]) {
+		if (!select[index].has_window) {
 			return ColumnRef(FactColumn(index));
 		}
 		if (expanding_windows.count(index)) {
 			throw BinderException("Window function alias \"%s\" cannot be referenced in its own definition when "
 			                      "querying semantic view \"%s\" by name",
-			                      select_aliases[index], model.Name().name);
+			                      select[index].alias, model.Name().name);
 		}
 		expanding_windows.insert(index);
-		auto result = MapToFacts(*WithoutAlias(*select[index]));
+		auto result = MapToFacts(*WithoutAlias(*select[index].expr));
 		expanding_windows.erase(index);
 		return result;
 	}
@@ -265,25 +267,24 @@ private:
 		return result;
 	}
 
-	//! Windows are evaluated by the outer query, so not in clauses evaluated before them
-	void CheckNoWindow(const ParsedExpression &expr, const string &clause) {
+	//! Windows are evaluated by the outer query, so not in clauses evaluated before them; `hint` follows the error
+	void CheckNoWindow(const ParsedExpression &expr, const string &clause, const string &hint = string()) {
 		if (SemanticAnalyzer::ContainsWindow(expr)) {
 			throw BinderException("Window functions are not allowed in %s when querying semantic view \"%s\" by name%s",
-			                      clause, model.Name().name, clause == "HAVING" ? "; use QUALIFY" : "");
+			                      clause, model.Name().name, hint);
 		}
 	}
 
 	//! AGG(...) and time_shift / cumulative calls are metric items, not window functions: windows apply to them
 	void CheckWindowFunctions(const ParsedExpression &expr) {
-		if (expr.GetExpressionClass() == ExpressionClass::WINDOW) {
-			auto &window = expr.Cast<WindowExpression>();
-			FunctionExpression call(window.GetQualifiedName(), vector<unique_ptr<ParsedExpression>>());
-			if (IsAggCall(call) || IsTransformCall(call)) {
-				auto name = IsAggCall(call) ? string("AGG") : window.FunctionName().GetIdentifierName();
-				throw BinderException("%s() cannot be used as a window function when querying semantic view \"%s\" "
-				                      "by name; apply the window to it instead, as in SUM(%s(...)) OVER (...)",
-				                      name, model.Name().name, name);
-			}
+		auto form = SemanticQueryFormOf(expr);
+		if (expr.GetExpressionClass() == ExpressionClass::WINDOW && form != SemanticQueryForm::NONE) {
+			auto name = form == SemanticQueryForm::AGG
+			                ? string("AGG")
+			                : expr.Cast<WindowExpression>().FunctionName().GetIdentifierName();
+			throw BinderException("%s() cannot be used as a window function when querying semantic view \"%s\" "
+			                      "by name; apply the window to it instead, as in SUM(%s(...)) OVER (...)",
+			                      name, model.Name().name, name);
 		}
 		ParsedExpressionIterator::EnumerateChildren(
 		    expr, [&](const ParsedExpression &child) { CheckWindowFunctions(child); });
@@ -351,21 +352,12 @@ private:
 		                    ignored);
 	}
 
-	static bool IsAggCall(const ParsedExpression &expr) {
-		return expr.GetExpressionClass() == ExpressionClass::FUNCTION &&
-		       StringUtil::CIEquals(expr.Cast<FunctionExpression>().FunctionName().GetIdentifierName(), "agg");
-	}
-
-	static bool IsTransformCall(const ParsedExpression &expr) {
-		return SemanticFindTransformCall(expr).get() == &expr;
-	}
-
-	//! AGG(...), an aggregate function, or a time_shift / cumulative call: the boundary of one metric item
+	//! AGG(...), a time_shift / cumulative call, or an aggregate function: the boundary of one metric item
 	bool IsAggregateCall(const ParsedExpression &expr) {
 		if (expr.GetExpressionClass() != ExpressionClass::FUNCTION) {
 			return false;
 		}
-		return IsAggCall(expr) || IsTransformCall(expr) || analyzer.IsAggregate(expr);
+		return SemanticQueryFormOf(expr) != SemanticQueryForm::NONE || analyzer.IsAggregate(expr);
 	}
 
 	bool ContainsAggregate(const ParsedExpression &expr) {
@@ -389,7 +381,7 @@ private:
 					                      "should be between 1 and %d",
 					                      select.size());
 				}
-				return WithoutAlias(*select[NumericCast<idx_t>(index - 1)]);
+				return WithoutAlias(*select[NumericCast<idx_t>(index - 1)].expr);
 			}
 		}
 		return ResolveAlias(*normalized);
@@ -402,7 +394,7 @@ private:
 			if (!colref.IsQualified() && !HasInputName(colref.GetColumnName().GetIdentifierName())) {
 				auto alias = OutputAlias(expr);
 				if (alias.IsValid()) {
-					return WithoutAlias(*select[alias.GetIndex()]);
+					return WithoutAlias(*select[alias.GetIndex()].expr);
 				}
 			}
 		}
@@ -427,9 +419,9 @@ private:
 		}
 		auto &colref = expr.Cast<ColumnRefExpression>();
 		if (!colref.IsQualified()) {
-			for (idx_t i = select_aliases.size(); i > 0; i--) {
-				if (!select_aliases[i - 1].empty() &&
-				    StringUtil::CIEquals(select_aliases[i - 1], colref.GetColumnName().GetIdentifierName())) {
+			for (idx_t i = select.size(); i > 0; i--) {
+				auto &alias = select[i - 1].alias;
+				if (!alias.empty() && StringUtil::CIEquals(alias, colref.GetColumnName().GetIdentifierName())) {
 					return i - 1;
 				}
 			}
@@ -456,79 +448,39 @@ private:
 		item.kind = kind;
 		item.expression = std::move(expr);
 		item.alias = column;
+		// errors name the item as written, not by its internal alias
+		item.display_name = item.expression->ToString();
 		query.items.push_back(std::move(item));
 	}
 
-	//! The metric item of an AGG(<metric>) call: its metric, or the call itself with a FILTER, which the semantic query
-	//! resolves like a metric defined with that FILTER
-	unique_ptr<ParsedExpression> AggMetric(const FunctionExpression &function) {
-		// a named argument (`name := value`) may be stored as the value's alias
-		if (ArgumentCount(function) != 1 || function.GetArguments()[0].HasName() ||
-		    !Argument(function, 0).GetAlias().empty() || function.Distinct() ||
-		    (function.OrderBy() && !function.OrderBy()->orders.empty()) || function.ExportState() ||
-		    SemanticFindTransformCall(Argument(function, 0))) {
-			throw BinderException("AGG() takes exactly one metric");
-		}
-		if (SemanticAnalyzer::ContainsWindow(Argument(function, 0))) {
-			throw BinderException("AGG() takes a metric, not a window function; apply the window to it instead, as in "
-			                      "SUM(AGG(...)) OVER (...)");
-		}
-		auto metric = WithoutAlias(Argument(function, 0));
-		SemanticResolveContext resolve_context;
-		resolve_context.allow_private = false;
-		resolve_context.what = "AGG(" + metric->ToString() + ")";
-		auto resolved = model.Resolve(*metric, resolve_context);
-		if (!analyzer.ContainsAggregateOrMetric(*resolved)) {
-			throw BinderException("AGG() requires a metric; \"%s\" is not a metric", metric->ToString());
-		}
-		return function.Filter() ? WithoutAlias(function) : std::move(metric);
-	}
-
-	//! Replaces the AGG(<metric>) calls in `expr` by their metric item; ad-hoc aggregates are kept, bare metrics
-	//! rejected
-	void UnwrapAggCalls(unique_ptr<ParsedExpression> &expr) {
-		if (IsAggCall(*expr)) {
-			auto alias = expr->GetAlias();
-			expr = AggMetric(expr->Cast<FunctionExpression>());
-			expr->SetAlias(alias);
+	//! Rejects bare metric references outside AGG(...) and aggregate calls, in the metric of a time_shift / cumulative
+	//! call too (its other arguments are an interval and named options)
+	void CheckMetricsWrapped(const ParsedExpression &expr) {
+		if (expr.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+			CheckNotMetric(expr);
 			return;
 		}
-		if (analyzer.IsAggregate(*expr)) {
+		auto form = SemanticQueryFormOf(expr);
+		if (expr.GetExpressionClass() == ExpressionClass::FUNCTION &&
+		    (form == SemanticQueryForm::AGG || analyzer.IsAggregate(expr))) {
 			return;
 		}
-		if (expr->GetExpressionClass() == ExpressionClass::COLUMN_REF) {
-			CheckNotMetric(*expr);
-			return;
-		}
-		ParsedExpressionIterator::EnumerateChildren(
-		    *expr, [&](unique_ptr<ParsedExpression> &child) { UnwrapAggCalls(child); });
-	}
-
-	//! A time_shift / cumulative call as one metric item: the AGG() calls of its metric (the first positional
-	//! argument) are unwrapped; the other arguments, named ones included, are kept as written so that they resolve in
-	//! the semantic query
-	unique_ptr<ParsedExpression> TransformMetric(const ParsedExpression &call) {
-		auto result = WithoutAlias(call);
-		for (auto &argument : result->Cast<FunctionExpression>().GetArgumentsMutable()) {
-			auto &expr = argument.GetExpressionMutable();
-			if (!argument.HasName() && expr->GetAlias().empty()) {
-				UnwrapAggCalls(expr);
-				break;
+		if (expr.GetExpressionClass() == ExpressionClass::FUNCTION && form != SemanticQueryForm::NONE) {
+			auto metric = SemanticTransformMetricArgument(expr.Cast<FunctionExpression>());
+			if (metric) {
+				CheckMetricsWrapped(*metric);
 			}
+			return;
 		}
-		return result;
+		ParsedExpressionIterator::EnumerateChildren(expr,
+		                                            [&](const ParsedExpression &child) { CheckMetricsWrapped(child); });
 	}
 
-	//! Registers the metric item for an aggregate or transform call (deduplicated) and returns its column
-	string MetricFor(const ParsedExpression &aggregate) {
-		unique_ptr<ParsedExpression> metric;
-		if (IsAggCall(aggregate)) {
-			metric = AggMetric(aggregate.Cast<FunctionExpression>());
-		} else if (IsTransformCall(aggregate)) {
-			metric = TransformMetric(aggregate);
-		} else {
-			metric = WithoutAlias(aggregate);
-		}
+	//! Registers the metric item of an AGG(...), time_shift / cumulative or aggregate call (deduplicated) and returns
+	//! its column. The call is kept as written: the semantic query resolves and validates it (semantic_transforms.hpp).
+	string MetricFor(const ParsedExpression &call) {
+		CheckMetricsWrapped(call);
+		auto metric = WithoutAlias(call);
 		for (idx_t m = 0; m < metrics.size(); m++) {
 			if (metrics[m]->Equals(*metric)) {
 				return MetricColumn(m);
@@ -544,7 +496,7 @@ private:
 	                                     bool top_level_alias = false) {
 		auto alias = top_level_alias ? OutputAlias(expr) : optional_idx();
 		if (alias.IsValid()) {
-			return Replace(*select[alias.GetIndex()], false);
+			return Replace(*select[alias.GetIndex()].expr, false);
 		}
 		for (idx_t g = 0; g < groups.size(); g++) {
 			if (groups[g]->Equals(expr)) {
@@ -557,10 +509,8 @@ private:
 		if (expr.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
 			auto &colref = expr.Cast<ColumnRefExpression>();
 			if (allow_aliases && !colref.IsQualified() && !HasInputName(colref.GetColumnName().GetIdentifierName())) {
-				for (auto &alias : select_aliases) {
-					if (!alias.empty() && StringUtil::CIEquals(alias, colref.GetColumnName().GetIdentifierName())) {
-						return expr.Copy();
-					}
+				if (OutputAlias(expr).IsValid()) {
+					return expr.Copy();
 				}
 			}
 			CheckNotMetric(expr);
@@ -587,7 +537,7 @@ private:
 			return SelectedFact(alias.GetIndex());
 		}
 		for (idx_t i = 0; i < select.size(); i++) {
-			if (!window_items[i] && select[i]->Equals(expr)) {
+			if (!select[i].has_window && select[i].expr->Equals(expr)) {
 				return make_uniq<ColumnRefExpression>(Identifier(FactColumn(i)));
 			}
 		}
@@ -623,23 +573,31 @@ private:
 	}
 
 	string OutputName(idx_t index) {
-		if (!select_aliases[index].empty()) {
-			return select_aliases[index];
+		auto &item = select[index];
+		if (!item.alias.empty()) {
+			return item.alias;
 		}
-		if (select[index]->GetExpressionClass() == ExpressionClass::COLUMN_REF) {
-			return select[index]->Cast<ColumnRefExpression>().GetColumnName().GetIdentifierName();
+		if (item.expr->GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+			return item.expr->Cast<ColumnRefExpression>().GetColumnName().GetIdentifierName();
 		}
-		return original_text[index];
+		return item.text;
 	}
 
 	const SemanticModel &model;
 	SemanticAnalyzer analyzer;
 	const BaseTableRef &ref;
-	vector<unique_ptr<ParsedExpression>> select;
-	vector<string> select_aliases;
-	vector<string> original_text;
-	//! Whether each select item contains a window function
-	vector<bool> window_items;
+	//! A select list item
+	struct SelectItem {
+		//! Normalized, with its alias
+		unique_ptr<ParsedExpression> expr;
+		string alias;
+		//! As written
+		string text;
+		//! Whether it contains a window function (evaluated by the outer query)
+		bool has_window = false;
+	};
+
+	vector<SelectItem> select;
 	//! The window items being mapped to fact columns, to reject an alias referenced in its own definition
 	set<idx_t> expanding_windows;
 	unique_ptr<ParsedExpression> having;

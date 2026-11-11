@@ -201,6 +201,14 @@ struct SemanticMember {
 	bool IsRowLevel() const {
 		return Kind() != SemanticMemberKind::METRIC;
 	}
+	//! "OFFSET", "CUMULATIVE" or "NON ADDITIVE BY" when the metric uses that clause, or nullptr: CUMULATIVE metrics
+	//! and cumulative() calls build on metrics without them
+	const char *TimeClause() const {
+		return offset.IsValid()        ? "OFFSET"
+		       : cumulative.IsValid()  ? "CUMULATIVE"
+		       : !non_additive.empty() ? "NON ADDITIVE BY"
+		                               : nullptr;
+	}
 };
 
 //! Name-resolution context of an expression

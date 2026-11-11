@@ -14,21 +14,31 @@
 #pragma once
 
 #include "duckdb/common/optional_ptr.hpp"
-#include <functional>
 #include "semantic_model.hpp"
 
 namespace duckdb {
 
-class ClientContext;
 class ExtensionLoader;
 class FunctionExpression;
 class SemanticAnalyzer;
-struct SemanticAtom;
+
+//! The OFFSETs, CUMULATIVEs and FILTER conditions a query adds to those of its model. Owned by the resolved query
+//! (SemanticQuerySpec::transforms), whose markers address them; boxed so that references handed out stay valid when
+//! entries are added
+struct SemanticQueryTransforms {
+	vector<unique_ptr<SemanticOffset>> offsets;
+	vector<unique_ptr<SemanticCumulative>> cumulatives;
+	vector<unique_ptr<ParsedExpression>> filters;
+};
 
 class SemanticTransforms {
 public:
-	explicit SemanticTransforms(const SemanticModel &model) : model(model) {
+	explicit SemanticTransforms(const SemanticModel &model)
+	    : model(model), query(make_shared_ptr<SemanticQueryTransforms>()) {
 	}
+
+	//! Reads and adds the query-local entries of `query` from now on: those of the query being resolved or compiled
+	void Bind(shared_ptr<SemanticQueryTransforms> query);
 
 	//! Index < model.offsets.size(): the model's; otherwise query-local
 	const SemanticOffset &Offset(idx_t index) const;
@@ -43,20 +53,13 @@ public:
 	//! The first index (members' FILTERs, then query-local ones) whose condition Equals() that of `index`: filters
 	//! with equal conditions filter the same rows
 	idx_t CanonicalFilter(idx_t index) const;
-	//! For error messages: `metric "<name>"` (a member's FILTER) or `FILTER (WHERE <condition>)` (query-local)
+	//! For error messages: `FILTER of metric "<name>"` (a member's FILTER) or `FILTER (WHERE <condition>)`
+	//! (query-local)
 	string FilterDisplayName(idx_t index) const;
-	//! Copies of the query-local filter conditions, in index order
-	vector<unique_ptr<ParsedExpression>> LocalFilters() const;
-	//! Registers the query-local filter conditions of another store (LocalFilters()), so that the same indices address
-	//! them: this store's must be a prefix of them
-	void RegisterFilters(const vector<unique_ptr<ParsedExpression>> &conditions);
 
 private:
 	const SemanticModel &model;
-	//! Boxed so that references handed out stay valid when entries are added
-	vector<unique_ptr<SemanticOffset>> offsets;
-	vector<unique_ptr<SemanticCumulative>> cumulatives;
-	vector<unique_ptr<ParsedExpression>> filters;
+	shared_ptr<SemanticQueryTransforms> query;
 };
 
 //! The error of a metric FILTER that is not row-level, after "<what>: "
@@ -65,49 +68,36 @@ static constexpr const char *SEMANTIC_ROW_LEVEL_FILTER_ERROR =
 //! Whether a resolved FILTER condition is row-level: no aggregate, metric, window function, AGG() or transform call
 bool SemanticIsRowLevelCondition(SemanticAnalyzer &analyzer, const ParsedExpression &condition);
 
-//! Whether `expr` is a constant: no column, member, aggregate, window or parameter
-bool SemanticIsConstant(SemanticAnalyzer &analyzer, const ParsedExpression &expr);
-//! Binds SELECT <expr>; the binder's error message, or empty (then `type`, if given, receives the expression's type)
-string SemanticBindError(ClientContext &context, unique_ptr<ParsedExpression> expr,
-                         optional_ptr<LogicalType> type = nullptr);
-//! Validated offset of dimension member `dimension` (defined as a column); throws SemanticDefinitionException
-//! "<what>: ..." with today's messages
-SemanticOffset SemanticMakeOffset(ClientContext &context, SemanticAnalyzer &analyzer, const SemanticModel &model,
-                                  idx_t dimension, const ParsedExpression &interval, const string &what);
+//! Validated offset of dimension member `dimension` (defined as a column) of the analyzer's model; throws
+//! SemanticDefinitionException "<what>: ..."
+SemanticOffset SemanticMakeOffset(SemanticAnalyzer &analyzer, idx_t dimension, const ParsedExpression &interval,
+                                  const string &what);
 //! Validated cumulative of dimension member `dimension` (defined as a column); `window` null unless kind WINDOW,
-//! `part` (lower case) empty unless GRAIN; throws SemanticDefinitionException "<what>: ..." with today's messages
-SemanticCumulative SemanticMakeCumulative(ClientContext &context, SemanticAnalyzer &analyzer,
-                                          const SemanticModel &model, idx_t dimension, const ParsedExpression *window,
+//! `part` (lower case) empty unless GRAIN; throws SemanticDefinitionException "<what>: ..."
+SemanticCumulative SemanticMakeCumulative(SemanticAnalyzer &analyzer, idx_t dimension, const ParsedExpression *window,
                                           const string &part, SemanticCumulativePeriod period, const string &what);
+
+//! The query-time forms of a semantic query: AGG(<metric>), time_shift(...) and cumulative(...)
+enum class SemanticQueryForm : uint8_t { NONE, AGG, TIME_SHIFT, CUMULATIVE };
+//! The query-time form `expr` calls, unqualified, as a function or a window function; NONE otherwise
+SemanticQueryForm SemanticQueryFormOf(const ParsedExpression &expr);
 
 //! The first unqualified time_shift / cumulative call in `expr`, or nullptr
 optional_ptr<const FunctionExpression> SemanticFindTransformCall(const ParsedExpression &expr);
+//! The metric a time_shift / cumulative call applies to: its first positional argument, or nullptr
+optional_ptr<const ParsedExpression> SemanticTransformMetricArgument(const FunctionExpression &call);
 //! Whether `expr` contains an unqualified AGG(...) call, or AGG(...) OVER (...)
 bool SemanticContainsAggCall(const ParsedExpression &expr);
 //! A resolved expression as the user could have written it: markers replaced by the names they stand for
 unique_ptr<ParsedExpression> SemanticDisplayExpression(const SemanticModel &model, const ParsedExpression &expr);
 
-//! A call's arguments: unaliased ones in order, aliased ones (`name := value`) by name. Throws when the number of
-//! positional arguments differs from `positional`, or a name is unknown or repeated, listing the signature.
-struct SemanticTransformArguments {
-	vector<const ParsedExpression *> positional;
-	case_insensitive_map_t<const ParsedExpression *> named;
-};
-SemanticTransformArguments SemanticSplitTransformArguments(const FunctionExpression &call, idx_t positional,
-                                                           const vector<string> &names, const string &what);
-//! The dimension member of `dimension := ...`, or metric_time.day when absent and the view has TIME; throws
-//! otherwise, listing the valid dimensions: column-defined, reachable from every atom and `usable` by the call
-idx_t SemanticTransformDimension(const SemanticModel &model, optional_ptr<const ParsedExpression> argument,
-                                 const vector<SemanticAtom> &atoms, const std::function<bool(idx_t)> &usable,
-                                 const string &what);
 //! Checks the time_shift / cumulative calls of an unresolved METRICS item for errors that resolution would hide (an
 //! unquoted period / to_date value fails as an unknown column)
 void SemanticCheckUnresolvedTransforms(const ParsedExpression &expr, const string &what);
 //! Replaces the time_shift / cumulative calls of a resolved METRICS item by markers (validated, stored in
 //! analyzer.Transforms()), and its AGG(<metric>) calls by their metric (with FILTER (WHERE ...): by a filter marker);
 //! throws for calls in other positions
-unique_ptr<ParsedExpression> SemanticResolveTransforms(ClientContext &context, SemanticAnalyzer &analyzer,
-                                                       const SemanticModel &model,
+unique_ptr<ParsedExpression> SemanticResolveTransforms(SemanticAnalyzer &analyzer,
                                                        unique_ptr<ParsedExpression> resolved, SemanticMemberKind kind,
                                                        const string &what);
 

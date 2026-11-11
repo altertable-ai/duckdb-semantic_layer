@@ -113,6 +113,9 @@ public:
 	ClientContext &Context() const {
 		return context;
 	}
+	const SemanticModel &Model() const {
+		return model;
+	}
 	//! The OFFSETs, CUMULATIVEs and FILTERs of the query: the model's, plus those the query adds
 	SemanticTransforms &Transforms() {
 		return transforms;

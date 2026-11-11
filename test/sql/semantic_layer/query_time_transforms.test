@@ -1066,11 +1066,27 @@ SELECT (SELECT count(*) FROM (
 ----
 true
 
-# AGG() takes a metric, not a transform call
+# AGG() takes a metric, not a transform call, in both query forms
 statement error
 SELECT metric_time.month, AGG(time_shift(revenue, INTERVAL 1 YEAR)) FROM ledger GROUP BY metric_time.month;
 ----
-AGG() takes exactly one metric
+AGG() takes exactly one metric, not a time_shift() call
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month METRICS AGG(cumulative(revenue)) AS x);
+----
+<REGEX>:.*Invalid metric "x": AGG\(\) takes exactly one metric, not a cumulative\(\) call.*
+
+# AGG() is recognized unqualified only, in both query forms
+statement error
+SELECT metric_time.month, main.agg(revenue) FROM ledger GROUP BY metric_time.month;
+----
+Metric "revenue" must be used with AGG()
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month METRICS main.agg(revenue) AS x);
+----
+Scalar Function with name agg does not exist
 
 # a metric inside a transform call needs AGG() too
 statement error
