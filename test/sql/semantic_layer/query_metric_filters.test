@@ -421,6 +421,28 @@ ORDER BY AGG(revenue) FILTER (WHERE account.segment = 'enterprise') DESC;
 FR	3550
 DE	1500
 
+# a semi-additive metric filters its rows like the query's WHERE (as its metric FILTER does): a group without
+# matching rows disappears when no other metric produces it
+query II
+SELECT country, AGG(balance) FILTER (WHERE segment = 'enterprise') FROM ledger GROUP BY country ORDER BY country;
+----
+DE	800
+FR	1200
+
+query II
+SELECT country, AGG(enterprise_balance) FROM ledger GROUP BY country ORDER BY country;
+----
+DE	800
+FR	1200
+
+query III
+SELECT country, AGG(balance) FILTER (WHERE segment = 'enterprise'), AGG(balance) FROM ledger GROUP BY country
+ORDER BY country;
+----
+DE	800	800
+FR	1200	1200
+US	NULL	450
+
 # the same metric with and without FILTER, or with different conditions, are distinct items
 query IIII
 SELECT country, AGG(revenue), AGG(revenue) FILTER (WHERE account.segment = 'enterprise'),
