@@ -402,3 +402,37 @@ CREATE SEMANTIC VIEW bad TABLES (invoices PRIMARY KEY (invoice_id) TIME (invoice
   METRICS (invoices.revenue AS SUM(amount), invoices.x AS cumulative(revenue));
 ----
 <REGEX>:.*cumulative\(\) is only allowed in queries.*CUMULATIVE.*
+
+# the internal transform markers cannot be written
+statement error
+SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month METRICS __sv_offset(0, revenue) AS x);
+----
+function "__sv_offset" is reserved for internal use
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month METRICS __sv_offset(99, revenue) AS x);
+----
+function "__sv_offset" is reserved for internal use
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month METRICS "__SV_CUMULATIVE"(0, revenue) AS x);
+----
+function "__sv_cumulative" is reserved for internal use
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month METRICS revenue
+  WHERE __sv_offset(0, invoices.amount) > 0);
+----
+function "__sv_offset" is reserved for internal use
+
+statement error
+CREATE SEMANTIC VIEW bad TABLES (invoices PRIMARY KEY (invoice_id) TIME (invoiced_at))
+  METRICS (invoices.revenue AS SUM(amount), invoices.x AS __sv_offset(0, revenue));
+----
+function "__sv_offset" is reserved for internal use
+
+statement error
+CREATE SEMANTIC VIEW bad TABLES (invoices PRIMARY KEY (invoice_id) TIME (invoiced_at))
+  METRICS (invoices.x FILTER (WHERE main.__sv_offset(0, amount) > 0) AS SUM(amount));
+----
+function "__sv_offset" is reserved for internal use

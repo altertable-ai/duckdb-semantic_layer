@@ -6,6 +6,7 @@
 #include "duckdb/common/exception/catalog_exception.hpp"
 #include "duckdb/common/to_string.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/expression/subquery_expression.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
 
@@ -333,6 +334,11 @@ static void ResolveRecursive(const SemanticModel &model, unique_ptr<ParsedExpres
 	}
 	if (expr->GetExpressionClass() == ExpressionClass::STAR) {
 		throw SemanticDefinitionException("%s'*' is not supported here", ErrorPrefix(context));
+	}
+	// markers are only produced after resolution (semantic_transforms.hpp)
+	if (SemanticMarkers::IsTransformMarkerCall(*expr)) {
+		throw SemanticDefinitionException("%sfunction \"%s\" is reserved for internal use", ErrorPrefix(context),
+		                                  expr->Cast<FunctionExpression>().FunctionName().GetIdentifierName());
 	}
 	// subqueries are left untouched (they must be uncorrelated); their IN-operand is resolved
 	ParsedExpressionIterator::EnumerateChildren(

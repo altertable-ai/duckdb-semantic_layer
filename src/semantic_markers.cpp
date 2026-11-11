@@ -91,4 +91,12 @@ SemanticTransformRef SemanticMarkers::ClassifyTransform(const ParsedExpression &
 	return result;
 }
 
+bool SemanticMarkers::IsTransformMarkerCall(const ParsedExpression &expr) {
+	if (expr.GetExpressionClass() != ExpressionClass::FUNCTION) {
+		return false;
+	}
+	auto &name = expr.Cast<FunctionExpression>().FunctionName().GetIdentifierName();
+	return StringUtil::CIEquals(name, OFFSET_MARKER) || StringUtil::CIEquals(name, CUMULATIVE_MARKER);
+}
+
 } // namespace duckdb

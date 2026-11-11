@@ -61,6 +61,8 @@ struct SemanticMarkers {
 	static unique_ptr<ParsedExpression> Transform(SemanticTransformKind kind, idx_t index,
 	                                              unique_ptr<ParsedExpression> argument);
 	static SemanticTransformRef ClassifyTransform(const ParsedExpression &expr);
+	//! Whether `expr` calls a function named like a transform marker (any case or qualification): user input must not
+	static bool IsTransformMarkerCall(const ParsedExpression &expr);
 };
 
 } // namespace duckdb
