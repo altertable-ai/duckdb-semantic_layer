@@ -289,8 +289,9 @@ SELECT ... FROM SEMANTIC_VIEW(
 
 - The result has one column per requested item, in clause order, named after the member (or its alias).
 - `DIMENSIONS` items can be expressions over dimensions and facts (`YEAR(orders.order_date) AS year`). `METRICS` items
-  can be expressions over metrics or ad-hoc aggregates (`COUNT(DISTINCT customers.segment)`). `<table>.*` selects every
-  public member of that kind of a logical table.
+  can be expressions over metrics or ad-hoc aggregates (`COUNT(DISTINCT customers.segment)`), and can filter a metric
+  with [`AGG(<metric>) FILTER (WHERE ...)`](#metric-filters-filter). `<table>.*` selects every public member of that
+  kind of a logical table.
 - `WHERE` filters rows before aggregation. It may reference dimensions and facts (not metrics) and uncorrelated
   subqueries.
 - `FACTS` returns row-level values (grouped by `DIMENSIONS` when both are given). `FACTS` and `METRICS` cannot be
@@ -316,7 +317,9 @@ ORDER BY 2 DESC;
 In this form:
 
 - `GROUP BY` expressions become dimensions.
-- Metrics are wrapped in `AGG(...)`; other aggregate functions over dimensions or facts are ad-hoc metrics.
+- Metrics are wrapped in `AGG(...)`, which takes a metric or an expression over metrics and ad-hoc aggregates
+  (`AGG(lines.revenue + 1)`); other aggregate functions over dimensions or facts are ad-hoc metrics.
+  `AGG(<metric>) FILTER (WHERE ...)` filters a metric at query time, like a [metric `FILTER`](#metric-filters-filter).
 - `WHERE` filters before aggregation, `HAVING` after.
 - Without aggregation, the select list is evaluated as facts, row by row.
 - Names can be bare, qualified (`customers.segment`) or quoted as BI tools write them (`"customers.segment"`).
@@ -383,14 +386,15 @@ GROUP BY metric_time.month;
   required. It must be a dimension defined as a column of its table; the error lists the valid ones.
   `trailing_window` and `to_date` are mutually exclusive, and `period` defaults to `'last'`.
 - **Where:** in `METRICS` (and, by name, in the select list, `HAVING`, `QUALIFY` and `ORDER BY` expressions over
-  metrics). They are rejected in `DIMENSIONS`, `FACTS`, `WHERE`, inside an aggregate's argument (`AGG(time_shift(...))`
-  too), and in `CREATE SEMANTIC VIEW` definitions. `time_shift(cumulative(...))` is allowed; `cumulative()` cannot wrap another
-  transform or a metric that uses `OFFSET`, `CUMULATIVE` or `NON ADDITIVE BY`, and `period := 'average'` needs a
-  metric computed from a single aggregate. A window function can wrap a transform but not appear inside its metric
-  argument. Only unqualified calls are transforms (`main.time_shift(...)` is not).
+  metrics). They are rejected in `DIMENSIONS`, `FACTS`, `WHERE`, inside an aggregate's argument
+  (`AGG(time_shift(...))` too), and in `CREATE SEMANTIC VIEW` definitions. `time_shift(cumulative(...))` is allowed;
+  `cumulative()` cannot wrap another transform or a metric that uses `OFFSET`, `CUMULATIVE` or `NON ADDITIVE BY`, and
+  `period := 'average'` needs a metric computed from a single aggregate. A window function can wrap a transform but
+  not appear inside its metric argument. Only unqualified calls are transforms (`main.time_shift(...)` is not).
 - **Arguments** are checked as in the DDL: `trailing_window` takes what `OVER` takes for the dimension's type (an
   interval, or a number for a numeric column). `FILTER`, `DISTINCT` and `ORDER BY` go on the aggregate inside the call
-  (`time_shift(SUM(x) FILTER (WHERE ...), ...)`), not on the call itself.
+  (`time_shift(SUM(x) FILTER (WHERE ...), ...)`, or a [metric filter](#metric-filters-filter):
+  `time_shift(AGG(m) FILTER (WHERE ...), ...)`), not on the call itself.
 - Query-time transforms cannot be [materialized](#materializations); in a query that mixes them with plain metrics, the
   plain metrics still read the materializations.
 - `duckdb_functions()` lists both functions with their parameter names, a description and examples. They are never
@@ -466,6 +470,37 @@ metrics it references (here both the revenue and the cost). Filters of nested me
 is row-level (dimensions, facts and columns), and every table it reads must be reachable from the table of each
 aggregate it applies to. A filtered metric is an ordinary aggregate with a `FILTER` clause, so it can be materialized.
 For semi-additive metrics, the filter applies before the last snapshot is picked, like a query's `WHERE`.
+
+**At query time**, `AGG(<metric>) FILTER (WHERE <condition>)` filters a metric without defining one, in both query
+forms:
+
+```sql
+-- SEMANTIC_VIEW(...): AGG(<metric>) is the metric, FILTER filters it
+SELECT * FROM SEMANTIC_VIEW(finance
+  DIMENSIONS metric_time.month
+  METRICS margin, AGG(margin) FILTER (WHERE accounts.segment = 'enterprise') AS enterprise_margin);
+
+-- by name
+SELECT customers.segment,
+       AGG(margin) FILTER (WHERE accounts.segment = 'enterprise') AS enterprise_margin
+FROM finance
+GROUP BY customers.segment;
+
+-- composes with the query-time transforms
+time_shift(AGG(margin) FILTER (WHERE accounts.segment = 'enterprise'), INTERVAL 1 YEAR)
+```
+
+It computes exactly what the metric `FILTER` computes: the condition is `AND`-ed into every aggregate the metric is
+computed from, nested metrics included (for `margin` above, into all three aggregates), combined with the filters of
+nested metrics. For semi-additive metrics it filters the rows before the last snapshot is picked. It is row-level
+(dimensions, facts and columns; no aggregates, metrics or windows), and every table it reads must be reachable from
+each aggregate's table. It reads stored values (not shifted by `OFFSET` / `time_shift`). Unlike the query's `WHERE`,
+it does not remove groups or cumulative anchors: a filtered metric is 0 / NULL where nothing matches. `AGG(...)`
+without `FILTER` is the metric itself; `AGG()` does not take `DISTINCT`, `ORDER BY` or more than one argument, and is
+not a window function (`SUM(AGG(m) FILTER (WHERE ...)) OVER (...)`). Ad-hoc aggregates keep their own `FILTER`
+(`SUM(amount) FILTER (WHERE ...)`). A query-time filtered metric reads, and can be stored in, a
+[materialization](#materializations) like the equivalent filtered metric:
+`ADD MATERIALIZATION ... METRICS AGG(revenue) FILTER (WHERE accounts.segment = 'enterprise') AS enterprise_revenue`.
 
 ### Time spine (`TIME`)
 
@@ -837,8 +872,8 @@ SERVICE`, `AI_SQL_GENERATION`, `AI_QUESTION_CATEGORIZATION`, `AI_VERIFIED_QUERIE
 - Metric `FILTER (WHERE ...)`, `OFFSET (<dimension> BY <interval>)` and `CUMULATIVE (...)` clauses, and the built-in
   time spine (`TIME (<column>)`, logical table `metric_time`) are extensions, modeled on
   [dbt MetricFlow](https://docs.getdbt.com/docs/build/about-metricflow)'s time spine, cumulative metrics and offsets;
-  adjacent string literals in DDL are concatenated. The query-time `time_shift()` and `cumulative()` functions are
-  extensions too.
+  adjacent string literals in DDL are concatenated. The query-time `time_shift()` and `cumulative()` functions and
+  `AGG(<metric>) FILTER (WHERE ...)` are extensions too.
 
 ## Contributing
 

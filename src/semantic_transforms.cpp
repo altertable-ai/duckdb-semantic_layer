@@ -10,6 +10,7 @@
 #include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
+#include "duckdb/parser/expression/window_expression.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
@@ -194,6 +195,16 @@ static bool IsAggCall(const ParsedExpression &expr) {
 	auto &call = expr.Cast<FunctionExpression>();
 	return !call.IsOperator() && call.GetQualifiedName().Path().size() == 1 &&
 	       StringUtil::CIEquals(call.FunctionName().GetIdentifierName(), "agg");
+}
+
+//! Whether `expr` is AGG(...) OVER (...) (unqualified)
+static bool IsAggWindow(const ParsedExpression &expr) {
+	if (expr.GetExpressionClass() != ExpressionClass::WINDOW) {
+		return false;
+	}
+	auto &window = expr.Cast<WindowExpression>();
+	return window.GetQualifiedName().Path().size() == 1 &&
+	       StringUtil::CIEquals(window.FunctionName().GetIdentifierName(), "agg");
 }
 
 //! The first AGG(...) call in `expr`, or nullptr
@@ -415,6 +426,11 @@ public:
 			node = IsTimeShift(call) ? TimeShift(call) : Cumulative(call);
 			node->SetAlias(alias);
 			return;
+		}
+		if (IsAggWindow(*node)) {
+			throw SemanticDefinitionException("%s: AGG() cannot be used as a window function; apply the window to it "
+			                                  "instead, as in SUM(AGG(...)) OVER (...)",
+			                                  what);
 		}
 		if (metric && IsAggCall(*node)) {
 			auto alias = node->GetAlias();

@@ -300,6 +300,177 @@ enterprise	0.8633333333333333	0.7666666666666667	0.8633333333333333
 startup	NULL	NULL	NULL
 
 #===--------------------------------------------------------------------===#
+# By name: AGG(<metric>) FILTER (WHERE <condition>) is the same metric item
+#===--------------------------------------------------------------------===#
+
+foreach dimension segment account.country metric_time.month
+
+query I
+SELECT (SELECT count(*) FROM (
+    (SELECT {dimension}, AGG(margin) FILTER (WHERE account.segment = 'enterprise') FROM ledger GROUP BY {dimension}
+     EXCEPT ALL
+     SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS {dimension}
+       METRICS AGG(margin) FILTER (WHERE account.segment = 'enterprise') AS enterprise_margin))
+    UNION ALL
+    (SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS {dimension}
+       METRICS AGG(margin) FILTER (WHERE account.segment = 'enterprise') AS enterprise_margin)
+     EXCEPT ALL
+     SELECT {dimension}, AGG(margin) FILTER (WHERE account.segment = 'enterprise') FROM ledger GROUP BY {dimension})
+  )) = 0
+   AND (SELECT count(m) FROM (SELECT {dimension}, AGG(margin) FILTER (WHERE account.segment = 'enterprise') AS m
+       FROM ledger GROUP BY {dimension})) > 0;
+----
+true
+
+endloop
+
+query II
+SELECT segment, AGG(margin) FILTER (WHERE account.segment = 'enterprise') FROM ledger GROUP BY segment ORDER BY segment;
+----
+enterprise	0.8311111111111111
+startup	NULL
+
+# inside arithmetic
+query I
+SELECT (SELECT count(*) FROM (
+    (SELECT metric_time.month, AGG(margin) FILTER (WHERE account.segment = 'enterprise') * 100 - AGG(cost)
+     FROM ledger GROUP BY metric_time.month
+     EXCEPT ALL
+     SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month METRICS enterprise_margin * 100 - cost AS m))
+    UNION ALL
+    (SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month METRICS enterprise_margin * 100 - cost AS m)
+     EXCEPT ALL
+     SELECT metric_time.month, AGG(margin) FILTER (WHERE account.segment = 'enterprise') * 100 - AGG(cost)
+     FROM ledger GROUP BY metric_time.month)
+  )) = 0
+   AND (SELECT count(m) FROM (SELECT metric_time.month,
+       AGG(margin) FILTER (WHERE account.segment = 'enterprise') * 100 - AGG(cost) AS m
+       FROM ledger GROUP BY metric_time.month)) > 0;
+----
+true
+
+# inside time_shift(): the condition reads the stored rows, the shift moves the dimensions
+query I
+SELECT (SELECT count(*) FROM (
+    (SELECT metric_time.month, time_shift(AGG(margin) FILTER (WHERE account.segment = 'enterprise'), INTERVAL 1 YEAR)
+     FROM ledger GROUP BY metric_time.month
+     EXCEPT ALL
+     SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month METRICS enterprise_margin_ly))
+    UNION ALL
+    (SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month METRICS enterprise_margin_ly)
+     EXCEPT ALL
+     SELECT metric_time.month, time_shift(AGG(margin) FILTER (WHERE account.segment = 'enterprise'), INTERVAL 1 YEAR)
+     FROM ledger GROUP BY metric_time.month)
+  )) = 0
+   AND (SELECT count(m) FROM (SELECT metric_time.month,
+       time_shift(AGG(margin) FILTER (WHERE account.segment = 'enterprise'), INTERVAL 1 YEAR) AS m
+       FROM ledger GROUP BY metric_time.month)) > 0;
+----
+true
+
+# ... and cumulative()
+query III
+SELECT metric_time.year, cumulative(AGG(revenue) FILTER (WHERE account.segment = 'enterprise')) AS running,
+       AGG(enterprise_revenue)
+FROM ledger GROUP BY metric_time.year ORDER BY 1;
+----
+2025-01-01	1400	1400
+2026-01-01	4500	3100
+
+# in HAVING
+query I
+SELECT (SELECT count(*) FROM (
+    (SELECT metric_time.month, AGG(revenue) FROM ledger GROUP BY metric_time.month
+     HAVING AGG(revenue) FILTER (WHERE account.segment = 'enterprise') > 700
+     EXCEPT ALL
+     SELECT month, revenue FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month METRICS revenue, enterprise_revenue)
+     WHERE enterprise_revenue > 700)
+    UNION ALL
+    (SELECT month, revenue FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month METRICS revenue, enterprise_revenue)
+     WHERE enterprise_revenue > 700
+     EXCEPT ALL
+     SELECT metric_time.month, AGG(revenue) FROM ledger GROUP BY metric_time.month
+     HAVING AGG(revenue) FILTER (WHERE account.segment = 'enterprise') > 700)
+  )) = 0
+   AND (SELECT count(*) FROM (SELECT metric_time.month, AGG(revenue) FROM ledger GROUP BY metric_time.month
+       HAVING AGG(revenue) FILTER (WHERE account.segment = 'enterprise') > 700)) = 3;
+----
+true
+
+# in a window, in QUALIFY and in ORDER BY
+query II
+SELECT country, RANK() OVER (ORDER BY AGG(margin) FILTER (WHERE account.segment = 'enterprise') DESC NULLS LAST) AS r
+FROM ledger GROUP BY country ORDER BY country;
+----
+DE	2
+FR	1
+US	3
+
+query II
+SELECT segment, AGG(revenue) FILTER (WHERE account.country = 'FR') / SUM(AGG(revenue)) OVER () AS fr_share
+FROM ledger GROUP BY segment ORDER BY segment;
+----
+enterprise	0.5042016806722689
+startup	0.09243697478991597
+
+query II
+SELECT country, AGG(revenue) FROM ledger GROUP BY ALL
+QUALIFY RANK() OVER (ORDER BY AGG(revenue) FILTER (WHERE account.segment = 'enterprise') DESC NULLS LAST) <= 2
+ORDER BY AGG(revenue) FILTER (WHERE account.segment = 'enterprise') DESC;
+----
+FR	3550
+DE	1500
+
+# the same metric with and without FILTER, or with different conditions, are distinct items
+query IIII
+SELECT country, AGG(revenue), AGG(revenue) FILTER (WHERE account.segment = 'enterprise'),
+       AGG(revenue) FILTER (WHERE account.country = 'FR')
+FROM ledger GROUP BY country ORDER BY country;
+----
+DE	1500	1500	NULL
+FR	3550	3000	3550
+US	900	NULL	NULL
+
+query IIII
+SELECT country, AGG(revenue) FILTER (WHERE account.country = 'FR'),
+       AGG(revenue) FILTER (WHERE account.segment = 'enterprise'), AGG(revenue)
+FROM ledger GROUP BY country ORDER BY country;
+----
+DE	NULL	1500	1500
+FR	3550	3000	3550
+US	NULL	NULL	900
+
+# ... equal ones share one item
+query II
+SELECT contains(sql, '__sv_m1'), contains(sql, '__sv_m2') FROM semantic_view_sql('SELECT country,
+    AGG(revenue) FILTER (WHERE account.segment = ''enterprise'') AS a,
+    AGG(revenue) FILTER (WHERE account.segment = ''enterprise'') + 1 AS b, AGG(revenue) AS c
+  FROM ledger GROUP BY country');
+----
+true	false
+
+# an ad-hoc aggregate keeps its native FILTER
+query III
+SELECT country, AGG(revenue) FILTER (WHERE account.segment = 'enterprise'),
+       SUM(invoices.amount) FILTER (WHERE account.segment = 'enterprise')
+FROM ledger GROUP BY country ORDER BY country;
+----
+DE	1500	1500
+FR	3000	3000
+US	NULL	NULL
+
+# the condition's names are resolved like the rest of the query: view-qualified, bare or quoted
+query IIII
+SELECT l.country, AGG(revenue) FILTER (WHERE l.segment = 'enterprise'),
+       AGG(revenue) FILTER (WHERE l.account.segment = 'enterprise'),
+       AGG(revenue) FILTER (WHERE "account.segment" = 'enterprise')
+FROM ledger AS l GROUP BY l.country ORDER BY 1;
+----
+DE	1500	1500	1500
+FR	3000	3000	3000
+US	NULL	NULL	NULL
+
+#===--------------------------------------------------------------------===#
 # Errors
 #===--------------------------------------------------------------------===#
 
@@ -386,6 +557,64 @@ SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month METRICS __sv_fil
 ----
 function "__sv_filter" is reserved for internal use
 
+# AGG() is not a window function, with or without FILTER
+statement error
+SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS account.country
+  METRICS AGG(margin) FILTER (WHERE account.segment = 'enterprise') OVER () AS x);
+----
+<REGEX>:.*Invalid metric "x": AGG\(\) cannot be used as a window function; apply the window to it instead, as in SUM\(AGG\(\.\.\.\)\) OVER \(\.\.\.\).*
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS account.country METRICS AGG(margin) OVER () AS x);
+----
+AGG() cannot be used as a window function
+
+# by name
+statement error
+SELECT country, AGG(margin) FILTER (WHERE account.segment = 'enterprise') OVER () FROM ledger GROUP BY country;
+----
+AGG() cannot be used as a window function when querying semantic view "ledger" by name
+
+statement error
+SELECT country, AGG(DISTINCT margin) FILTER (WHERE account.segment = 'enterprise') FROM ledger GROUP BY country;
+----
+AGG() takes exactly one metric
+
+statement error
+SELECT country, AGG(margin, cost) FILTER (WHERE account.segment = 'enterprise') FROM ledger GROUP BY country;
+----
+AGG() takes exactly one metric
+
+statement error
+SELECT country, AGG(margin ORDER BY cost) FROM ledger GROUP BY country;
+----
+AGG() takes exactly one metric
+
+statement error
+SELECT country, AGG(m := margin) FROM ledger GROUP BY country;
+----
+AGG() takes exactly one metric
+
+statement error
+SELECT country, AGG(account.segment) FILTER (WHERE account.segment = 'enterprise') FROM ledger GROUP BY country;
+----
+AGG() requires a metric; "account.segment" is not a metric
+
+statement error
+SELECT country, AGG(revenue) FILTER (WHERE AGG(cost) > 0) FROM ledger GROUP BY country;
+----
+FILTER must be a row-level condition
+
+statement error
+SELECT country, AGG(margin) FILTER (WHERE invoices.amount > 500) FROM ledger GROUP BY country;
+----
+references logical table "invoices", which is not reachable from "costs"
+
+statement error
+SELECT country, time_shift(AGG(revenue) FILTER (WHERE AGG(cost) > 0), INTERVAL 1 YEAR) FROM ledger GROUP BY country;
+----
+FILTER must be a row-level condition
+
 #===--------------------------------------------------------------------===#
 # Materializations
 #===--------------------------------------------------------------------===#
@@ -423,3 +652,78 @@ ORDER BY country;
 DE	1500	1500
 FR	3000	3000
 US	NULL	NULL
+
+# by name
+query I
+SELECT sql ILIKE '%ledger__enterprise__0%' FROM semantic_view_sql('SELECT country,
+    AGG(revenue) FILTER (WHERE account.segment = ''enterprise'') FROM ledger GROUP BY country');
+----
+true
+
+query II
+SELECT country, AGG(revenue) FILTER (WHERE account.segment = 'enterprise') FROM ledger GROUP BY country
+ORDER BY country;
+----
+DE	1500
+FR	3000
+US	NULL
+
+# a monthly materialization of the query-time filtered metric serves the metric defined with that FILTER
+statement ok
+ALTER SEMANTIC VIEW ledger ADD MATERIALIZATION mf AS
+  DIMENSIONS metric_time.month METRICS AGG(revenue) FILTER (WHERE account.segment = 'enterprise') AS er;
+
+query II
+SELECT metrics, usable FROM (SHOW SEMANTIC MATERIALIZATIONS LIKE 'mf' IN ledger);
+----
+[er]	true
+
+query III
+SELECT
+  (SELECT sql ILIKE '%__semantic_materializations%ledger__mf__0%' FROM semantic_view_sql('SELECT * FROM
+     SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month METRICS enterprise_revenue)')),
+  (SELECT sql ILIKE '%__semantic_materializations%ledger__mf__0%' FROM semantic_view_sql('SELECT metric_time.month,
+     AGG(revenue) FILTER (WHERE account.segment = ''enterprise'') FROM ledger GROUP BY metric_time.month')),
+  (SELECT sql ILIKE '%__semantic_materializations%' FROM semantic_view_sql('SELECT * FROM
+     SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month METRICS revenue)'));
+----
+true	true	false
+
+statement ok
+CREATE TEMP TABLE from_materialization AS
+SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month METRICS enterprise_revenue);
+
+statement ok
+CREATE TEMP TABLE by_name_from_materialization AS
+SELECT metric_time.month, AGG(revenue) FILTER (WHERE account.segment = 'enterprise') AS er
+FROM ledger GROUP BY metric_time.month;
+
+statement ok
+SET semantic_view_materializations = false;
+
+query I
+SELECT (SELECT sql NOT ILIKE '%__semantic_materializations%' FROM semantic_view_sql('SELECT * FROM
+          SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month METRICS enterprise_revenue)'))
+   AND (SELECT count(*) FROM (
+         (SELECT * FROM from_materialization
+          EXCEPT ALL
+          SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month METRICS enterprise_revenue))
+         UNION ALL
+         (SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month METRICS enterprise_revenue)
+          EXCEPT ALL
+          SELECT * FROM from_materialization)
+         UNION ALL
+         (SELECT * FROM by_name_from_materialization
+          EXCEPT ALL
+          SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month METRICS enterprise_revenue))
+         UNION ALL
+         (SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month METRICS enterprise_revenue)
+          EXCEPT ALL
+          SELECT * FROM by_name_from_materialization)
+       )) = 0
+   AND (SELECT count(enterprise_revenue) FROM from_materialization) = 4;
+----
+true
+
+statement ok
+RESET semantic_view_materializations;

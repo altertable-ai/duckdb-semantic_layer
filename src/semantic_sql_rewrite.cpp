@@ -431,9 +431,13 @@ private:
 		query.items.push_back(std::move(item));
 	}
 
-	//! The metric of an AGG(<metric>) call
+	//! The metric item of an AGG(<metric>) call: its metric, or the call itself with a FILTER, which the semantic query
+	//! resolves like a metric defined with that FILTER
 	unique_ptr<ParsedExpression> AggMetric(const FunctionExpression &function) {
-		if (ArgumentCount(function) != 1 || function.Distinct() || function.Filter() ||
+		// a named argument (`name := value`) may be stored as the value's alias
+		if (ArgumentCount(function) != 1 || function.GetArguments()[0].HasName() ||
+		    !Argument(function, 0).GetAlias().empty() || function.Distinct() ||
+		    (function.OrderBy() && !function.OrderBy()->orders.empty()) || function.ExportState() ||
 		    SemanticFindTransformCall(Argument(function, 0))) {
 			throw BinderException("AGG() takes exactly one metric");
 		}
@@ -449,10 +453,11 @@ private:
 		if (!analyzer.ContainsAggregateOrMetric(*resolved)) {
 			throw BinderException("AGG() requires a metric; \"%s\" is not a metric", metric->ToString());
 		}
-		return metric;
+		return function.Filter() ? WithoutAlias(function) : std::move(metric);
 	}
 
-	//! Replaces the AGG(<metric>) calls in `expr` by their metric; ad-hoc aggregates are kept, bare metrics rejected
+	//! Replaces the AGG(<metric>) calls in `expr` by their metric item; ad-hoc aggregates are kept, bare metrics
+	//! rejected
 	void UnwrapAggCalls(unique_ptr<ParsedExpression> &expr) {
 		if (IsAggCall(*expr)) {
 			auto alias = expr->GetAlias();
