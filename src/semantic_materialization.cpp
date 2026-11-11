@@ -57,6 +57,7 @@ shared_ptr<SemanticMaterialization> PlanSemanticMaterialization(ClientContext &c
 			(kind == SemanticMemberKind::DIMENSION ? result->dimension_names : result->metric_names).push_back(name);
 			result->spec.items.push_back(SemanticQueryItem {item.kind, std::move(item.resolved),
 			                                                "__sv_m" + to_string(result->spec.items.size())});
+			result->spec.items.back().display_name = item.display_name.empty() ? item.output_name : item.display_name;
 		}
 	}
 	result->dimension_count = result->dimension_names.size();

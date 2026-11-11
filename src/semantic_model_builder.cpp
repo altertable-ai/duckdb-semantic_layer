@@ -700,10 +700,13 @@ private:
 	}
 
 	void CheckMemberKinds() {
+		// first, as the checks of a member also analyze the metrics it references
+		for (idx_t m = 0; m < model->members.size(); m++) {
+			CheckNoQueryForms(m, What(m));
+		}
 		SemanticAnalyzer analyzer(*model, context);
 		for (idx_t m = 0; m < model->members.size(); m++) {
 			auto what = What(m);
-			CheckNoTransformCalls(m, what);
 			CheckNoWindowMetricReferences(m, what);
 			if (model->members[m].IsRowLevel()) {
 				CheckRowLevelMember(analyzer, m, what);
@@ -713,15 +716,21 @@ private:
 		}
 	}
 
-	//! time_shift() / cumulative() are query-time forms of OFFSET / CUMULATIVE
-	void CheckNoTransformCalls(idx_t member, const string &what) {
-		auto call = SemanticFindTransformCall(*model->members[member].resolved);
-		if (!call) {
-			return;
+	//! time_shift() / cumulative() are query-time forms of OFFSET / CUMULATIVE, and AGG(<metric>) [FILTER (WHERE ...)]
+	//! the query-time form of a metric reference [with FILTER]
+	void CheckNoQueryForms(idx_t member, const string &what) {
+		auto &resolved = *model->members[member].resolved;
+		auto call = SemanticFindTransformCall(resolved);
+		if (call) {
+			auto &name = call->FunctionName().GetIdentifierName();
+			Fail("%s: %s() is only allowed in queries; use %s (...) in a definition", what, name,
+			     StringUtil::CIEquals(name, "time_shift") ? "OFFSET" : "CUMULATIVE");
 		}
-		auto &name = call->FunctionName().GetIdentifierName();
-		Fail("%s: %s() is only allowed in queries; use %s (...) in a definition", what, name,
-		     StringUtil::CIEquals(name, "time_shift") ? "OFFSET" : "CUMULATIVE");
+		if (SemanticContainsAggCall(resolved)) {
+			Fail("%s: AGG() is only allowed in queries; reference metrics by name in a definition, and filter them "
+			     "with the metric FILTER (WHERE ...) clause",
+			     what);
+		}
 	}
 
 	//! Window-function metrics cannot be used by other semantic expressions

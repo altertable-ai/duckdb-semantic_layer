@@ -29,6 +29,9 @@ struct SemanticQueryItem {
 	//! Resolved expression (marker references)
 	unique_ptr<ParsedExpression> resolved;
 	string output_name;
+	//! The name of the item in error messages, when not its output name (the items of queries by name have internal
+	//! output names: their errors name the expression)
+	string display_name;
 
 	SemanticQueryItem() = default;
 	SemanticQueryItem(SemanticMemberKind kind, unique_ptr<ParsedExpression> resolved, string output_name)

@@ -134,6 +134,86 @@ SELECT (SELECT count(*) FROM (FROM by_name EXCEPT ALL FROM expected)) = 0
 ----
 true
 
+# ... naming a group as GROUP BY does: by a select alias or by its expression, however GROUP BY wrote it
+foreach excluded y metric_time.year
+
+query I
+WITH by_name AS (
+  SELECT segment, metric_time.year AS y,
+         RANK() OVER (PARTITION BY EXCLUDING {excluded} ORDER BY AGG(revenue) DESC) AS r
+  FROM sales GROUP BY segment, y),
+expected AS (
+  SELECT segment, y, RANK() OVER (PARTITION BY segment ORDER BY revenue DESC) AS r
+  FROM SEMANTIC_VIEW(sales DIMENSIONS segment, metric_time.year AS y METRICS revenue))
+SELECT (SELECT count(*) FROM (FROM by_name EXCEPT ALL FROM expected)) = 0
+   AND (SELECT count(*) FROM (FROM expected EXCEPT ALL FROM by_name)) = 0
+   AND (SELECT count(*) FROM by_name) > 0;
+----
+true
+
+query I
+WITH by_name AS (
+  SELECT segment, metric_time.year AS y,
+         RANK() OVER (PARTITION BY EXCLUDING {excluded} ORDER BY AGG(revenue) DESC) AS r
+  FROM sales GROUP BY 1, 2),
+expected AS (
+  SELECT segment, y, RANK() OVER (PARTITION BY segment ORDER BY revenue DESC) AS r
+  FROM SEMANTIC_VIEW(sales DIMENSIONS segment, metric_time.year AS y METRICS revenue))
+SELECT (SELECT count(*) FROM (FROM by_name EXCEPT ALL FROM expected)) = 0
+   AND (SELECT count(*) FROM (FROM expected EXCEPT ALL FROM by_name)) = 0
+   AND (SELECT count(*) FROM by_name) > 0;
+----
+true
+
+query I
+WITH by_name AS (
+  SELECT segment, metric_time.year AS y,
+         RANK() OVER (PARTITION BY EXCLUDING {excluded} ORDER BY AGG(revenue) DESC) AS r
+  FROM sales GROUP BY segment, metric_time.year),
+expected AS (
+  SELECT segment, y, RANK() OVER (PARTITION BY segment ORDER BY revenue DESC) AS r
+  FROM SEMANTIC_VIEW(sales DIMENSIONS segment, metric_time.year AS y METRICS revenue))
+SELECT (SELECT count(*) FROM (FROM by_name EXCEPT ALL FROM expected)) = 0
+   AND (SELECT count(*) FROM (FROM expected EXCEPT ALL FROM by_name)) = 0
+   AND (SELECT count(*) FROM by_name) > 0;
+----
+true
+
+endloop
+
+# ... or another spelling of a grouped dimension
+foreach excluded account.segment "account.segment" sales.segment
+
+query I
+WITH by_name AS (
+  SELECT segment, metric_time.year AS y,
+         RANK() OVER (PARTITION BY EXCLUDING {excluded} ORDER BY AGG(revenue) DESC) AS r
+  FROM sales GROUP BY segment, y),
+expected AS (
+  SELECT segment, y, RANK() OVER (PARTITION BY y ORDER BY revenue DESC) AS r
+  FROM SEMANTIC_VIEW(sales DIMENSIONS segment, metric_time.year AS y METRICS revenue))
+SELECT (SELECT count(*) FROM (FROM by_name EXCEPT ALL FROM expected)) = 0
+   AND (SELECT count(*) FROM (FROM expected EXCEPT ALL FROM by_name)) = 0
+   AND (SELECT count(*) FROM by_name) > 0;
+----
+true
+
+endloop
+
+query I
+WITH by_name AS (
+  SELECT account.segment, metric_time.year AS y,
+         RANK() OVER (PARTITION BY EXCLUDING segment ORDER BY AGG(revenue) DESC) AS r
+  FROM sales GROUP BY account.segment, y),
+expected AS (
+  SELECT segment, y, RANK() OVER (PARTITION BY y ORDER BY revenue DESC) AS r
+  FROM SEMANTIC_VIEW(sales DIMENSIONS segment, metric_time.year AS y METRICS revenue))
+SELECT (SELECT count(*) FROM (FROM by_name EXCEPT ALL FROM expected)) = 0
+   AND (SELECT count(*) FROM (FROM expected EXCEPT ALL FROM by_name)) = 0
+   AND (SELECT count(*) FROM by_name) > 0;
+----
+true
+
 # GROUP BY ALL: a window item is not a group, even without an aggregate inside
 query I
 WITH by_name AS (
@@ -290,6 +370,12 @@ SELECT segment, metric_time.year, RANK() OVER (PARTITION BY EXCLUDING country OR
 FROM sales GROUP BY segment, metric_time.year;
 ----
 PARTITION BY EXCLUDING only accepts grouped dimensions
+
+statement error
+SELECT segment, metric_time.year, AGG(revenue) AS rev, RANK() OVER (PARTITION BY EXCLUDING rev ORDER BY AGG(revenue))
+FROM sales GROUP BY segment, metric_time.year;
+----
+"rev" is not in the GROUP BY clause
 
 statement error
 SELECT segment, ROW_NUMBER() OVER (PARTITION BY EXCLUDING segment ORDER BY invoice_amount) FROM sales;

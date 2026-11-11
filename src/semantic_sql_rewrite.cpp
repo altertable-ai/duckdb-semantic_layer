@@ -297,35 +297,58 @@ private:
 				partitions.push_back(std::move(partition));
 				continue;
 			}
-			auto &excluded = partition->Cast<FunctionExpression>().GetArguments();
-			for (auto &argument : excluded) {
-				if (!IsGroup(argument.GetExpression())) {
+			// the excluded groups (an argument names a group as GROUP BY does, in any spelling of its expression)
+			set<idx_t> excluded;
+			for (auto &argument : partition->Cast<FunctionExpression>().GetArguments()) {
+				auto group = FindGroup(*ResolveAlias(argument.GetExpression()));
+				if (!group.IsValid()) {
 					throw BinderException(
 					    "PARTITION BY EXCLUDING only accepts grouped dimensions when querying semantic "
 					    "view \"%s\" by name; \"%s\" is not in the GROUP BY clause",
 					    model.Name().name, argument.GetExpression().ToString());
 				}
+				excluded.insert(group.GetIndex());
 			}
-			for (auto &group : groups) {
-				bool is_excluded = false;
-				for (auto &argument : excluded) {
-					is_excluded = is_excluded || group->Equals(argument.GetExpression());
-				}
-				if (!is_excluded) {
-					partitions.push_back(group->Copy());
+			for (idx_t g = 0; g < groups.size(); g++) {
+				if (!excluded.count(g)) {
+					partitions.push_back(groups[g]->Copy());
 				}
 			}
 		}
 		window.PartitionsMutable() = std::move(partitions);
 	}
 
-	bool IsGroup(const ParsedExpression &expr) const {
-		for (auto &group : groups) {
-			if (group->Equals(expr)) {
-				return true;
+	//! The group `expr` is: written the same way, or naming the same dimension or column (`segment` and
+	//! `account.segment`)
+	optional_idx FindGroup(const ParsedExpression &expr) const {
+		for (idx_t g = 0; g < groups.size(); g++) {
+			if (groups[g]->Equals(expr)) {
+				return g;
 			}
 		}
-		return false;
+		auto ref = NameRef(expr);
+		if (ref.Is(SemanticRefKind::NONE)) {
+			return optional_idx();
+		}
+		for (idx_t g = 0; g < groups.size(); g++) {
+			auto group = NameRef(*groups[g]);
+			if (group.kind == ref.kind && group.index == ref.index && StringUtil::CIEquals(group.column, ref.column)) {
+				return g;
+			}
+		}
+		return optional_idx();
+	}
+
+	//! What a name stands for (NONE for an unknown name or another expression)
+	SemanticRef NameRef(const ParsedExpression &expr) const {
+		if (expr.GetExpressionClass() != ExpressionClass::COLUMN_REF) {
+			return SemanticRef();
+		}
+		SemanticResolveContext resolve_context;
+		resolve_context.allow_private = false;
+		string ignored;
+		return model.Lookup(IdentifiersToStrings(expr.Cast<ColumnRefExpression>().ColumnNames()), resolve_context,
+		                    ignored);
 	}
 
 	static bool IsAggCall(const ParsedExpression &expr) {
@@ -369,16 +392,21 @@ private:
 				return WithoutAlias(*select[NumericCast<idx_t>(index - 1)]);
 			}
 		}
-		if (normalized->GetExpressionClass() == ExpressionClass::COLUMN_REF) {
-			auto &colref = normalized->Cast<ColumnRefExpression>();
+		return ResolveAlias(*normalized);
+	}
+
+	//! A (normalized) select alias as its select item's expression; other expressions as they are
+	unique_ptr<ParsedExpression> ResolveAlias(const ParsedExpression &expr) const {
+		if (expr.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+			auto &colref = expr.Cast<ColumnRefExpression>();
 			if (!colref.IsQualified() && !HasInputName(colref.GetColumnName().GetIdentifierName())) {
-				auto alias = OutputAlias(*normalized);
+				auto alias = OutputAlias(expr);
 				if (alias.IsValid()) {
 					return WithoutAlias(*select[alias.GetIndex()]);
 				}
 			}
 		}
-		return normalized;
+		return expr.Copy();
 	}
 
 	bool HasInputName(const string &name) const {

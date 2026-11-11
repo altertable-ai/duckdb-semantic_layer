@@ -82,6 +82,10 @@ SemanticCumulative SemanticMakeCumulative(ClientContext &context, SemanticAnalyz
 
 //! The first unqualified time_shift / cumulative call in `expr`, or nullptr
 optional_ptr<const FunctionExpression> SemanticFindTransformCall(const ParsedExpression &expr);
+//! Whether `expr` contains an unqualified AGG(...) call, or AGG(...) OVER (...)
+bool SemanticContainsAggCall(const ParsedExpression &expr);
+//! A resolved expression as the user could have written it: markers replaced by the names they stand for
+unique_ptr<ParsedExpression> SemanticDisplayExpression(const SemanticModel &model, const ParsedExpression &expr);
 
 //! A call's arguments: unaliased ones in order, aliased ones (`name := value`) by name. Throws when the number of
 //! positional arguments differs from `positional`, or a name is unknown or repeated, listing the signature.

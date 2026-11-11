@@ -44,13 +44,14 @@ constexpr const char *BLOCK_COLUMN = "__sv_block";
 } // namespace
 
 string SemanticItemWhat(const SemanticQueryItem &item) {
+	auto &name = item.display_name.empty() ? item.output_name : item.display_name;
 	switch (item.kind) {
 	case SemanticMemberKind::DIMENSION:
-		return "Invalid dimension \"" + item.output_name + "\"";
+		return "Invalid dimension \"" + name + "\"";
 	case SemanticMemberKind::FACT:
-		return "Invalid fact \"" + item.output_name + "\"";
+		return "Invalid fact \"" + name + "\"";
 	default:
-		return "Invalid metric \"" + item.output_name + "\"";
+		return "Invalid metric \"" + name + "\"";
 	}
 }
 
@@ -751,7 +752,9 @@ SemanticQuerySpec SemanticQueryCompiler::Resolve(const vector<ParsedSemanticQuer
 			                                                : item.expression->ToString();
 		}
 		SemanticQueryItem query_item {item.kind, std::move(resolved), output_name};
-		if (!internal_name) {
+		if (internal_name) {
+			query_item.display_name = item.expression->ToString();
+		} else {
 			transforms_what = SemanticItemWhat(query_item);
 		}
 		query_item.resolved = SemanticResolveTransforms(analyzer.Context(), analyzer, model,

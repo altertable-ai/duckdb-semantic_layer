@@ -127,8 +127,7 @@ void SemanticTransforms::RegisterFilters(const vector<unique_ptr<ParsedExpressio
 	}
 }
 
-//! A resolved expression as the user could have written it: markers replaced by the names they stand for
-static unique_ptr<ParsedExpression> DisplayExpression(const SemanticModel &model, const ParsedExpression &expr) {
+unique_ptr<ParsedExpression> SemanticDisplayExpression(const SemanticModel &model, const ParsedExpression &expr) {
 	auto result = expr.Copy();
 	std::function<void(unique_ptr<ParsedExpression> &)> replace = [&](unique_ptr<ParsedExpression> &node) {
 		auto ref = SemanticMarkers::Classify(*node);
@@ -157,7 +156,7 @@ string SemanticTransforms::FilterDisplayName(idx_t index) const {
 	if (index < model.members.size()) {
 		return "metric \"" + model.MemberDisplayName(index) + "\"";
 	}
-	return "FILTER (WHERE " + DisplayExpression(model, Filter(index))->ToString() + ")";
+	return "FILTER (WHERE " + SemanticDisplayExpression(model, Filter(index))->ToString() + ")";
 }
 
 //===--------------------------------------------------------------------===//
@@ -207,23 +206,19 @@ static bool IsAggWindow(const ParsedExpression &expr) {
 	       StringUtil::CIEquals(window.FunctionName().GetIdentifierName(), "agg");
 }
 
-//! The first AGG(...) call in `expr`, or nullptr
-static optional_ptr<const FunctionExpression> FindAggCall(const ParsedExpression &expr) {
-	if (IsAggCall(expr)) {
-		return &expr.Cast<FunctionExpression>();
+bool SemanticContainsAggCall(const ParsedExpression &expr) {
+	if (IsAggCall(expr) || IsAggWindow(expr)) {
+		return true;
 	}
-	optional_ptr<const FunctionExpression> result;
-	ParsedExpressionIterator::EnumerateChildren(expr, [&](const ParsedExpression &child) {
-		if (!result) {
-			result = FindAggCall(child);
-		}
-	});
-	return result;
+	bool found = false;
+	ParsedExpressionIterator::EnumerateChildren(
+	    expr, [&](const ParsedExpression &child) { found = found || SemanticContainsAggCall(child); });
+	return found;
 }
 
 bool SemanticIsRowLevelCondition(SemanticAnalyzer &analyzer, const ParsedExpression &condition) {
 	return !analyzer.ContainsAggregateOrMetric(condition) && !SemanticAnalyzer::ContainsWindow(condition) &&
-	       !FindAggCall(condition) && !SemanticFindTransformCall(condition);
+	       !SemanticContainsAggCall(condition) && !SemanticFindTransformCall(condition);
 }
 
 //! The checks of an OFFSET's interval that do not depend on its dimension
@@ -458,7 +453,7 @@ private:
 		Rewrite(metric, false);
 		if (!analyzer.ContainsAggregateOrMetric(*metric)) {
 			throw SemanticDefinitionException("%s: AGG() requires a metric; \"%s\" is not a metric", what,
-			                                  DisplayExpression(model, *metric)->ToString());
+			                                  SemanticDisplayExpression(model, *metric)->ToString());
 		}
 		if (!call.Filter()) {
 			return std::move(metric);
@@ -776,7 +771,7 @@ unique_ptr<ParsedExpression> SemanticResolveTransforms(ClientContext &context, S
 			throw SemanticDefinitionException("%s: %s() is only allowed in METRICS", what,
 			                                  call->FunctionName().GetIdentifierName());
 		}
-		if (FindAggCall(*resolved)) {
+		if (SemanticContainsAggCall(*resolved)) {
 			throw SemanticDefinitionException("%s: AGG() is only allowed in METRICS", what);
 		}
 		return resolved;

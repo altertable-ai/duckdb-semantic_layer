@@ -212,7 +212,7 @@ void SemanticAnalyzer::ApplyMetricContext(SemanticAtom &atom, const string &what
 				throw SemanticDefinitionException(
 				    "%s: %s references logical table \"%s\", which is not reachable from \"%s\" (aggregated by %s)",
 				    what, filter < model.members.size() ? "FILTER of " + name : name, model.tables[table].name,
-				    model.tables[atom.home].name, aggregate.ToString());
+				    model.tables[atom.home].name, SemanticDisplayExpression(model, aggregate)->ToString());
 			}
 		}
 	}
