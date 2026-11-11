@@ -3,6 +3,9 @@
 #include "duckdb/common/error_data.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/function/scalar_function.hpp"
+#include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
 #include "duckdb/parser/expression/cast_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
@@ -541,6 +544,73 @@ unique_ptr<ParsedExpression> SemanticResolveTransforms(ClientContext &context, S
 	TransformResolver resolver(context, analyzer, model, what);
 	resolver.Rewrite(resolved, false);
 	return resolved;
+}
+
+//===--------------------------------------------------------------------===//
+// Catalog entries
+//===--------------------------------------------------------------------===//
+// The calls are rewritten before binding inside semantic queries, so these entries are never executed: they make
+// the functions discoverable in duckdb_functions(), and their bind fails anywhere else.
+static unique_ptr<FunctionData> SemanticTransformOutsideQuery(const string &name) {
+	throw BinderException("%s() can only be used in the METRICS of a semantic query (SEMANTIC_VIEW(...) or a query of "
+	                      "a semantic view by name)",
+	                      name);
+}
+
+static unique_ptr<FunctionData> TimeShiftBind(BindScalarFunctionInput &) {
+	return SemanticTransformOutsideQuery("time_shift");
+}
+
+static unique_ptr<FunctionData> CumulativeBind(BindScalarFunctionInput &) {
+	return SemanticTransformOutsideQuery("cumulative");
+}
+
+static void SemanticTransformExecute(DataChunk &, ExpressionState &, Vector &) {
+	throw InternalException("query-time transforms are rewritten before execution");
+}
+
+static void RegisterSemanticTransform(ExtensionLoader &loader, ScalarFunction function, string description,
+                                      vector<string> examples) {
+	function.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+	CreateScalarFunctionInfo info(std::move(function));
+	FunctionDescription entry;
+	entry.description = std::move(description);
+	entry.examples = std::move(examples);
+	info.descriptions.push_back(std::move(entry));
+	loader.RegisterFunction(std::move(info));
+}
+
+void RegisterSemanticTransformFunctions(ExtensionLoader &loader) {
+	RegisterSemanticTransform(
+	    loader,
+	    ScalarFunction("time_shift",
+	                   {FunctionParameter("metric", LogicalType::ANY), FunctionParameter("interval", LogicalType::ANY),
+	                    FunctionParameter("dimension", LogicalType::ANY, Value(LogicalType::SQLNULL))},
+	                   LogicalType::ANY, SemanticTransformExecute, TimeShiftBind),
+	    "Query-time form of an OFFSET metric: the metric computed over the rows dated one interval earlier (a "
+	    "negative interval looks forward). Only valid in the METRICS of a semantic query; dimension defaults to "
+	    "metric_time.day.",
+	    {"SELECT * FROM SEMANTIC_VIEW(sales DIMENSIONS metric_time.month METRICS time_shift(revenue, INTERVAL 1 YEAR) "
+	     "AS revenue_ly)",
+	     "SELECT metric_time.month, time_shift(AGG(revenue), INTERVAL 1 MONTH, dimension := orders.order_date) FROM "
+	     "sales GROUP BY metric_time.month"});
+	RegisterSemanticTransform(
+	    loader,
+	    ScalarFunction("cumulative",
+	                   {FunctionParameter("metric", LogicalType::ANY),
+	                    FunctionParameter("trailing_window", LogicalType::ANY, Value(LogicalType::SQLNULL)),
+	                    FunctionParameter("to_date", LogicalType::ANY, Value(LogicalType::SQLNULL)),
+	                    FunctionParameter("period", LogicalType::ANY, Value(LogicalType::SQLNULL)),
+	                    FunctionParameter("dimension", LogicalType::ANY, Value(LogicalType::SQLNULL))},
+	                   LogicalType::ANY, SemanticTransformExecute, CumulativeBind),
+	    "Query-time form of a CUMULATIVE metric: a running total, a trailing window (trailing_window) or a period to "
+	    "date (to_date) of the metric. Only valid in the METRICS of a semantic query; dimension defaults to "
+	    "metric_time.day.",
+	    {"SELECT * FROM SEMANTIC_VIEW(sales DIMENSIONS metric_time.month METRICS cumulative(revenue) AS running)",
+	     "SELECT * FROM SEMANTIC_VIEW(sales DIMENSIONS metric_time.day METRICS cumulative(revenue, trailing_window := "
+	     "INTERVAL 7 DAYS) AS revenue_7d)",
+	     "SELECT * FROM SEMANTIC_VIEW(sales DIMENSIONS metric_time.month METRICS cumulative(revenue, to_date := "
+	     "'year', period := 'first') AS revenue_ytd)"});
 }
 
 } // namespace duckdb

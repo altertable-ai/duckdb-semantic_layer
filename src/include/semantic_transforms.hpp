@@ -18,6 +18,7 @@
 namespace duckdb {
 
 class ClientContext;
+class ExtensionLoader;
 class FunctionExpression;
 class SemanticAnalyzer;
 struct SemanticAtom;
@@ -77,5 +78,8 @@ unique_ptr<ParsedExpression> SemanticResolveTransforms(ClientContext &context, S
                                                        const SemanticModel &model,
                                                        unique_ptr<ParsedExpression> resolved, SemanticMemberKind kind,
                                                        const string &what);
+
+//! Catalog entries (duckdb_functions()) for time_shift and cumulative; binding them outside a semantic query fails
+void RegisterSemanticTransformFunctions(ExtensionLoader &loader);
 
 } // namespace duckdb

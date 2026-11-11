@@ -324,6 +324,54 @@ In this form:
   `CUBE`, or `GROUPING SETS`) are not supported in this form. For subtotals, use `UNION ALL` of separately grouped
   semantic queries so each metric is evaluated at the appropriate grain.
 
+### Query-time transforms (`time_shift`, `cumulative`)
+
+Without defining a metric first, `time_shift(...)` and `cumulative(...)` apply [`OFFSET`](#time-offsets-offset) and
+[`CUMULATIVE`](#cumulative-metrics-cumulative) to a metric expression inside a query:
+
+```sql
+time_shift(<metric>, <interval> [, dimension := <dimension>])
+cumulative(<metric> [, trailing_window := <interval> | to_date := '<date part>']
+                    [, period := 'first' | 'last' | 'average'] [, dimension := <dimension>])
+```
+
+| Function | Equivalent DDL clause |
+|---|---|
+| `time_shift(m, INTERVAL 1 YEAR)` | `OFFSET (metric_time.day BY INTERVAL 1 YEAR)` |
+| `time_shift(m, INTERVAL 1 MONTH, dimension := invoices.invoice_date)` | `OFFSET (invoices.invoice_date BY INTERVAL 1 MONTH)` |
+| `cumulative(m)` | `CUMULATIVE (metric_time.day)` (running total) |
+| `cumulative(m, period := 'average')` | `CUMULATIVE (metric_time.day AVERAGE)` |
+| `cumulative(m, trailing_window := INTERVAL 7 DAYS)` | `CUMULATIVE (metric_time.day OVER INTERVAL 7 DAYS)` |
+| `cumulative(m, to_date := 'month')` | `CUMULATIVE (metric_time.day TO MONTH)` |
+| `cumulative(m, to_date := 'year', period := 'first')` | `CUMULATIVE (metric_time.day TO YEAR FIRST)` |
+
+```sql
+SELECT * FROM SEMANTIC_VIEW(sales
+  DIMENSIONS metric_time.month, customers.segment
+  METRICS lines.revenue,
+          time_shift(lines.revenue, INTERVAL 1 YEAR)                     AS revenue_ly,
+          lines.revenue / time_shift(lines.revenue, INTERVAL 1 YEAR) - 1 AS growth,
+          cumulative(lines.revenue, to_date := 'year')                   AS revenue_ytd);
+
+-- by name: metrics inside a transform stay wrapped in AGG()
+SELECT metric_time.month, AGG(lines.revenue), time_shift(AGG(lines.revenue), INTERVAL 1 YEAR) AS revenue_ly
+FROM sales
+GROUP BY metric_time.month;
+```
+
+- **Sign:** as for `OFFSET`, a positive interval reads the past: rows dated *t − interval*.
+- **`dimension`** defaults to `metric_time.day` when the view declares [`TIME`](#time-spine-time). Otherwise it is
+  required. It must be a dimension defined as a column of its table; the error lists the valid ones.
+  `trailing_window` and `to_date` are mutually exclusive, and `period` defaults to `'last'`.
+- **Where:** in `METRICS` (and, by name, in the select list, `HAVING` and `ORDER BY` expressions over metrics). They
+  are rejected in `DIMENSIONS`, `FACTS`, `WHERE`, inside an aggregate's argument (`AGG(time_shift(...))` too), and in
+  `CREATE SEMANTIC VIEW` definitions. `time_shift(cumulative(...))` is allowed; `cumulative()` cannot wrap another
+  transform or a metric that uses `OFFSET`, `CUMULATIVE` or `NON ADDITIVE BY`. A window function can wrap a transform
+  but not appear inside its metric argument.
+- Query-time transforms cannot be [materialized](#materializations); the other metrics of the query still read them.
+- `duckdb_functions()` lists both functions with their parameter names, a description and examples. They are never
+  executed: calling them outside a semantic query fails. The names `__sv_offset` and `__sv_cumulative` are reserved.
+
 ### Seeing the generated SQL
 
 ```sql
@@ -435,6 +483,8 @@ relationship is. The name `metric_time` is reserved only in a view that uses `TI
 
 ### Time offsets (`OFFSET`)
 
+To shift a metric in a single query without defining it, see [query-time transforms](#query-time-transforms-time_shift-cumulative).
+
 ```sql
 METRICS (
   margin_ly OFFSET (metric_time.day BY INTERVAL 1 YEAR) AS margin,
@@ -453,6 +503,8 @@ add up. Offset metrics cannot be materialized (the other metrics of a query stil
 by facts and dimensions.
 
 ### Cumulative metrics (`CUMULATIVE`)
+
+To accumulate a metric in a single query without defining it, see [query-time transforms](#query-time-transforms-time_shift-cumulative).
 
 ```sql
 METRICS (
@@ -677,6 +729,8 @@ relationships are about 9x faster than a hand-written range join. See [docs/benc
   fails with an unknown `__semantic_view_placeholder` function.
 - No placeholder is created in read-only databases or in attached non-DuckDB catalogs (Postgres, SQLite, ...). Such
   semantic views work but are not listed. A plain `DROP VIEW x` removes only the placeholder.
+- `time_shift()` and `cumulative()` are extensions: they are not allowed in definitions, cannot be materialized, and
+  a user function of the same name in the default schema may conflict with their catalog entries.
 - A DuckDB view cannot be defined over the query-by-name form; use `SEMANTIC_VIEW(...)` in view definitions.
 - The semantic view syntax is a grammar extension that `LOAD semantic_layer` turns on for every connection. A
   connection that was already open switches once its current (or, when the extension is loaded through an API rather
@@ -759,7 +813,8 @@ SERVICE`, `AI_SQL_GENERATION`, `AI_QUESTION_CATEGORIZATION`, `AI_VERIFIED_QUERIE
 - Metric `FILTER (WHERE ...)`, `OFFSET (<dimension> BY <interval>)` and `CUMULATIVE (...)` clauses, and the built-in
   time spine (`TIME (<column>)`, logical table `metric_time`) are extensions, modeled on
   [dbt MetricFlow](https://docs.getdbt.com/docs/build/about-metricflow)'s time spine, cumulative metrics and offsets;
-  adjacent string literals in DDL are concatenated.
+  adjacent string literals in DDL are concatenated. The query-time `time_shift()` and `cumulative()` functions are
+  extensions too.
 
 ## Contributing
 

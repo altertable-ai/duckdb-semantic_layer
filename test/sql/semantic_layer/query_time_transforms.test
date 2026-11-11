@@ -991,3 +991,66 @@ SELECT (SELECT count(*) FROM (
      FROM ledger GROUP BY metric_time.month) WHERE x IS NOT NULL) > 0;
 ----
 true
+
+# materializations
+statement error
+ALTER SEMANTIC VIEW ledger ADD MATERIALIZATION m1 AS DIMENSIONS metric_time.month
+  METRICS time_shift(revenue, INTERVAL 1 YEAR) AS ly;
+----
+cannot be materialized
+
+statement ok
+ALTER SEMANTIC VIEW ledger ADD MATERIALIZATION m2 AS DIMENSIONS metric_time.month METRICS revenue;
+
+statement ok
+ALTER SEMANTIC VIEW ledger SET MAX_STALENESS = 3600;
+
+# a mixed query reads the materialization only for the plain block
+query I
+SELECT len(sql) - len(replace(sql, '__semantic_materializations', '')) = len('__semantic_materializations')
+FROM semantic_view_sql('SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month METRICS revenue, time_shift(revenue, INTERVAL 1 YEAR) AS ly)');
+----
+true
+
+statement ok
+CREATE TABLE mixed_on AS SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month METRICS revenue, time_shift(revenue, INTERVAL 1 YEAR) AS ly);
+
+statement ok
+SET semantic_view_materializations = false;
+
+statement ok
+CREATE TABLE mixed_off AS SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month METRICS revenue, time_shift(revenue, INTERVAL 1 YEAR) AS ly);
+
+statement ok
+RESET semantic_view_materializations;
+
+query I
+SELECT (SELECT count(*) FROM ((SELECT * FROM mixed_on EXCEPT ALL SELECT * FROM mixed_off)
+  UNION ALL (SELECT * FROM mixed_off EXCEPT ALL SELECT * FROM mixed_on))) = 0
+  AND (SELECT count(*) FROM mixed_on) > 0;
+----
+true
+
+# catalog entries and the error outside semantic queries
+query TTT
+SELECT function_name, function_type, parameters::VARCHAR FROM duckdb_functions()
+WHERE function_name IN ('time_shift', 'cumulative') ORDER BY ALL;
+----
+cumulative	scalar	[metric, trailing_window, to_date, period, dimension]
+time_shift	scalar	[metric, interval, dimension]
+
+query I
+SELECT count(*) FROM duckdb_functions()
+WHERE function_name IN ('time_shift', 'cumulative') AND description <> '' AND len(examples) > 0;
+----
+2
+
+statement error
+SELECT time_shift(1, INTERVAL 1 YEAR);
+----
+time_shift() can only be used in the METRICS of a semantic query
+
+statement error
+SELECT cumulative(1);
+----
+cumulative() can only be used in the METRICS of a semantic query
