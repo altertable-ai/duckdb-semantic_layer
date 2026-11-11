@@ -341,10 +341,16 @@ GROUP BY ALL
 QUALIFY rnk <= 3;
 ```
 
-Without aggregation, windows are evaluated over the fact rows. Like any SQL window, `LAG(AGG(m)) OVER (ORDER BY
-metric_time.month)` sees only the periods that have rows: a missing month makes it read an older one. To compare with
-a previous period, use [`time_shift(...)`](#query-time-transforms-time_shift-cumulative). `AGG(...)` and the
-transforms are not window functions themselves (`SUM(AGG(m)) OVER (...)`, not `AGG(m) OVER (...)`).
+Without aggregation, windows are evaluated over the fact rows. Those rows are at the grain of the finest table among
+all the facts the query reads (in the select list, `ORDER BY`, `QUALIFY`, and the windows' keys and arguments), so a
+window key on a finer fact changes the row count: `SELECT customers.segment FROM sales` returns one row per customer,
+`SELECT customers.segment, ROW_NUMBER() OVER (ORDER BY lines.net_price) FROM sales` one row per line, and
+`SELECT customers.segment, COUNT(*) OVER (PARTITION BY customers.segment) FROM sales` counts customers, not lines.
+
+Like any SQL window, `LAG(AGG(m)) OVER (ORDER BY metric_time.month)` sees only the periods that have rows: a missing
+month makes it read an older one. To compare with a previous period, use
+[`time_shift(...)`](#query-time-transforms-time_shift-cumulative). `AGG(...)` and the transforms are not window
+functions themselves (`SUM(AGG(m)) OVER (...)`, not `AGG(m) OVER (...)`).
 
 ### Query-time transforms (`time_shift`, `cumulative`)
 
@@ -398,7 +404,8 @@ GROUP BY metric_time.month;
 - Query-time transforms cannot be [materialized](#materializations); in a query that mixes them with plain metrics, the
   plain metrics still read the materializations.
 - `duckdb_functions()` lists both functions with their parameter names, a description and examples. They are never
-  executed: calling them outside a semantic query fails. The names `__sv_offset` and `__sv_cumulative` are reserved.
+  executed: calling them outside a semantic query fails. The names `__sv_offset`, `__sv_cumulative` and `__sv_filter`
+  are reserved.
 
 ### Seeing the generated SQL
 
