@@ -366,9 +366,14 @@ GROUP BY metric_time.month;
 - **Where:** in `METRICS` (and, by name, in the select list, `HAVING` and `ORDER BY` expressions over metrics). They
   are rejected in `DIMENSIONS`, `FACTS`, `WHERE`, inside an aggregate's argument (`AGG(time_shift(...))` too), and in
   `CREATE SEMANTIC VIEW` definitions. `time_shift(cumulative(...))` is allowed; `cumulative()` cannot wrap another
-  transform or a metric that uses `OFFSET`, `CUMULATIVE` or `NON ADDITIVE BY`. A window function can wrap a transform
-  but not appear inside its metric argument.
-- Query-time transforms cannot be [materialized](#materializations); the other metrics of the query still read them.
+  transform or a metric that uses `OFFSET`, `CUMULATIVE` or `NON ADDITIVE BY`, and `period := 'average'` needs a
+  metric computed from a single aggregate. A window function can wrap a transform but not appear inside its metric
+  argument. Only unqualified calls are transforms (`main.time_shift(...)` is not).
+- **Arguments** are checked as in the DDL: `trailing_window` takes what `OVER` takes for the dimension's type (an
+  interval, or a number for a numeric column). `FILTER`, `DISTINCT` and `ORDER BY` go on the aggregate inside the call
+  (`time_shift(SUM(x) FILTER (WHERE ...), ...)`), not on the call itself.
+- Query-time transforms cannot be [materialized](#materializations); in a query that mixes them with plain metrics, the
+  plain metrics still read the materializations.
 - `duckdb_functions()` lists both functions with their parameter names, a description and examples. They are never
   executed: calling them outside a semantic query fails. The names `__sv_offset` and `__sv_cumulative` are reserved.
 
