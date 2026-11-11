@@ -12,6 +12,7 @@
 #include "duckdb/parser/tableref/emptytableref.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "semantic_analysis.hpp"
+#include "semantic_cumulative.hpp"
 #include "semantic_definition_exception.hpp"
 #include "semantic_offsets.hpp"
 #include "semantic_time_spine.hpp"
@@ -72,7 +73,7 @@ bool SemanticIsConstant(SemanticAnalyzer &analyzer, const ParsedExpression &expr
 	       !SemanticAnalyzer::ContainsWindow(expr);
 }
 
-string SemanticBindError(ClientContext &context, unique_ptr<ParsedExpression> expr) {
+string SemanticBindError(ClientContext &context, unique_ptr<ParsedExpression> expr, optional_ptr<LogicalType> type) {
 	auto node = make_uniq<SelectNode>();
 	node->select_list.push_back(std::move(expr));
 	node->from_table = make_uniq<EmptyTableRef>();
@@ -80,7 +81,10 @@ string SemanticBindError(ClientContext &context, unique_ptr<ParsedExpression> ex
 	statement->node = std::move(node);
 	try {
 		auto binder = Binder::CreateBinder(context);
-		binder->Bind(statement->Cast<SQLStatement>());
+		auto bound = binder->Bind(statement->Cast<SQLStatement>());
+		if (type) {
+			*type = bound.types[0];
+		}
 	} catch (std::exception &ex) {
 		ErrorData error(ex);
 		return error.RawMessage();
@@ -114,6 +118,57 @@ SemanticOffset SemanticMakeOffset(ClientContext &context, SemanticAnalyzer &anal
 		                                  offset.column, offset.type.ToString(), offset.interval->ToString(), error);
 	}
 	return offset;
+}
+
+SemanticCumulative SemanticMakeCumulative(ClientContext &context, SemanticAnalyzer &analyzer,
+                                          const SemanticModel &model, idx_t dimension, const ParsedExpression *window,
+                                          const string &part, SemanticCumulativePeriod period, const string &what) {
+	auto column = SemanticMarkers::Classify(*model.members[dimension].resolved);
+	if (!column.Is(SemanticRefKind::COLUMN)) {
+		throw InternalException("CUMULATIVE dimension \"%s\" is not defined as a column",
+		                        model.MemberDisplayName(dimension));
+	}
+	auto &table = model.tables[column.index];
+	SemanticCumulative cumulative;
+	cumulative.dimension = dimension;
+	cumulative.table = column.index;
+	cumulative.column = column.column;
+	cumulative.type = table.column_types[table.columns.at(column.column)];
+	cumulative.period = period;
+	cumulative.kind = SemanticCumulativeKind::ALL;
+	if (window) {
+		if (!SemanticIsConstant(analyzer, *window)) {
+			throw SemanticDefinitionException("%s: the window must be a constant expression", what);
+		}
+		cumulative.kind = SemanticCumulativeKind::WINDOW;
+		cumulative.window = window->Copy();
+	} else if (!part.empty()) {
+		if (!SemanticIsTruncationPart(part)) {
+			throw SemanticDefinitionException(
+			    "%s: \"%s\" is not a date part to truncate to (e.g. day, week, month, quarter, year)", what, part);
+		}
+		cumulative.kind = SemanticCumulativeKind::GRAIN;
+		cumulative.part = part;
+	}
+	// binds SELECT <window condition over CAST(NULL AS <type>)>
+	auto null = [&]() {
+		return make_uniq<CastExpression>(cumulative.type, ConstantExpression::FromValue(Value()));
+	};
+	auto error = SemanticBindError(context, SemanticCumulativeWindow(cumulative, null(), null()));
+	if (error.empty()) {
+		return cumulative;
+	}
+	auto description = "column \"" + table.name + "." + cumulative.column + "\" (" + cumulative.type.ToString() + ")";
+	switch (cumulative.kind) {
+	case SemanticCumulativeKind::WINDOW:
+		throw SemanticDefinitionException("%s: cannot use %s as the window of %s: %s", what,
+		                                  cumulative.window->ToString(), description, error);
+	case SemanticCumulativeKind::GRAIN:
+		throw SemanticDefinitionException("%s: cannot truncate %s to %s: %s", what, description, cumulative.part,
+		                                  error);
+	default:
+		throw SemanticDefinitionException("%s: %s cannot be ordered: %s", what, description, error);
+	}
 }
 
 //===--------------------------------------------------------------------===//
@@ -205,11 +260,9 @@ public:
 			for (auto &argument : call.GetArgumentsMutable()) {
 				Rewrite(argument.GetExpressionMutable(), false);
 			}
-			if (IsTimeShift(call)) {
-				auto alias = node->GetAlias();
-				node = TimeShift(call);
-				node->SetAlias(alias);
-			}
+			auto alias = node->GetAlias();
+			node = IsTimeShift(call) ? TimeShift(call) : Cumulative(call);
+			node->SetAlias(alias);
 			return;
 		}
 		auto aggregate = in_aggregate || analyzer.IsAggregate(*node);
@@ -235,6 +288,132 @@ private:
 		auto offset = SemanticMakeOffset(context, analyzer, model, dimension, *arguments.positional[1], call_what);
 		auto index = analyzer.Transforms().AddOffset(std::move(offset));
 		return SemanticMarkers::Transform(SemanticTransformKind::OFFSET, index, metric.Copy());
+	}
+
+	//! cumulative(<metric> [, trailing_window := <interval> | to_date := '<date part>']
+	//!            [, period := 'first' | 'last' | 'average'] [, dimension := <dimension>])
+	unique_ptr<ParsedExpression> Cumulative(const FunctionExpression &call) {
+		auto call_what = CallWhat(call, what);
+		auto arguments =
+		    SemanticSplitTransformArguments(call, 1, {"trailing_window", "to_date", "period", "dimension"}, call_what);
+		auto named = [&](const char *name) -> optional_ptr<const ParsedExpression> {
+			auto entry = arguments.named.find(name);
+			return entry == arguments.named.end() ? nullptr : entry->second;
+		};
+		auto window = named("trailing_window");
+		auto to_date = named("to_date");
+		if (window && to_date) {
+			throw SemanticDefinitionException("%s: trailing_window and to_date cannot be combined", call_what);
+		}
+		if (window && SemanticIsConstant(analyzer, *window)) {
+			LogicalType type;
+			auto error = SemanticBindError(context, window->Copy(), type);
+			if (!error.empty() || type.id() != LogicalTypeId::INTERVAL) {
+				throw SemanticDefinitionException("%s: trailing_window must be an interval (e.g. INTERVAL 7 DAYS)%s",
+				                                  call_what, Got(*window));
+			}
+		}
+		string part;
+		if (to_date) {
+			if (!StringConstant(*to_date, part)) {
+				throw SemanticDefinitionException("%s: to_date must be a date part string (e.g. to_date := 'month')%s",
+				                                  call_what, Got(*to_date));
+			}
+			part = StringUtil::Lower(part);
+		}
+		auto period = SemanticCumulativePeriod::LAST;
+		auto period_argument = named("period");
+		if (period_argument) {
+			string value; // empty unless a string literal
+			StringConstant(*period_argument, value);
+			if (StringUtil::CIEquals(value, "first")) {
+				period = SemanticCumulativePeriod::FIRST;
+			} else if (StringUtil::CIEquals(value, "average")) {
+				period = SemanticCumulativePeriod::AVERAGE;
+			} else if (!StringUtil::CIEquals(value, "last")) {
+				throw SemanticDefinitionException("%s: period must be 'first', 'last' or 'average'%s", call_what,
+				                                  Got(*period_argument));
+			}
+		}
+		auto &metric = *arguments.positional[0];
+		CheckNoWindow(metric, call_what);
+		// before the dimension's reachability: a metric that cannot be cumulated says why
+		CheckCumulativeComposition(metric, call_what);
+		vector<SemanticAtom> atoms;
+		auto post = analyzer.Decompose(metric, SemanticMetricContext(), atoms, what);
+		for (auto &atom : atoms) {
+			// CheckCumulativeComposition names the culprit; this guards the invariant Decompose relies on
+			if (!atom.context.offsets.empty() || atom.context.cumulative != DConstants::INVALID_INDEX ||
+			    atom.context.non_additive_member != DConstants::INVALID_INDEX) {
+				throw SemanticDefinitionException(
+				    "%s: the metric expression cannot use OFFSET, CUMULATIVE or NON ADDITIVE BY", call_what);
+			}
+		}
+		// AVERAGE averages each aggregate: only a metric that is a single aggregate has its value averaged
+		if (period == SemanticCumulativePeriod::AVERAGE &&
+		    (atoms.size() != 1 || !SemanticMarkers::Classify(*post).Is(SemanticRefKind::ATOM))) {
+			throw SemanticDefinitionException(
+			    "%s: period := 'average' requires a metric computed from a single aggregate (averaging each aggregate "
+			    "of an expression would not average its value)",
+			    call_what);
+		}
+		auto dimension = SemanticTransformDimension(model, named("dimension"), atoms, call_what);
+		auto cumulative =
+		    SemanticMakeCumulative(context, analyzer, model, dimension, window.get(), part, period, call_what);
+		auto index = analyzer.Transforms().AddCumulative(std::move(cumulative));
+		return SemanticMarkers::Transform(SemanticTransformKind::CUMULATIVE, index, metric.Copy());
+	}
+
+	//! ", got <value>" for a constant argument (other arguments hold internal markers)
+	string Got(const ParsedExpression &argument) {
+		return SemanticIsConstant(analyzer, argument) ? ", got " + argument.ToString() : string();
+	}
+
+	//! The value of a string literal
+	static bool StringConstant(const ParsedExpression &expr, string &result) {
+		if (expr.GetExpressionClass() != ExpressionClass::CONSTANT) {
+			return false;
+		}
+		auto value = expr.Cast<ConstantExpression>().GetLiteral().ToValue();
+		if (value.IsNull() || value.type().id() != LogicalTypeId::VARCHAR) {
+			return false;
+		}
+		result = StringValue::Get(value);
+		return true;
+	}
+
+	//! Like CUMULATIVE metrics, cumulative() builds on plain metrics only: no OFFSET, CUMULATIVE or NON ADDITIVE BY
+	//! below it (time_shift() / cumulative() calls are markers by now)
+	void CheckCumulativeComposition(const ParsedExpression &expr, const string &call_what) {
+		auto transform = SemanticMarkers::ClassifyTransform(expr);
+		if (transform.kind != SemanticTransformKind::NONE) {
+			throw SemanticDefinitionException("%s: the metric expression cannot contain %s()", call_what,
+			                                  transform.kind == SemanticTransformKind::OFFSET ? TIME_SHIFT_FUNCTION
+			                                                                                  : CUMULATIVE_FUNCTION);
+		}
+		auto ref = SemanticMarkers::Classify(expr);
+		if (ref.Is(SemanticRefKind::MEMBER)) {
+			if (model.members[ref.index].Kind() == SemanticMemberKind::METRIC) {
+				CheckCumulativeMetric(ref.index, call_what);
+			}
+			return;
+		}
+		ParsedExpressionIterator::EnumerateChildren(
+		    expr, [&](const ParsedExpression &child) { CheckCumulativeComposition(child, call_what); });
+	}
+
+	//! `metric` and the metrics below it (CheckCumulativeComposition of the model builder)
+	void CheckCumulativeMetric(idx_t metric, const string &call_what) {
+		auto &member = model.members[metric];
+		const char *clause = member.offset.IsValid()        ? "OFFSET"
+		                     : member.cumulative.IsValid()  ? "CUMULATIVE"
+		                     : !member.non_additive.empty() ? "NON ADDITIVE BY"
+		                                                    : nullptr;
+		if (clause) {
+			throw SemanticDefinitionException("%s: the metric expression cannot reference metric \"%s\", which uses %s",
+			                                  call_what, model.MemberDisplayName(metric), clause);
+		}
+		CheckCumulativeComposition(*member.resolved, call_what);
 	}
 
 	void CheckNoWindow(const ParsedExpression &metric, const string &call_what) {

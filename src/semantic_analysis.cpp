@@ -247,9 +247,14 @@ unique_ptr<ParsedExpression> SemanticAnalyzer::Decompose(const ParsedExpression 
 		auto transform = SemanticMarkers::ClassifyTransform(*node);
 		if (transform.kind != SemanticTransformKind::NONE) {
 			// a query-time transform applies like the clause of an inlined metric (innermost first)
-			D_ASSERT(transform.kind == SemanticTransformKind::OFFSET);
 			auto inner = context;
-			inner.offsets.insert(inner.offsets.begin(), transform.index);
+			if (transform.kind == SemanticTransformKind::OFFSET) {
+				inner.offsets.insert(inner.offsets.begin(), transform.index);
+			} else {
+				// cumulative() only wraps plain metrics (SemanticResolveTransforms)
+				D_ASSERT(context.cumulative == DConstants::INVALID_INDEX);
+				inner.cumulative = transform.index;
+			}
 			auto &argument = node->Cast<FunctionExpression>().GetArguments()[1].GetExpression();
 			node = Decompose(argument, inner, atoms, what);
 			node->SetAlias(Identifier(alias));

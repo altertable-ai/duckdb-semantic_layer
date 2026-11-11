@@ -436,3 +436,361 @@ CREATE SEMANTIC VIEW bad TABLES (invoices PRIMARY KEY (invoice_id) TIME (invoice
   METRICS (invoices.x FILTER (WHERE main.__sv_offset(0, amount) > 0) AS SUM(amount));
 ----
 function "__sv_offset" is reserved for internal use
+
+#===--------------------------------------------------------------------===#
+# cumulative(<metric> [, trailing_window := <interval> | to_date := '<date part>'] [, period := ...]
+#            [, dimension := <dimension>])
+#===--------------------------------------------------------------------===#
+
+# cumulative(m, ...) computes what a metric defined with CUMULATIVE (metric_time.day ...) computes, at every grain
+foreach grain day month year
+
+# a running total
+query I
+SELECT (SELECT count(*) FROM (
+    (SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.{grain}, account.segment
+       METRICS cumulative(revenue) AS revenue_total)
+     EXCEPT ALL
+     SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.{grain}, account.segment
+       METRICS revenue_total))
+    UNION ALL
+    (SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.{grain}, account.segment
+       METRICS revenue_total)
+     EXCEPT ALL
+     SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.{grain}, account.segment
+       METRICS cumulative(revenue) AS revenue_total))
+  )) = 0
+   AND (SELECT count(*) FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.{grain}, account.segment
+       METRICS cumulative(revenue) AS revenue_total)) > 0;
+----
+true
+
+# period := 'average'
+query I
+SELECT (SELECT count(*) FROM (
+    (SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.{grain}, account.segment
+       METRICS cumulative(revenue, period := 'average') AS revenue_total_avg)
+     EXCEPT ALL
+     SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.{grain}, account.segment
+       METRICS revenue_total_avg))
+    UNION ALL
+    (SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.{grain}, account.segment
+       METRICS revenue_total_avg)
+     EXCEPT ALL
+     SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.{grain}, account.segment
+       METRICS cumulative(revenue, period := 'average') AS revenue_total_avg))
+  )) = 0
+   AND (SELECT count(*) FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.{grain}, account.segment
+       METRICS cumulative(revenue, period := 'average') AS revenue_total_avg)) > 0;
+----
+true
+
+# to_date := <part>
+query I
+SELECT (SELECT count(*) FROM (
+    (SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.{grain}, account.segment
+       METRICS cumulative(revenue, to_date := 'month') AS revenue_mtd)
+     EXCEPT ALL
+     SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.{grain}, account.segment
+       METRICS revenue_mtd))
+    UNION ALL
+    (SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.{grain}, account.segment
+       METRICS revenue_mtd)
+     EXCEPT ALL
+     SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.{grain}, account.segment
+       METRICS cumulative(revenue, to_date := 'month') AS revenue_mtd))
+  )) = 0
+   AND (SELECT count(*) FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.{grain}, account.segment
+       METRICS cumulative(revenue, to_date := 'month') AS revenue_mtd)) > 0;
+----
+true
+
+# trailing_window := <interval>
+query I
+SELECT (SELECT count(*) FROM (
+    (SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.{grain}, account.segment
+       METRICS cumulative(revenue, trailing_window := INTERVAL 7 DAYS) AS revenue_7d)
+     EXCEPT ALL
+     SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.{grain}, account.segment
+       METRICS revenue_7d))
+    UNION ALL
+    (SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.{grain}, account.segment
+       METRICS revenue_7d)
+     EXCEPT ALL
+     SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.{grain}, account.segment
+       METRICS cumulative(revenue, trailing_window := INTERVAL 7 DAYS) AS revenue_7d))
+  )) = 0
+   AND (SELECT count(*) FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.{grain}, account.segment
+       METRICS cumulative(revenue, trailing_window := INTERVAL 7 DAYS) AS revenue_7d)) > 0;
+----
+true
+
+# to_date and period
+query I
+SELECT (SELECT count(*) FROM (
+    (SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.{grain}, account.segment
+       METRICS cumulative(revenue, to_date := 'year', period := 'first') AS revenue_ytd_first)
+     EXCEPT ALL
+     SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.{grain}, account.segment
+       METRICS revenue_ytd_first))
+    UNION ALL
+    (SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.{grain}, account.segment
+       METRICS revenue_ytd_first)
+     EXCEPT ALL
+     SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.{grain}, account.segment
+       METRICS cumulative(revenue, to_date := 'year', period := 'first') AS revenue_ytd_first))
+  )) = 0
+   AND (SELECT count(*) FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.{grain}, account.segment
+       METRICS cumulative(revenue, to_date := 'year', period := 'first') AS revenue_ytd_first)) > 0;
+----
+true
+
+# names and values are case-insensitive, in any order
+query I
+SELECT (SELECT count(*) FROM (
+    (SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.{grain}, account.segment
+       METRICS CUMULATIVE(revenue, PERIOD := 'FIRST', TO_DATE := 'YEAR') AS revenue_ytd_first)
+     EXCEPT ALL
+     SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.{grain}, account.segment
+       METRICS revenue_ytd_first))
+    UNION ALL
+    (SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.{grain}, account.segment
+       METRICS revenue_ytd_first)
+     EXCEPT ALL
+     SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.{grain}, account.segment
+       METRICS CUMULATIVE(revenue, PERIOD := 'FIRST', TO_DATE := 'YEAR') AS revenue_ytd_first))
+  )) = 0
+   AND (SELECT count(*) FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.{grain}, account.segment
+       METRICS CUMULATIVE(revenue, PERIOD := 'FIRST', TO_DATE := 'YEAR') AS revenue_ytd_first)) > 0;
+----
+true
+
+# over an ad-hoc aggregate
+query I
+SELECT (SELECT count(*) FROM (
+    (SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.{grain}, account.segment
+       METRICS cumulative(COUNT(DISTINCT invoices.account_id), trailing_window := INTERVAL 28 DAYS) AS buyers_28d)
+     EXCEPT ALL
+     SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.{grain}, account.segment
+       METRICS buyers_28d))
+    UNION ALL
+    (SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.{grain}, account.segment
+       METRICS buyers_28d)
+     EXCEPT ALL
+     SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.{grain}, account.segment
+       METRICS cumulative(COUNT(DISTINCT invoices.account_id), trailing_window := INTERVAL 28 DAYS) AS buyers_28d))
+  )) = 0
+   AND (SELECT count(*) FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.{grain}, account.segment
+       METRICS cumulative(COUNT(DISTINCT invoices.account_id), trailing_window := INTERVAL 28 DAYS) AS buyers_28d)) > 0;
+----
+true
+
+# shifting a cumulative
+query I
+SELECT (SELECT count(*) FROM (
+    (SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.{grain}, account.segment
+       METRICS time_shift(cumulative(revenue, to_date := 'year', period := 'first'), INTERVAL 1 YEAR) AS revenue_ytd_ly)
+     EXCEPT ALL
+     SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.{grain}, account.segment
+       METRICS revenue_ytd_ly))
+    UNION ALL
+    (SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.{grain}, account.segment
+       METRICS revenue_ytd_ly)
+     EXCEPT ALL
+     SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.{grain}, account.segment
+       METRICS time_shift(cumulative(revenue, to_date := 'year', period := 'first'), INTERVAL 1 YEAR) AS revenue_ytd_ly))
+  )) = 0
+   AND (SELECT count(*) FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.{grain}, account.segment
+       METRICS time_shift(cumulative(revenue, to_date := 'year', period := 'first'), INTERVAL 1 YEAR) AS revenue_ytd_ly)) > 0;
+----
+true
+
+# an explicit dimension
+query I
+SELECT (SELECT count(*) FROM (
+    (SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.{grain}, account.segment
+       METRICS cumulative(revenue, dimension := metric_time.day) AS revenue_total)
+     EXCEPT ALL
+     SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.{grain}, account.segment
+       METRICS revenue_total))
+    UNION ALL
+    (SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.{grain}, account.segment
+       METRICS revenue_total)
+     EXCEPT ALL
+     SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.{grain}, account.segment
+       METRICS cumulative(revenue, dimension := metric_time.day) AS revenue_total))
+  )) = 0
+   AND (SELECT count(*) FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.{grain}, account.segment
+       METRICS cumulative(revenue, dimension := metric_time.day) AS revenue_total)) > 0;
+----
+true
+
+endloop
+
+# the WHERE clause does not remove earlier rows from the running total
+query I
+SELECT (SELECT count(*) FROM (
+    (SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
+       METRICS cumulative(revenue) AS revenue_total WHERE metric_time.month >= DATE '2026-03-01')
+     EXCEPT ALL
+     SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
+       METRICS revenue_total WHERE metric_time.month >= DATE '2026-03-01'))
+    UNION ALL
+    (SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
+       METRICS revenue_total WHERE metric_time.month >= DATE '2026-03-01')
+     EXCEPT ALL
+     SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
+       METRICS cumulative(revenue) AS revenue_total WHERE metric_time.month >= DATE '2026-03-01'))
+  )) = 0
+   AND (SELECT count(*) FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
+       METRICS cumulative(revenue) AS revenue_total WHERE metric_time.month >= DATE '2026-03-01')) > 0;
+----
+true
+
+# ... which really are counted: March 2026 holds every invoice up to it
+query I
+SELECT revenue_total FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
+  METRICS cumulative(revenue) AS revenue_total WHERE metric_time.month >= DATE '2026-03-01')
+WHERE month = DATE '2026-03-01';
+----
+1620
+
+
+# ... and compiles to the same SQL
+query I
+SELECT (SELECT sql FROM semantic_view_sql('SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
+          METRICS cumulative(revenue, to_date := ''month'') AS revenue_mtd)'))
+     = (SELECT sql FROM semantic_view_sql('SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
+          METRICS revenue_mtd)'));
+----
+true
+
+# equal clauses share their block with the defined metric
+query II
+SELECT count(*) > 0, count(*) FILTER (WHERE revenue_mtd IS DISTINCT FROM a) = 0
+FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
+  METRICS revenue_mtd, cumulative(revenue, to_date := 'month') AS a);
+----
+true	true
+
+# composition: no OFFSET, CUMULATIVE or NON ADDITIVE BY below a cumulative
+statement error
+SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month METRICS cumulative(revenue_ly) AS x);
+----
+cannot reference metric "invoices.revenue_ly", which uses OFFSET
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
+  METRICS cumulative(time_shift(revenue, INTERVAL 1 YEAR)) AS x);
+----
+cannot contain time_shift()
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month METRICS cumulative(revenue_total) AS x);
+----
+cannot reference metric "invoices.revenue_total", which uses CUMULATIVE
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month METRICS cumulative(cumulative(revenue)) AS x);
+----
+cannot contain cumulative()
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month METRICS cumulative(balance) AS x);
+----
+cannot reference metric "balances.balance", which uses NON ADDITIVE BY
+
+# no window function below the cumulative
+statement error
+SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month, account.segment
+  METRICS cumulative(revenue_share) AS x);
+----
+cannot contain a window function
+
+# 'average' averages a single aggregate
+statement error
+SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
+  METRICS cumulative(revenue / avg_amount, period := 'average') AS x);
+----
+requires a metric computed from a single aggregate
+
+# the arguments
+statement error
+SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
+  METRICS cumulative(revenue, trailing_window := 42) AS x);
+----
+trailing_window must be an interval
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
+  METRICS cumulative(revenue, trailing_window := invoices.amount) AS x);
+----
+the window must be a constant expression
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
+  METRICS cumulative(revenue, trailing_window := INTERVAL 7 DAYS, to_date := 'month') AS x);
+----
+trailing_window and to_date cannot be combined
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
+  METRICS cumulative(revenue, to_date := 'fortnight') AS x);
+----
+"fortnight" is not a date part to truncate to
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month METRICS cumulative(revenue, to_date := 42) AS x);
+----
+to_date must be
+
+# a non-constant argument is not printed (it holds internal markers)
+statement error
+SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month METRICS cumulative(revenue, to_date := month) AS x);
+----
+<REGEX>:.*to_date must be a date part string \(e\.g\. to_date := 'month'\)\n.*
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
+  METRICS cumulative(revenue, period := 'median') AS x);
+----
+period must be 'first', 'last' or 'average'
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month METRICS cumulative(revenue, 'month') AS x);
+----
+cumulative(<metric> [, trailing_window := <interval> | to_date := '<date part>'] [, period := 'first' | 'last' | 'average'] [, dimension := <dimension>])
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month METRICS cumulative(revenue, metric_time.day) AS x);
+----
+cumulative(<metric> [, trailing_window := <interval> | to_date := '<date part>'] [, period := 'first' | 'last' | 'average'] [, dimension := <dimension>])
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
+  METRICS cumulative(revenue, window_size := INTERVAL 7 DAYS) AS x);
+----
+<REGEX>:.*unknown argument "window_size".*trailing_window.*
+
+# the dimension
+statement error
+SELECT * FROM SEMANTIC_VIEW(ledger_untimed DIMENSIONS invoices.invoice_month METRICS cumulative(revenue) AS x);
+----
+<REGEX>:.*cumulative\(\) needs dimension :=.*invoices\.invoice_date.*
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
+  METRICS cumulative(revenue, dimension := invoices.invoice_month) AS x);
+----
+<REGEX>:.*cumulative\(\): dimension "invoices\.invoice_month" must be defined as a column.*valid dimensions:.*invoices\.invoice_date.*
+
+# only in METRICS
+statement error
+SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month METRICS revenue WHERE cumulative(revenue) > 0);
+----
+cumulative() is only allowed in METRICS
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month METRICS SUM(cumulative(invoices.amount)) AS x);
+----
+cumulative() cannot be used inside an aggregate

@@ -9,8 +9,6 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/common/error_data.hpp"
-#include "duckdb/parser/expression/cast_expression.hpp"
-#include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/star_expression.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
@@ -23,7 +21,6 @@
 #include "semantic_definition_exception.hpp"
 #include "semantic_model.hpp"
 #include "semantic_materialization.hpp"
-#include "semantic_cumulative.hpp"
 #include "semantic_query_compiler.hpp"
 #include "semantic_time_spine.hpp"
 #include "semantic_transforms.hpp"
@@ -551,7 +548,7 @@ private:
 	}
 
 	//! CUMULATIVE dimensions resolve like OFFSET dimensions; the OVER window is constant and the window condition
-	//! binds over the column's type. Equal clauses are stored once.
+	//! binds over the column's type (SemanticMakeCumulative). Equal clauses are stored once.
 	void ResolveCumulatives() {
 		SemanticAnalyzer analyzer(*model, context);
 		for (idx_t m = 0; m < model->members.size(); m++) {
@@ -561,57 +558,24 @@ private:
 				continue;
 			}
 			auto what = What(m) + " CUMULATIVE";
+			idx_t dimension;
+			ResolveColumnDimension(parsed.cumulative_dimension, m, what, dimension);
 			SemanticCumulative cumulative;
-			auto column = ResolveColumnDimension(parsed.cumulative_dimension, m, what, cumulative.dimension);
-			auto &table = model->tables[column.index];
-			cumulative.table = column.index;
-			cumulative.column = column.column;
-			cumulative.type = table.column_types[table.columns.at(column.column)];
-			cumulative.period = parsed.cumulative_period;
-			cumulative.kind = SemanticCumulativeKind::ALL;
-			if (parsed.cumulative_window) {
-				if (!SemanticIsConstant(analyzer, *parsed.cumulative_window)) {
-					Fail("%s: the window must be a constant expression", what);
-				}
-				cumulative.kind = SemanticCumulativeKind::WINDOW;
-				cumulative.window = parsed.cumulative_window->Copy();
-			} else if (!parsed.cumulative_part.empty()) {
-				if (!SemanticIsTruncationPart(parsed.cumulative_part)) {
-					Fail("%s: \"%s\" is not a date part to truncate to (e.g. day, week, month, quarter, year)", what,
-					     parsed.cumulative_part);
-				}
-				cumulative.kind = SemanticCumulativeKind::GRAIN;
-				cumulative.part = parsed.cumulative_part;
+			try {
+				cumulative =
+				    SemanticMakeCumulative(context, analyzer, *model, dimension, parsed.cumulative_window.get(),
+				                           parsed.cumulative_part, parsed.cumulative_period, what);
+			} catch (SemanticDefinitionException &ex) {
+				ErrorData error(ex);
+				Fail("%s", error.RawMessage());
 			}
 			auto existing = std::find_if(model->cumulatives.begin(), model->cumulatives.end(),
 			                             [&](const SemanticCumulative &other) { return other.Equals(cumulative); });
 			if (existing == model->cumulatives.end()) {
-				CheckCumulativeType(cumulative, what);
 				model->cumulatives.push_back(std::move(cumulative));
 				existing = model->cumulatives.end() - 1;
 			}
 			member.cumulative = NumericCast<idx_t>(existing - model->cumulatives.begin());
-		}
-	}
-
-	//! Binds SELECT <window condition over CAST(NULL AS <type>)>
-	void CheckCumulativeType(const SemanticCumulative &cumulative, const string &what) {
-		auto null = [&]() {
-			return make_uniq<CastExpression>(cumulative.type, ConstantExpression::FromValue(Value()));
-		};
-		auto error = SemanticBindError(context, SemanticCumulativeWindow(cumulative, null(), null()));
-		if (error.empty()) {
-			return;
-		}
-		auto column = "column \"" + model->tables[cumulative.table].name + "." + cumulative.column + "\" (" +
-		              cumulative.type.ToString() + ")";
-		switch (cumulative.kind) {
-		case SemanticCumulativeKind::WINDOW:
-			Fail("%s: cannot use %s as the window of %s: %s", what, cumulative.window->ToString(), column, error);
-		case SemanticCumulativeKind::GRAIN:
-			Fail("%s: cannot truncate %s to %s: %s", what, column, cumulative.part, error);
-		default:
-			Fail("%s: %s cannot be ordered: %s", what, column, error);
 		}
 	}
 

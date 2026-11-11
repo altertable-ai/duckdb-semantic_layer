@@ -43,12 +43,18 @@ private:
 
 //! Whether `expr` is a constant: no column, member, aggregate, window or parameter
 bool SemanticIsConstant(SemanticAnalyzer &analyzer, const ParsedExpression &expr);
-//! Binds SELECT <expr>; the binder's error message, or empty
-string SemanticBindError(ClientContext &context, unique_ptr<ParsedExpression> expr);
+//! Binds SELECT <expr>; the binder's error message, or empty (then `type`, if given, receives the expression's type)
+string SemanticBindError(ClientContext &context, unique_ptr<ParsedExpression> expr,
+                         optional_ptr<LogicalType> type = nullptr);
 //! Validated offset of dimension member `dimension` (defined as a column); throws SemanticDefinitionException
 //! "<what>: ..." with today's messages
 SemanticOffset SemanticMakeOffset(ClientContext &context, SemanticAnalyzer &analyzer, const SemanticModel &model,
                                   idx_t dimension, const ParsedExpression &interval, const string &what);
+//! Validated cumulative of dimension member `dimension` (defined as a column); `window` null unless kind WINDOW,
+//! `part` (lower case) empty unless GRAIN; throws SemanticDefinitionException "<what>: ..." with today's messages
+SemanticCumulative SemanticMakeCumulative(ClientContext &context, SemanticAnalyzer &analyzer,
+                                          const SemanticModel &model, idx_t dimension, const ParsedExpression *window,
+                                          const string &part, SemanticCumulativePeriod period, const string &what);
 
 //! The first unqualified time_shift / cumulative call in `expr`, or nullptr
 optional_ptr<const FunctionExpression> SemanticFindTransformCall(const ParsedExpression &expr);
