@@ -20,11 +20,13 @@
 #include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "semantic_analysis.hpp"
+#include "semantic_definition_exception.hpp"
 #include "semantic_model.hpp"
 #include "semantic_materialization.hpp"
 #include "semantic_cumulative.hpp"
 #include "semantic_query_compiler.hpp"
 #include "semantic_time_spine.hpp"
+#include "semantic_transforms.hpp"
 
 namespace duckdb {
 
@@ -495,10 +497,6 @@ private:
 		}
 	}
 
-	static bool IsConstant(SemanticAnalyzer &analyzer, const ParsedExpression &expr) {
-		return expr.IsScalar() && !analyzer.ContainsAggregateOrMetric(expr) && !SemanticAnalyzer::ContainsWindow(expr);
-	}
-
 	//! The dimension of a metric's OFFSET / CUMULATIVE clause: a dimension defined as a column (returned)
 	SemanticRef ResolveColumnDimension(const vector<string> &name_parts, idx_t m, const string &what,
 	                                   idx_t &dimension) {
@@ -523,7 +521,7 @@ private:
 	}
 
 	//! OFFSET dimensions resolve to a dimension defined as a column; the interval must be constant and shift the
-	//! column's type. Equal offsets are stored once.
+	//! column's type (SemanticMakeOffset). Equal offsets are stored once.
 	void ResolveOffsets() {
 		SemanticAnalyzer analyzer(*model, context);
 		for (idx_t m = 0; m < model->members.size(); m++) {
@@ -534,53 +532,21 @@ private:
 			}
 			auto what = What(m) + " OFFSET";
 			idx_t dimension;
-			auto column = ResolveColumnDimension(parsed.offset_dimension, m, what, dimension);
-			auto &interval = *parsed.offset_interval;
-			if (!IsConstant(analyzer, interval)) {
-				Fail("%s: the interval must be a constant expression", what);
-			}
-			auto &table = model->tables[column.index];
+			ResolveColumnDimension(parsed.offset_dimension, m, what, dimension);
 			SemanticOffset offset;
-			offset.dimension = dimension;
-			offset.table = column.index;
-			offset.column = column.column;
-			offset.type = table.column_types[table.columns.at(column.column)];
-			offset.interval = interval.Copy();
+			try {
+				offset = SemanticMakeOffset(context, analyzer, *model, dimension, *parsed.offset_interval, what);
+			} catch (SemanticDefinitionException &ex) {
+				ErrorData error(ex);
+				Fail("%s", error.RawMessage());
+			}
 			auto existing = std::find_if(model->offsets.begin(), model->offsets.end(),
 			                             [&](const SemanticOffset &other) { return other.Equals(offset); });
 			if (existing == model->offsets.end()) {
-				CheckOffsetType(offset, what);
 				model->offsets.push_back(std::move(offset));
 				existing = model->offsets.end() - 1;
 			}
 			member.offset = NumericCast<idx_t>(existing - model->offsets.begin());
-		}
-	}
-
-	//! Binds SELECT <expr>; the binder's error message, or empty
-	string BindError(unique_ptr<ParsedExpression> expr) {
-		auto node = make_uniq<SelectNode>();
-		node->select_list.push_back(std::move(expr));
-		node->from_table = make_uniq<EmptyTableRef>();
-		auto statement = make_uniq<SelectStatement>();
-		statement->node = std::move(node);
-		try {
-			auto binder = Binder::CreateBinder(context);
-			binder->Bind(statement->Cast<SQLStatement>());
-		} catch (std::exception &ex) {
-			ErrorData error(ex);
-			return error.RawMessage();
-		}
-		return string();
-	}
-
-	//! Binds SELECT CAST(CAST(NULL AS <type>) + <interval> AS <type>)
-	void CheckOffsetType(const SemanticOffset &offset, const string &what) {
-		auto error = BindError(SemanticShiftColumn(
-		    make_uniq<CastExpression>(offset.type, ConstantExpression::FromValue(Value())), offset));
-		if (!error.empty()) {
-			Fail("%s: cannot shift column \"%s.%s\" (%s) by %s: %s", what, model->tables[offset.table].name,
-			     offset.column, offset.type.ToString(), offset.interval->ToString(), error);
 		}
 	}
 
@@ -604,7 +570,7 @@ private:
 			cumulative.period = parsed.cumulative_period;
 			cumulative.kind = SemanticCumulativeKind::ALL;
 			if (parsed.cumulative_window) {
-				if (!IsConstant(analyzer, *parsed.cumulative_window)) {
+				if (!SemanticIsConstant(analyzer, *parsed.cumulative_window)) {
 					Fail("%s: the window must be a constant expression", what);
 				}
 				cumulative.kind = SemanticCumulativeKind::WINDOW;
@@ -633,7 +599,7 @@ private:
 		auto null = [&]() {
 			return make_uniq<CastExpression>(cumulative.type, ConstantExpression::FromValue(Value()));
 		};
-		auto error = BindError(SemanticCumulativeWindow(cumulative, null(), null()));
+		auto error = SemanticBindError(context, SemanticCumulativeWindow(cumulative, null(), null()));
 		if (error.empty()) {
 			return;
 		}
@@ -773,6 +739,7 @@ private:
 		SemanticAnalyzer analyzer(*model, context);
 		for (idx_t m = 0; m < model->members.size(); m++) {
 			auto what = What(m);
+			CheckNoTransformCalls(m, what);
 			CheckNoWindowMetricReferences(m, what);
 			if (model->members[m].IsRowLevel()) {
 				CheckRowLevelMember(analyzer, m, what);
@@ -780,6 +747,17 @@ private:
 				CheckMetric(analyzer, m, what);
 			}
 		}
+	}
+
+	//! time_shift() / cumulative() are query-time forms of OFFSET / CUMULATIVE
+	void CheckNoTransformCalls(idx_t member, const string &what) {
+		auto call = SemanticFindTransformCall(*model->members[member].resolved);
+		if (!call) {
+			return;
+		}
+		auto &name = call->FunctionName().GetIdentifierName();
+		Fail("%s: %s() is only allowed in queries; use %s (...) in a definition", what, name,
+		     StringUtil::CIEquals(name, "time_shift") ? "OFFSET" : "CUMULATIVE");
 	}
 
 	//! Window-function metrics cannot be used by other semantic expressions

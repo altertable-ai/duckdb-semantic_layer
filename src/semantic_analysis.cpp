@@ -244,6 +244,17 @@ unique_ptr<ParsedExpression> SemanticAnalyzer::Decompose(const ParsedExpression 
 	std::function<void(unique_ptr<ParsedExpression> &)> rewrite_window_key;
 	std::function<void(unique_ptr<ParsedExpression> &)> rewrite = [&](unique_ptr<ParsedExpression> &node) {
 		auto alias = node->GetAlias();
+		auto transform = SemanticMarkers::ClassifyTransform(*node);
+		if (transform.kind != SemanticTransformKind::NONE) {
+			// a query-time transform applies like the clause of an inlined metric (innermost first)
+			D_ASSERT(transform.kind == SemanticTransformKind::OFFSET);
+			auto inner = context;
+			inner.offsets.insert(inner.offsets.begin(), transform.index);
+			auto &argument = node->Cast<FunctionExpression>().GetArguments()[1].GetExpression();
+			node = Decompose(argument, inner, atoms, what);
+			node->SetAlias(Identifier(alias));
+			return;
+		}
 		if (IsAggregate(*node)) {
 			SemanticAtom atom;
 			atom.home = AggregateHome(node->Cast<FunctionExpression>(), context.table, what);
@@ -313,7 +324,8 @@ unique_ptr<ParsedExpression> SemanticAnalyzer::Decompose(const ParsedExpression 
 			    "%s: the window clause must reference dimensions or metrics, not column \"%s.%s\"", what,
 			    model.tables[ref.index].name, ref.column);
 		}
-		if (IsAggregate(*node) || ref.Is(SemanticRefKind::MEMBER)) {
+		if (IsAggregate(*node) || ref.Is(SemanticRefKind::MEMBER) ||
+		    SemanticMarkers::ClassifyTransform(*node).kind != SemanticTransformKind::NONE) {
 			rewrite(node);
 			return;
 		}

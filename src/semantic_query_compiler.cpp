@@ -743,11 +743,17 @@ SemanticQuerySpec SemanticQueryCompiler::Resolve(const vector<ParsedSemanticQuer
 			              : ref.Is(SemanticRefKind::COLUMN) ? ref.column
 			                                                : item.expression->ToString();
 		}
-		spec.items.push_back(SemanticQueryItem {item.kind, std::move(resolved), output_name});
+		SemanticQueryItem query_item {item.kind, std::move(resolved), output_name};
+		query_item.resolved =
+		    SemanticResolveTransforms(analyzer.Context(), analyzer, model, std::move(query_item.resolved), item.kind,
+		                              SemanticItemWhat(query_item));
+		spec.items.push_back(std::move(query_item));
 	}
 	if (where) {
 		resolve_context.what = "Invalid WHERE clause";
-		spec.where = model.Resolve(*where, resolve_context);
+		spec.where =
+		    SemanticResolveTransforms(analyzer.Context(), analyzer, model, model.Resolve(*where, resolve_context),
+		                              SemanticMemberKind::DIMENSION, resolve_context.what);
 	}
 	return spec;
 }

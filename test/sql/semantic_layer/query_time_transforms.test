@@ -1,0 +1,404 @@
+# name: test/sql/semantic_layer/query_time_transforms.test
+# description: query-time metric transforms: time_shift(...) and cumulative(...)
+# group: [semantic_layer]
+
+require semantic_layer
+
+statement ok
+PRAGMA enable_verification
+
+statement ok
+CREATE TABLE accounts (account_id INTEGER, segment VARCHAR, country VARCHAR);
+
+statement ok
+INSERT INTO accounts VALUES (1, 'enterprise', 'FR'), (2, 'startup', 'US'), (3, 'enterprise', 'DE');
+
+# 2025: no invoices in April, June, August and November; 2026: April has no 2025 counterpart
+statement ok
+CREATE TABLE invoices (invoice_id INTEGER, account_id INTEGER, invoiced_at DATE, amount INTEGER);
+
+statement ok
+INSERT INTO invoices VALUES
+  (1, 1, '2025-01-05', 100), (2, 2, '2025-01-20', 200), (3, 3, '2025-02-11', 150), (4, 1, '2025-03-03', 120),
+  (5, 2, '2025-05-17', 80), (6, 3, '2025-07-09', 300), (7, 1, '2025-09-30', 90), (8, 2, '2025-10-01', 60),
+  (9, 3, '2025-12-31', 110),
+  (10, 1, '2026-01-05', 130), (11, 3, '2026-01-28', 70), (12, 2, '2026-03-14', 210), (13, 1, '2026-04-02', 50),
+  (14, 3, '2026-05-17', 140), (15, 2, '2026-07-09', 95), (16, 1, '2026-09-30', 160), (17, 3, '2026-10-01', 40),
+  (18, 2, '2026-12-31', 75);
+
+statement ok
+CREATE TABLE balances (account_id INTEGER, as_of DATE, balance INTEGER);
+
+statement ok
+INSERT INTO balances VALUES
+  (1, '2025-06-30', 1000), (2, '2025-06-30', 500), (3, '2025-12-31', 700),
+  (1, '2026-06-30', 1200), (2, '2026-06-30', 450), (3, '2026-12-31', 800);
+
+statement ok
+CREATE SEMANTIC VIEW ledger
+  TABLES (
+    account AS accounts PRIMARY KEY (account_id),
+    invoices PRIMARY KEY (invoice_id) TIME (invoiced_at),
+    balances PRIMARY KEY (account_id, as_of)
+  )
+  RELATIONSHIPS (invoices (account_id) REFERENCES account, balances (account_id) REFERENCES account)
+  DIMENSIONS (account.segment AS segment, invoices.invoice_date AS invoiced_at,
+              invoices.invoice_month AS DATE_TRUNC('month', invoiced_at)::DATE, balances.as_of_day AS as_of)
+  METRICS (
+    invoices.revenue AS SUM(amount),
+    invoices.avg_amount AS AVG(amount),
+    invoices.revenue_ly OFFSET (metric_time.day BY INTERVAL 1 YEAR) AS revenue,
+    invoices.revenue_lm_by_date OFFSET (invoices.invoice_date BY INTERVAL 1 MONTH) AS revenue,
+    invoices.revenue_total CUMULATIVE (metric_time.day) AS SUM(amount),
+    invoices.revenue_total_avg CUMULATIVE (metric_time.day AVERAGE) AS SUM(amount),
+    invoices.revenue_mtd CUMULATIVE (metric_time.day TO MONTH) AS SUM(amount),
+    invoices.revenue_7d CUMULATIVE (metric_time.day OVER INTERVAL 7 DAYS) AS SUM(amount),
+    invoices.revenue_ytd_first CUMULATIVE (metric_time.day TO YEAR FIRST) AS SUM(amount),
+    invoices.revenue_ytd_ly OFFSET (metric_time.day BY INTERVAL 1 YEAR) AS revenue_ytd_first,
+    invoices.buyers_28d CUMULATIVE (metric_time.day OVER INTERVAL 28 DAYS) AS COUNT(DISTINCT account_id),
+    balances.balance NON ADDITIVE BY (balances.as_of_day) AS SUM(balance),
+    invoices.revenue_share AS invoices.revenue / SUM(invoices.revenue) OVER (PARTITION BY EXCLUDING account.segment)
+  );
+
+# the same invoices without TIME: no default dimension
+statement ok
+CREATE SEMANTIC VIEW ledger_untimed
+  TABLES (invoices PRIMARY KEY (invoice_id))
+  DIMENSIONS (invoices.invoice_date AS invoiced_at, invoices.invoice_month AS DATE_TRUNC('month', invoiced_at)::DATE)
+  METRICS (
+    invoices.revenue AS SUM(amount),
+    invoices.revenue_lm OFFSET (invoices.invoice_date BY INTERVAL 1 MONTH) AS revenue
+  );
+
+#===--------------------------------------------------------------------===#
+# time_shift(<metric>, <interval> [, dimension := <dimension>])
+#===--------------------------------------------------------------------===#
+
+# time_shift(m, i) computes what a metric defined with OFFSET (metric_time.day BY i) computes, at every grain
+foreach grain day month year
+
+query I
+SELECT (SELECT count(*) FROM (
+    (SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.{grain}, account.segment
+       METRICS time_shift(revenue, INTERVAL 1 YEAR) AS revenue_ly)
+     EXCEPT ALL
+     SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.{grain}, account.segment METRICS revenue_ly))
+    UNION ALL
+    (SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.{grain}, account.segment METRICS revenue_ly)
+     EXCEPT ALL
+     SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.{grain}, account.segment
+       METRICS time_shift(revenue, INTERVAL 1 YEAR) AS revenue_ly))
+  )) = 0
+   AND (SELECT count(*) FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.{grain}, account.segment
+       METRICS time_shift(revenue, INTERVAL 1 YEAR) AS revenue_ly)) > 0;
+----
+true
+
+endloop
+
+# ... and compiles to the same SQL
+query I
+SELECT (SELECT sql FROM semantic_view_sql('SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
+          METRICS time_shift(revenue, INTERVAL 1 YEAR) AS revenue_ly)'))
+     = (SELECT sql FROM semantic_view_sql('SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
+          METRICS revenue_ly)'));
+----
+true
+
+# the WHERE clause reads the shifted rows
+query I
+SELECT (SELECT count(*) FROM (
+    (SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
+       METRICS time_shift(revenue, INTERVAL 1 YEAR) AS revenue_ly WHERE metric_time.year = DATE '2026-01-01')
+     EXCEPT ALL
+     SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month METRICS revenue_ly
+       WHERE metric_time.year = DATE '2026-01-01'))
+    UNION ALL
+    (SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month METRICS revenue_ly
+       WHERE metric_time.year = DATE '2026-01-01')
+     EXCEPT ALL
+     SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
+       METRICS time_shift(revenue, INTERVAL 1 YEAR) AS revenue_ly WHERE metric_time.year = DATE '2026-01-01'))
+  )) = 0
+   AND (SELECT count(*) FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
+       METRICS time_shift(revenue, INTERVAL 1 YEAR) AS revenue_ly WHERE metric_time.year = DATE '2026-01-01')) > 0;
+----
+true
+
+# growth over the 2026 months that have 2025 data
+query II
+SELECT count(*), count(*) FILTER (WHERE growth IS NULL)
+FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
+  METRICS revenue / time_shift(revenue, INTERVAL 1 YEAR) - 1 AS growth WHERE metric_time.year = DATE '2026-01-01')
+WHERE month IN (DATE '2026-01-01', DATE '2026-03-01', DATE '2026-05-01', DATE '2026-07-01', DATE '2026-09-01',
+                DATE '2026-10-01', DATE '2026-12-01');
+----
+7	0
+
+# inside an expression
+query I
+SELECT (SELECT count(*) FROM (
+    (SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month, account.segment
+       METRICS revenue / time_shift(revenue, INTERVAL 1 YEAR) - 1 AS growth)
+     EXCEPT ALL
+     SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month, account.segment
+       METRICS revenue / revenue_ly - 1 AS growth))
+    UNION ALL
+    (SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month, account.segment
+       METRICS revenue / revenue_ly - 1 AS growth)
+     EXCEPT ALL
+     SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month, account.segment
+       METRICS revenue / time_shift(revenue, INTERVAL 1 YEAR) - 1 AS growth))
+  )) = 0
+   AND (SELECT count(*) FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month, account.segment
+       METRICS revenue / time_shift(revenue, INTERVAL 1 YEAR) - 1 AS growth)) > 0;
+----
+true
+
+# over an ad-hoc aggregate
+query I
+SELECT (SELECT count(*) FROM (
+    (SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month, account.segment
+       METRICS time_shift(SUM(invoices.amount), INTERVAL 1 YEAR) AS revenue_ly)
+     EXCEPT ALL
+     SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month, account.segment METRICS revenue_ly))
+    UNION ALL
+    (SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month, account.segment METRICS revenue_ly)
+     EXCEPT ALL
+     SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month, account.segment
+       METRICS time_shift(SUM(invoices.amount), INTERVAL 1 YEAR) AS revenue_ly))
+  )) = 0
+   AND (SELECT count(*) FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month, account.segment
+       METRICS time_shift(SUM(invoices.amount), INTERVAL 1 YEAR) AS revenue_ly)) > 0;
+----
+true
+
+# nested shifts add up
+query I
+SELECT (SELECT count(*) FROM (
+    (SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
+       METRICS time_shift(time_shift(revenue, INTERVAL 1 YEAR), INTERVAL 1 YEAR) AS r)
+     EXCEPT ALL
+     SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
+       METRICS time_shift(revenue, INTERVAL 2 YEARS) AS r))
+    UNION ALL
+    (SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
+       METRICS time_shift(revenue, INTERVAL 2 YEARS) AS r)
+     EXCEPT ALL
+     SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
+       METRICS time_shift(time_shift(revenue, INTERVAL 1 YEAR), INTERVAL 1 YEAR) AS r))
+  )) = 0
+   AND (SELECT count(*) FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
+       METRICS time_shift(time_shift(revenue, INTERVAL 1 YEAR), INTERVAL 1 YEAR) AS r)) > 0;
+----
+true
+
+# the function name is case-insensitive
+query I
+SELECT (SELECT count(*) FROM (
+    (SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
+       METRICS TIME_SHIFT(revenue, INTERVAL 1 YEAR) AS revenue_ly)
+     EXCEPT ALL
+     SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month METRICS revenue_ly))
+    UNION ALL
+    (SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month METRICS revenue_ly)
+     EXCEPT ALL
+     SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
+       METRICS TIME_SHIFT(revenue, INTERVAL 1 YEAR) AS revenue_ly))
+  )) = 0
+   AND (SELECT count(*) FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
+       METRICS TIME_SHIFT(revenue, INTERVAL 1 YEAR) AS revenue_ly)) > 0;
+----
+true
+
+# a window function over a shifted metric
+query I
+SELECT count(*) > 0 FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month, account.segment
+  METRICS RANK() OVER (PARTITION BY EXCLUDING account.segment ORDER BY time_shift(revenue, INTERVAL 1 YEAR)) AS r);
+----
+true
+
+# ... ranks the shifted values
+query I
+SELECT (SELECT count(*) FROM (
+    (SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month, account.segment
+       METRICS RANK() OVER (PARTITION BY EXCLUDING account.segment ORDER BY time_shift(revenue, INTERVAL 1 YEAR)) AS r)
+     EXCEPT ALL
+     SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month, account.segment
+       METRICS RANK() OVER (PARTITION BY EXCLUDING account.segment ORDER BY revenue_ly) AS r))
+    UNION ALL
+    (SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month, account.segment
+       METRICS RANK() OVER (PARTITION BY EXCLUDING account.segment ORDER BY revenue_ly) AS r)
+     EXCEPT ALL
+     SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month, account.segment
+       METRICS RANK() OVER (PARTITION BY EXCLUDING account.segment ORDER BY time_shift(revenue, INTERVAL 1 YEAR)) AS r))
+  )) = 0
+   AND (SELECT count(*) FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month, account.segment
+       METRICS RANK() OVER (PARTITION BY EXCLUDING account.segment ORDER BY time_shift(revenue, INTERVAL 1 YEAR)) AS r)) > 0;
+----
+true
+
+# equal shifts share their block with the defined metric
+query II
+SELECT count(*) > 0, count(*) FILTER (WHERE revenue_ly IS DISTINCT FROM a OR a IS DISTINCT FROM b) = 0
+FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
+  METRICS revenue_ly, time_shift(revenue, INTERVAL 1 YEAR) AS a, time_shift(revenue, INTERVAL 1 YEAR) AS b);
+----
+true	true
+
+# an explicit dimension
+query I
+SELECT (SELECT count(*) FROM (
+    (SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS invoices.invoice_month
+       METRICS time_shift(revenue, INTERVAL 1 MONTH, dimension := invoices.invoice_date) AS r)
+     EXCEPT ALL
+     SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS invoices.invoice_month METRICS revenue_lm_by_date AS r))
+    UNION ALL
+    (SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS invoices.invoice_month METRICS revenue_lm_by_date AS r)
+     EXCEPT ALL
+     SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS invoices.invoice_month
+       METRICS time_shift(revenue, INTERVAL 1 MONTH, dimension := invoices.invoice_date) AS r))
+  )) = 0
+   AND (SELECT count(*) FROM SEMANTIC_VIEW(ledger DIMENSIONS invoices.invoice_month
+       METRICS time_shift(revenue, INTERVAL 1 MONTH, dimension := invoices.invoice_date) AS r)) > 0;
+----
+true
+
+query I
+SELECT (SELECT count(*) FROM (
+    (SELECT * FROM SEMANTIC_VIEW(ledger_untimed DIMENSIONS invoices.invoice_month
+       METRICS time_shift(revenue, INTERVAL 1 MONTH, dimension := invoices.invoice_date) AS r)
+     EXCEPT ALL
+     SELECT * FROM SEMANTIC_VIEW(ledger_untimed DIMENSIONS invoices.invoice_month METRICS revenue_lm AS r))
+    UNION ALL
+    (SELECT * FROM SEMANTIC_VIEW(ledger_untimed DIMENSIONS invoices.invoice_month METRICS revenue_lm AS r)
+     EXCEPT ALL
+     SELECT * FROM SEMANTIC_VIEW(ledger_untimed DIMENSIONS invoices.invoice_month
+       METRICS time_shift(revenue, INTERVAL 1 MONTH, dimension := invoices.invoice_date) AS r))
+  )) = 0
+   AND (SELECT count(*) FROM SEMANTIC_VIEW(ledger_untimed DIMENSIONS invoices.invoice_month
+       METRICS time_shift(revenue, INTERVAL 1 MONTH, dimension := invoices.invoice_date) AS r)) > 0;
+----
+true
+
+# the default dimension is metric_time.day
+query I
+SELECT (SELECT count(*) FROM (
+    (SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
+       METRICS time_shift(revenue, INTERVAL 1 YEAR, dimension := metric_time.day) AS r)
+     EXCEPT ALL
+     SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
+       METRICS time_shift(revenue, INTERVAL 1 YEAR) AS r))
+    UNION ALL
+    (SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
+       METRICS time_shift(revenue, INTERVAL 1 YEAR) AS r)
+     EXCEPT ALL
+     SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
+       METRICS time_shift(revenue, INTERVAL 1 YEAR, dimension := metric_time.day) AS r))
+  )) = 0
+   AND (SELECT count(*) FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
+       METRICS time_shift(revenue, INTERVAL 1 YEAR, dimension := metric_time.day) AS r)) > 0;
+----
+true
+
+# only in METRICS
+statement error
+SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS time_shift(revenue, INTERVAL 1 YEAR) AS x);
+----
+time_shift() is only allowed in METRICS
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month METRICS revenue
+  WHERE time_shift(revenue, INTERVAL 1 YEAR) > 0);
+----
+time_shift() is only allowed in METRICS
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(ledger FACTS time_shift(invoices.amount, INTERVAL 1 YEAR) AS x);
+----
+time_shift() is only allowed in METRICS
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
+  METRICS SUM(time_shift(invoices.amount, INTERVAL 1 YEAR)) AS x);
+----
+time_shift() cannot be used inside an aggregate
+
+# no window function below the shift
+statement error
+SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month, account.segment
+  METRICS time_shift(revenue_share, INTERVAL 1 YEAR) AS x);
+----
+cannot contain a window function
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
+  METRICS time_shift(SUM(invoices.amount) OVER (), INTERVAL 1 YEAR) AS x);
+----
+cannot contain a window function
+
+# the dimension
+statement error
+SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
+  METRICS time_shift(revenue, INTERVAL 1 YEAR, dimension := metric_time.month) AS x);
+----
+<REGEX>:.*must be defined as a column.*valid dimensions:.*metric_time\.day.*
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
+  METRICS time_shift(revenue, INTERVAL 1 YEAR, dimension := account.segment) AS x);
+----
+cannot shift column
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(ledger_untimed DIMENSIONS invoices.invoice_month
+  METRICS time_shift(revenue, INTERVAL 1 MONTH) AS x);
+----
+<REGEX>:.*needs dimension :=.*invoices\.invoice_date.*
+
+# the arguments
+statement error
+SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month METRICS time_shift(revenue) AS x);
+----
+time_shift(<metric>, <interval> [, dimension := <dimension>])
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
+  METRICS time_shift(revenue, metric_time.day, INTERVAL 1 YEAR) AS x);
+----
+time_shift(<metric>, <interval> [, dimension := <dimension>])
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
+  METRICS time_shift(revenue, INTERVAL 1 YEAR, dim := metric_time.day) AS x);
+----
+<REGEX>:.*unknown argument "dim".*dimension.*
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
+  METRICS time_shift(revenue, INTERVAL 1 YEAR, dimension := metric_time.day, dimension := metric_time.day) AS x);
+----
+repeated argument "dimension"
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month METRICS time_shift(revenue, invoices.amount) AS x);
+----
+the interval must be a constant expression
+
+statement error
+PREPARE p AS SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month METRICS time_shift(revenue, $1) AS x);
+----
+the interval must be a constant expression
+
+# definitions use OFFSET (...) / CUMULATIVE (...)
+statement error
+CREATE SEMANTIC VIEW bad TABLES (invoices PRIMARY KEY (invoice_id) TIME (invoiced_at))
+  METRICS (invoices.revenue AS SUM(amount), invoices.x AS time_shift(revenue, INTERVAL 1 YEAR));
+----
+<REGEX>:.*time_shift\(\) is only allowed in queries.*OFFSET.*
+
+statement error
+CREATE SEMANTIC VIEW bad TABLES (invoices PRIMARY KEY (invoice_id) TIME (invoiced_at))
+  METRICS (invoices.revenue AS SUM(amount), invoices.x AS cumulative(revenue));
+----
+<REGEX>:.*cumulative\(\) is only allowed in queries.*CUMULATIVE.*
