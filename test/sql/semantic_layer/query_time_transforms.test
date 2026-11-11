@@ -934,3 +934,60 @@ statement error
 SELECT metric_time.month, AGG(time_shift(revenue, INTERVAL 1 YEAR)) FROM ledger GROUP BY metric_time.month;
 ----
 AGG() takes exactly one metric
+
+# a metric inside a transform call needs AGG() too
+statement error
+SELECT metric_time.month, time_shift(revenue, INTERVAL 1 YEAR) FROM ledger GROUP BY metric_time.month;
+----
+Metric "revenue" must be used with AGG()
+
+statement error
+SELECT metric_time.month, cumulative(revenue) FROM ledger GROUP BY metric_time.month;
+----
+Metric "revenue" must be used with AGG()
+
+statement error
+SELECT metric_time.month, time_shift(AGG(revenue) + revenue, INTERVAL 1 YEAR) FROM ledger GROUP BY metric_time.month;
+----
+Metric "revenue" must be used with AGG()
+
+# in ORDER BY
+query I
+SELECT (SELECT count(*) FROM (
+    (SELECT * FROM (SELECT metric_time.month, AGG(revenue) FROM ledger GROUP BY metric_time.month
+       ORDER BY time_shift(AGG(revenue), INTERVAL 1 YEAR) DESC NULLS LAST, metric_time.month LIMIT 3)
+     EXCEPT ALL
+     SELECT month, revenue FROM (SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
+       METRICS revenue, time_shift(revenue, INTERVAL 1 YEAR) AS ly) ORDER BY ly DESC NULLS LAST, month LIMIT 3))
+    UNION ALL
+    (SELECT month, revenue FROM (SELECT * FROM SEMANTIC_VIEW(ledger DIMENSIONS metric_time.month
+       METRICS revenue, time_shift(revenue, INTERVAL 1 YEAR) AS ly) ORDER BY ly DESC NULLS LAST, month LIMIT 3)
+     EXCEPT ALL
+     SELECT * FROM (SELECT metric_time.month, AGG(revenue) FROM ledger GROUP BY metric_time.month
+       ORDER BY time_shift(AGG(revenue), INTERVAL 1 YEAR) DESC NULLS LAST, metric_time.month LIMIT 3))
+  )) = 0
+   AND (SELECT count(*) FROM (SELECT * FROM (SELECT metric_time.month, AGG(revenue) FROM ledger GROUP BY metric_time.month
+       ORDER BY time_shift(AGG(revenue), INTERVAL 1 YEAR) DESC NULLS LAST, metric_time.month LIMIT 3))) > 0;
+----
+true
+
+# nested transforms
+query I
+SELECT (SELECT count(*) FROM (
+    (SELECT metric_time.month,
+            time_shift(cumulative(AGG(revenue), to_date := 'year', period := 'first'), INTERVAL 1 YEAR)
+     FROM ledger GROUP BY metric_time.month
+     EXCEPT ALL
+     SELECT metric_time.month, AGG(revenue_ytd_ly) FROM ledger GROUP BY metric_time.month)
+    UNION ALL
+    (SELECT metric_time.month, AGG(revenue_ytd_ly) FROM ledger GROUP BY metric_time.month
+     EXCEPT ALL
+     SELECT metric_time.month,
+            time_shift(cumulative(AGG(revenue), to_date := 'year', period := 'first'), INTERVAL 1 YEAR)
+     FROM ledger GROUP BY metric_time.month)
+  )) = 0
+   AND (SELECT count(*) FROM (SELECT metric_time.month,
+            time_shift(cumulative(AGG(revenue), to_date := 'year', period := 'first'), INTERVAL 1 YEAR) AS x
+     FROM ledger GROUP BY metric_time.month) WHERE x IS NOT NULL) > 0;
+----
+true

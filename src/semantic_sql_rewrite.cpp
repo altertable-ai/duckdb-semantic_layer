@@ -361,7 +361,7 @@ private:
 		return metric;
 	}
 
-	//! Replaces the AGG(<metric>) calls in `expr` by their metric; ad-hoc aggregates are kept
+	//! Replaces the AGG(<metric>) calls in `expr` by their metric; ad-hoc aggregates are kept, bare metrics rejected
 	void UnwrapAggCalls(unique_ptr<ParsedExpression> &expr) {
 		if (IsAggCall(*expr)) {
 			auto alias = expr->GetAlias();
@@ -370,6 +370,10 @@ private:
 			return;
 		}
 		if (analyzer.IsAggregate(*expr)) {
+			return;
+		}
+		if (expr->GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+			CheckNotMetric(*expr);
 			return;
 		}
 		ParsedExpressionIterator::EnumerateChildren(
