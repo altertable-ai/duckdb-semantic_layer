@@ -320,9 +320,28 @@ In this form:
 - `WHERE` filters before aggregation, `HAVING` after.
 - Without aggregation, the select list is evaluated as facts, row by row.
 - Names can be bare, qualified (`customers.segment`) or quoted as BI tools write them (`"customers.segment"`).
-- Joins with the semantic view, window functions, `QUALIFY`, `SELECT *`, and multiple grouping sets (`ROLLUP`,
-  `CUBE`, or `GROUPING SETS`) are not supported in this form. For subtotals, use `UNION ALL` of separately grouped
-  semantic queries so each metric is evaluated at the appropriate grain.
+- Joins with the semantic view, `SELECT *`, and multiple grouping sets (`ROLLUP`, `CUBE`, or `GROUPING SETS`) are not
+  supported in this form. For subtotals, use `UNION ALL` of separately grouped semantic queries so each metric is
+  evaluated at the appropriate grain.
+
+Window functions and `QUALIFY` work as in a hand-written `GROUP BY` query: a window reads the groups and metrics
+(`AGG(...)`, ad-hoc aggregates) of the finished rows, `HAVING` filters the groups before the windows, and `QUALIFY`
+after them. As in [window function metrics](#window-function-metrics), `PARTITION BY EXCLUDING d` partitions by every
+group except `d`:
+
+```sql
+SELECT customers.segment, metric_time.year,
+       AGG(lines.revenue) / SUM(AGG(lines.revenue)) OVER (PARTITION BY metric_time.year)       AS share,
+       RANK() OVER (PARTITION BY EXCLUDING customers.segment ORDER BY AGG(lines.revenue) DESC) AS rnk
+FROM sales
+GROUP BY ALL
+QUALIFY rnk <= 3;
+```
+
+Without aggregation, windows are evaluated over the fact rows. Like any SQL window, `LAG(AGG(m)) OVER (ORDER BY
+metric_time.month)` sees only the periods that have rows: a missing month makes it read an older one. To compare with
+a previous period, use [`time_shift(...)`](#query-time-transforms-time_shift-cumulative). `AGG(...)` and the
+transforms are not window functions themselves (`SUM(AGG(m)) OVER (...)`, not `AGG(m) OVER (...)`).
 
 ### Query-time transforms (`time_shift`, `cumulative`)
 
@@ -363,9 +382,9 @@ GROUP BY metric_time.month;
 - **`dimension`** defaults to `metric_time.day` when the view declares [`TIME`](#time-spine-time). Otherwise it is
   required. It must be a dimension defined as a column of its table; the error lists the valid ones.
   `trailing_window` and `to_date` are mutually exclusive, and `period` defaults to `'last'`.
-- **Where:** in `METRICS` (and, by name, in the select list, `HAVING` and `ORDER BY` expressions over metrics). They
-  are rejected in `DIMENSIONS`, `FACTS`, `WHERE`, inside an aggregate's argument (`AGG(time_shift(...))` too), and in
-  `CREATE SEMANTIC VIEW` definitions. `time_shift(cumulative(...))` is allowed; `cumulative()` cannot wrap another
+- **Where:** in `METRICS` (and, by name, in the select list, `HAVING`, `QUALIFY` and `ORDER BY` expressions over
+  metrics). They are rejected in `DIMENSIONS`, `FACTS`, `WHERE`, inside an aggregate's argument (`AGG(time_shift(...))`
+  too), and in `CREATE SEMANTIC VIEW` definitions. `time_shift(cumulative(...))` is allowed; `cumulative()` cannot wrap another
   transform or a metric that uses `OFFSET`, `CUMULATIVE` or `NON ADDITIVE BY`, and `period := 'average'` needs a
   metric computed from a single aggregate. A window function can wrap a transform but not appear inside its metric
   argument. Only unqualified calls are transforms (`main.time_shift(...)` is not).

@@ -8,6 +8,7 @@
 #include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
+#include "duckdb/parser/expression/window_expression.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/result_modifier.hpp"
@@ -16,6 +17,7 @@
 #include "semantic_ast_helpers.hpp"
 #include "semantic_catalog.hpp"
 #include "semantic_lowering.hpp"
+#include "semantic_markers.hpp"
 #include "semantic_statement_visitor.hpp"
 #include "semantic_layer_registry.hpp"
 #include "semantic_transforms.hpp"
@@ -43,9 +45,13 @@ public:
 		NormalizeClauses(node, orders);
 		CollectGroups(node);
 		auto aggregated = HasAggregation(orders);
-		// the items of the semantic query are registered in this order: groups, select list, HAVING, ORDER BY
+		// the items of the semantic query are registered in this order: groups, select list, HAVING, QUALIFY, ORDER BY
 		node.select_list = aggregated ? AggregatedSelect() : FactSelect();
+		// windows are evaluated by the outer query: after its WHERE (the HAVING), before QUALIFY
 		node.where_clause = aggregated && having ? Replace(*having, true) : nullptr;
+		if (qualify) {
+			node.qualify = aggregated ? Replace(*qualify, true) : MapToFacts(*qualify);
+		}
 		for (idx_t i = 0; i < orders.size(); i++) {
 			auto &order = *orders[i];
 			order = aggregated ? Replace(*order, true, modifier_aliases[i]) : MapToFacts(*order, modifier_aliases[i]);
@@ -74,10 +80,6 @@ private:
 			                      "name; use UNION ALL of separately grouped queries",
 			                      model.Name().name);
 		}
-		if (node.qualify) {
-			throw BinderException("QUALIFY is not supported when querying semantic view \"%s\" by name",
-			                      model.Name().name);
-		}
 		for (auto &expr : node.select_list) {
 			if (expr->GetExpressionClass() == ExpressionClass::STAR) {
 				throw BinderException("SELECT * is not supported when querying semantic view \"%s\" by name: list "
@@ -103,45 +105,54 @@ private:
 		return result;
 	}
 
-	//! Normalized copies of the select list, WHERE (the semantic query's filter) and HAVING; ORDER BY in place
+	//! Normalized copies of the select list, WHERE (the semantic query's filter), HAVING and QUALIFY; ORDER BY in
+	//! place
 	void NormalizeClauses(const SelectNode &node, const vector<unique_ptr<ParsedExpression> *> &orders) {
 		for (auto &expr : node.select_list) {
 			select.push_back(Normalize(*expr));
 			select.back()->SetAlias(expr->GetAlias());
 			select_aliases.push_back(expr->GetAlias().GetIdentifierName());
 			original_text.push_back(expr->ToString());
-			CheckNoWindow(*select.back());
+			window_items.push_back(SemanticAnalyzer::ContainsWindow(*select.back()));
+			CheckWindowFunctions(*select.back());
 		}
 		if (node.where_clause) {
 			query.where = Normalize(*node.where_clause);
+			CheckNoWindow(*query.where, "WHERE");
 		}
 		if (node.having) {
 			having = Normalize(*node.having);
-			CheckNoWindow(*having);
+			CheckNoWindow(*having, "HAVING");
+		}
+		if (node.qualify) {
+			qualify = Normalize(*node.qualify);
+			CheckWindowFunctions(*qualify);
 		}
 		for (auto order : orders) {
 			*order = Normalize(**order);
-			CheckNoWindow(**order);
+			CheckWindowFunctions(**order);
 		}
 	}
 
 	//! GROUP BY expressions (ordinals and select aliases resolve to select items)
 	void CollectGroups(const SelectNode &node) {
 		if (node.aggregate_handling == AggregateHandling::FORCE_AGGREGATES) {
-			for (auto &expr : select) {
-				if (!ContainsAggregate(*expr)) {
-					groups.push_back(WithoutAlias(*expr));
+			// like DuckDB's GROUP BY ALL, neither aggregates nor windows are groups
+			for (idx_t i = 0; i < select.size(); i++) {
+				if (!window_items[i] && !ContainsAggregate(*select[i])) {
+					groups.push_back(WithoutAlias(*select[i]));
 				}
 			}
 			return;
 		}
 		for (auto &group : node.groups.group_expressions) {
 			groups.push_back(ResolveGroup(*group));
+			CheckNoWindow(*groups.back(), "GROUP BY");
 		}
 	}
 
 	bool HasAggregation(const vector<unique_ptr<ParsedExpression> *> &orders) {
-		if (!groups.empty() || (having && ContainsAggregate(*having))) {
+		if (!groups.empty() || (having && ContainsAggregate(*having)) || (qualify && ContainsAggregate(*qualify))) {
 			return true;
 		}
 		for (auto &expr : select) {
@@ -172,15 +183,36 @@ private:
 		return result;
 	}
 
-	//! Row-level query: every select item is a fact
+	//! Row-level query: every select item is a fact, except the items with a window function, which are evaluated by
+	//! the outer query over the fact columns
 	vector<unique_ptr<ParsedExpression>> FactSelect() {
+		for (idx_t i = 0; i < select.size(); i++) {
+			if (!window_items[i]) {
+				CheckNotMetric(*select[i]);
+				AddItem(SemanticMemberKind::FACT, WithoutAlias(*select[i]), FactColumn(i));
+			}
+		}
 		vector<unique_ptr<ParsedExpression>> result;
 		for (idx_t i = 0; i < select.size(); i++) {
-			CheckNotMetric(*select[i]);
-			AddItem(SemanticMemberKind::FACT, WithoutAlias(*select[i]), FactColumn(i));
-			result.push_back(ColumnRef(FactColumn(i)));
+			result.push_back(SelectedFact(i));
 			result.back()->SetAlias(Identifier(OutputName(i)));
 		}
+		return result;
+	}
+
+	//! The fact column of select item `index`, or its window expression over fact columns
+	unique_ptr<ParsedExpression> SelectedFact(idx_t index) {
+		if (!window_items[index]) {
+			return ColumnRef(FactColumn(index));
+		}
+		if (expanding_windows.count(index)) {
+			throw BinderException("Window function alias \"%s\" cannot be referenced in its own definition when "
+			                      "querying semantic view \"%s\" by name",
+			                      select_aliases[index], model.Name().name);
+		}
+		expanding_windows.insert(index);
+		auto result = MapToFacts(*WithoutAlias(*select[index]));
+		expanding_windows.erase(index);
 		return result;
 	}
 
@@ -233,12 +265,67 @@ private:
 		return result;
 	}
 
-	void CheckNoWindow(const ParsedExpression &expr) {
+	//! Windows are evaluated by the outer query, so not in clauses evaluated before them
+	void CheckNoWindow(const ParsedExpression &expr, const string &clause) {
 		if (SemanticAnalyzer::ContainsWindow(expr)) {
-			throw BinderException("Window functions are not supported when querying semantic view \"%s\" by name; "
-			                      "define a window function metric instead",
-			                      model.Name().name);
+			throw BinderException("Window functions are not allowed in %s when querying semantic view \"%s\" by name%s",
+			                      clause, model.Name().name, clause == "HAVING" ? "; use QUALIFY" : "");
 		}
+	}
+
+	//! AGG(...) and time_shift / cumulative calls are metric items, not window functions: windows apply to them
+	void CheckWindowFunctions(const ParsedExpression &expr) {
+		if (expr.GetExpressionClass() == ExpressionClass::WINDOW) {
+			auto &window = expr.Cast<WindowExpression>();
+			FunctionExpression call(window.GetQualifiedName(), vector<unique_ptr<ParsedExpression>>());
+			if (IsAggCall(call) || IsTransformCall(call)) {
+				auto name = IsAggCall(call) ? string("AGG") : window.FunctionName().GetIdentifierName();
+				throw BinderException("%s() cannot be used as a window function when querying semantic view \"%s\" "
+				                      "by name; apply the window to it instead, as in SUM(%s(...)) OVER (...)",
+				                      name, model.Name().name, name);
+			}
+		}
+		ParsedExpressionIterator::EnumerateChildren(
+		    expr, [&](const ParsedExpression &child) { CheckWindowFunctions(child); });
+	}
+
+	//! Replaces the PARTITION BY EXCLUDING keys of `window` by the expressions of the other groups
+	void ExpandExcluding(WindowExpression &window) {
+		vector<unique_ptr<ParsedExpression>> partitions;
+		for (auto &partition : window.PartitionsMutable()) {
+			if (!SemanticMarkers::IsExcluding(*partition)) {
+				partitions.push_back(std::move(partition));
+				continue;
+			}
+			auto &excluded = partition->Cast<FunctionExpression>().GetArguments();
+			for (auto &argument : excluded) {
+				if (!IsGroup(argument.GetExpression())) {
+					throw BinderException(
+					    "PARTITION BY EXCLUDING only accepts grouped dimensions when querying semantic "
+					    "view \"%s\" by name; \"%s\" is not in the GROUP BY clause",
+					    model.Name().name, argument.GetExpression().ToString());
+				}
+			}
+			for (auto &group : groups) {
+				bool is_excluded = false;
+				for (auto &argument : excluded) {
+					is_excluded = is_excluded || group->Equals(argument.GetExpression());
+				}
+				if (!is_excluded) {
+					partitions.push_back(group->Copy());
+				}
+			}
+		}
+		window.PartitionsMutable() = std::move(partitions);
+	}
+
+	bool IsGroup(const ParsedExpression &expr) const {
+		for (auto &group : groups) {
+			if (group->Equals(expr)) {
+				return true;
+			}
+		}
+		return false;
 	}
 
 	static bool IsAggCall(const ParsedExpression &expr) {
@@ -350,6 +437,10 @@ private:
 		    SemanticFindTransformCall(Argument(function, 0))) {
 			throw BinderException("AGG() takes exactly one metric");
 		}
+		if (SemanticAnalyzer::ContainsWindow(Argument(function, 0))) {
+			throw BinderException("AGG() takes a metric, not a window function; apply the window to it instead, as in "
+			                      "SUM(AGG(...)) OVER (...)");
+		}
 		auto metric = WithoutAlias(Argument(function, 0));
 		SemanticResolveContext resolve_context;
 		resolve_context.allow_private = false;
@@ -448,6 +539,10 @@ private:
 			return expr.Copy();
 		}
 		auto result = expr.Copy();
+		if (result->GetExpressionClass() == ExpressionClass::WINDOW) {
+			// the group expressions it partitions by are replaced by their columns below
+			ExpandExcluding(result->Cast<WindowExpression>());
+		}
 		ParsedExpressionIterator::EnumerateChildren(
 		    *result, [&](unique_ptr<ParsedExpression> &child) { child = Replace(*child, allow_aliases); });
 		return result;
@@ -456,10 +551,10 @@ private:
 	unique_ptr<ParsedExpression> MapToFacts(const ParsedExpression &expr, bool top_level_alias = false) {
 		auto alias = top_level_alias ? OutputAlias(expr) : optional_idx();
 		if (alias.IsValid()) {
-			return ColumnRef(FactColumn(alias.GetIndex()));
+			return SelectedFact(alias.GetIndex());
 		}
 		for (idx_t i = 0; i < select.size(); i++) {
-			if (select[i]->Equals(expr)) {
+			if (!window_items[i] && select[i]->Equals(expr)) {
 				return make_uniq<ColumnRefExpression>(Identifier(FactColumn(i)));
 			}
 		}
@@ -468,7 +563,7 @@ private:
 			if (!HasInputName(colref.GetColumnName().GetIdentifierName())) {
 				auto output = OutputAlias(expr);
 				if (output.IsValid()) {
-					return ColumnRef(FactColumn(output.GetIndex()));
+					return SelectedFact(output.GetIndex());
 				}
 			}
 			CheckNotMetric(expr);
@@ -477,13 +572,18 @@ private:
 					return ColumnRef(item.alias);
 				}
 			}
-			// A sort or DISTINCT ON key can reference a fact that is not selected. Keep it in the
-			// semantic query's projection so the outer modifier can read it.
-			auto column = FactColumn(query.items.size());
+			// A sort, DISTINCT ON or window key can reference a fact that is not selected. Keep it in the
+			// semantic query's projection so the outer query can read it (numbered after the select items, which
+			// window items leave gaps in).
+			auto column = FactColumn(select.size() + query.items.size());
 			AddItem(SemanticMemberKind::FACT, WithoutAlias(expr), column);
 			return ColumnRef(column);
 		}
 		auto result = expr.Copy();
+		if (result->GetExpressionClass() == ExpressionClass::WINDOW) {
+			// no groups to partition by: rejects any PARTITION BY EXCLUDING
+			ExpandExcluding(result->Cast<WindowExpression>());
+		}
 		ParsedExpressionIterator::EnumerateChildren(
 		    *result, [&](unique_ptr<ParsedExpression> &child) { child = MapToFacts(*child); });
 		return result;
@@ -505,7 +605,12 @@ private:
 	vector<unique_ptr<ParsedExpression>> select;
 	vector<string> select_aliases;
 	vector<string> original_text;
+	//! Whether each select item contains a window function
+	vector<bool> window_items;
+	//! The window items being mapped to fact columns, to reject an alias referenced in its own definition
+	set<idx_t> expanding_windows;
 	unique_ptr<ParsedExpression> having;
+	unique_ptr<ParsedExpression> qualify;
 	vector<unique_ptr<ParsedExpression>> groups;
 	vector<unique_ptr<ParsedExpression>> metrics;
 	ParsedSemanticQuery query;
