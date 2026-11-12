@@ -274,12 +274,11 @@ public:
 	//! The table of `tables` from which every other one is reachable; invalid
 	//! when there is none (or `tables` is empty)
 	optional_idx FinestTable(const set<idx_t> &tables) const;
-	//! The unique path from -> to (empty when from == to), or why there is none
+	//! The selected path from -> to (empty when from == to), or why selection failed
 	SemanticPathResult TryPath(idx_t from, idx_t to, const vector<idx_t> &using_relationships,
 	                           vector<SemanticEdge> &path) const;
-	//! The unique path from -> to (empty when from == to); throws when there are
-	//! several paths or none. `using_relationships` (USING on metrics) restricts
-	//! how the tables they reference are reached.
+	//! Selects a path using USING, TIME defaults, then direct relationships over detours.
+	//! Empty when from == to; throws if no path remains or the choice is still ambiguous.
 	vector<SemanticEdge> Path(idx_t from, idx_t to, const vector<idx_t> &using_relationships = {}) const;
 	//! The relationship through which the rows of `from` reach the time spine: their TIME
 	SemanticEdge TimeEdge(idx_t from, const vector<idx_t> &using_relationships = {}) const;
@@ -301,11 +300,11 @@ public:
 	static string KindDisplayName(SemanticMemberKind kind);
 
 private:
-	//! Up to two simple paths from -> to through the edges `allowed` accepts
-	//! Up to two paths from `from` to `to` through `allowed` edges, among those `accept` accepts (all when null)
-	vector<vector<SemanticEdge>>
-	FindPaths(idx_t from, idx_t to, const std::function<bool(const SemanticEdge &)> &allowed,
-	          const std::function<bool(const vector<SemanticEdge> &)> &accept = nullptr) const;
+	//! Up to two paths through `allowed` edges that `accept` accepts (all when null), optionally without detours
+	vector<vector<SemanticEdge>> FindPaths(idx_t from, idx_t to,
+	                                       const std::function<bool(const SemanticEdge &)> &allowed,
+	                                       const std::function<bool(const vector<SemanticEdge> &)> &accept = nullptr,
+	                                       bool skip_detours = false) const;
 };
 
 //! Builds and validates a model from a parsed definition (catalog lookups through `context`)

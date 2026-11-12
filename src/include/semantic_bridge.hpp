@@ -40,8 +40,8 @@ class SemanticBridgeResolver {
 public:
 	explicit SemanticBridgeResolver(const SemanticModel &model);
 
-	//! Every bridge through which rows of `home` relate to all tables of `tables` (some of which `home` does not
-	//! reach). A USING relationship starting from one of them narrows the choice to it.
+	//! Bridges relating `home` to all tables of `tables`. USING selects a bridge explicitly;
+	//! otherwise omit finer bridges that reach another candidate.
 	vector<SemanticBridge> Candidates(idx_t home, const set<idx_t> &tables,
 	                                  const vector<idx_t> &using_relationships) const;
 	//! The only candidate; otherwise throws a BinderException (prefixed with `what`) naming the table no bridge
@@ -49,7 +49,7 @@ public:
 	SemanticBridge Resolve(idx_t home, const set<idx_t> &tables, const vector<idx_t> &using_relationships,
 	                       const string &what, const string &hint) const;
 	//! A table outside `tables` that reaches all of them through diverging paths (the base of a dimension-only
-	//! query across a bridge); INVALID_INDEX when there is none, throws when several qualify
+	//! query across a bridge), preferring coarser candidates; INVALID_INDEX when none remain, throws on ambiguity
 	idx_t CommonBase(const set<idx_t> &tables) const;
 
 private:

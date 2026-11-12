@@ -78,3 +78,270 @@ statement error
 CREATE SEMANTIC VIEW bad TABLES (airports PRIMARY KEY (airport_code), flights PRIMARY KEY (flight_id)) RELATIONSHIPS (r1 AS flights (departure_airport) REFERENCES airports) METRICS (flights.m USING (nope) AS COUNT(*));
 ----
 Unknown relationship "nope"
+
+# without USING, a relationship that references the table directly wins over a detour through other tables
+statement ok
+CREATE TABLE regions (region_id INTEGER, region_name VARCHAR);
+
+statement ok
+INSERT INTO regions VALUES (1, 'North'), (2, 'South');
+
+statement ok
+CREATE TABLE customers (customer_id INTEGER, customer_name VARCHAR, region_id INTEGER);
+
+statement ok
+INSERT INTO customers VALUES (1, 'Ann', 1), (2, 'Bob', 2);
+
+statement ok
+CREATE TABLE shipments (shipment_id INTEGER, recipient_id INTEGER);
+
+statement ok
+INSERT INTO shipments VALUES (1, 2), (2, 2), (3, 1);
+
+statement ok
+CREATE TABLE orders (order_id INTEGER, buyer_id INTEGER, shipment_id INTEGER, amount INTEGER);
+
+statement ok
+INSERT INTO orders VALUES (1, 1, 1, 10), (2, 1, 2, 20), (3, 2, 3, 40);
+
+statement ok
+CREATE SEMANTIC VIEW orders_sv
+  TABLES (
+    regions PRIMARY KEY (region_id),
+    customers PRIMARY KEY (customer_id),
+    shipments PRIMARY KEY (shipment_id),
+    orders PRIMARY KEY (order_id)
+  )
+  RELATIONSHIPS (
+    customer_region AS customers (region_id) REFERENCES regions,
+    shipment_recipient AS shipments (recipient_id) REFERENCES customers,
+    order_buyer AS orders (buyer_id) REFERENCES customers,
+    order_shipment AS orders (shipment_id) REFERENCES shipments
+  )
+  DIMENSIONS (
+    customers.customer AS customer_name,
+    regions.region AS region_name
+  )
+  METRICS (
+    orders.total AS SUM(amount),
+    orders.total_to_recipient USING (shipment_recipient) AS SUM(amount),
+    orders.total_via_shipment USING (order_shipment) AS SUM(amount)
+  );
+
+# the buyer (direct) over the recipient (through shipments)
+query II
+SELECT * FROM SEMANTIC_VIEW(orders_sv DIMENSIONS customers.customer METRICS orders.total) ORDER BY 1;
+----
+Ann	30
+Bob	40
+
+# also for a table further away: the buyer's region
+query II
+SELECT * FROM SEMANTIC_VIEW(orders_sv DIMENSIONS regions.region METRICS orders.total) ORDER BY 1;
+----
+North	30
+South	40
+
+# USING still selects the detour
+query II
+SELECT * FROM SEMANTIC_VIEW(orders_sv DIMENSIONS customers.customer METRICS orders.total_to_recipient) ORDER BY 1;
+----
+Ann	40
+Bob	30
+
+# USING can select the detour by its first hop without excluding the direct edge.
+query II
+SELECT * FROM SEMANTIC_VIEW(orders_sv DIMENSIONS customers.customer METRICS orders.total_via_shipment) ORDER BY 1;
+----
+Ann	40
+Bob	30
+
+# two unrelated routes stay ambiguous whatever their lengths: the agent's team's office or the queue's office
+statement ok
+CREATE TABLE offices (office_id INTEGER, office_name VARCHAR);
+
+statement ok
+CREATE TABLE teams (team_id INTEGER, office_id INTEGER);
+
+statement ok
+CREATE TABLE agents (agent_id INTEGER, team_id INTEGER);
+
+statement ok
+CREATE TABLE queues (queue_id INTEGER, office_id INTEGER);
+
+statement ok
+CREATE TABLE tickets (ticket_id INTEGER, agent_id INTEGER, queue_id INTEGER);
+
+statement ok
+CREATE SEMANTIC VIEW tickets_sv
+  TABLES (
+    offices PRIMARY KEY (office_id),
+    teams PRIMARY KEY (team_id),
+    agents PRIMARY KEY (agent_id),
+    queues PRIMARY KEY (queue_id),
+    tickets PRIMARY KEY (ticket_id)
+  )
+  RELATIONSHIPS (
+    team_office AS teams (office_id) REFERENCES offices,
+    agent_team AS agents (team_id) REFERENCES teams,
+    queue_office AS queues (office_id) REFERENCES offices,
+    ticket_agent AS tickets (agent_id) REFERENCES agents,
+    ticket_queue AS tickets (queue_id) REFERENCES queues
+  )
+  DIMENSIONS (offices.office AS office_name)
+  METRICS (tickets.ticket_count AS COUNT(*));
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(tickets_sv DIMENSIONS offices.office METRICS tickets.ticket_count);
+----
+multiple relationship paths
+
+# USING is applied first: a direct relationship it excludes (the payer) does not turn the remaining paths into detours
+statement ok
+CREATE TABLE accounts (account_id INTEGER, account_name VARCHAR);
+
+statement ok
+INSERT INTO accounts VALUES (1, 'A'), (2, 'B');
+
+statement ok
+CREATE TABLE wallets (wallet_id INTEGER, account_id INTEGER);
+
+statement ok
+INSERT INTO wallets VALUES (1, 1), (2, 2);
+
+statement ok
+CREATE TABLE cards (card_id INTEGER, wallet_id INTEGER);
+
+statement ok
+INSERT INTO cards VALUES (1, 1), (2, 2);
+
+statement ok
+CREATE TABLE payments (payment_id INTEGER, account_id INTEGER, wallet_id INTEGER, card_id INTEGER, amount INTEGER);
+
+statement ok
+INSERT INTO payments VALUES (1, 1, 2, 1, 10);
+
+statement ok
+CREATE SEMANTIC VIEW payments_sv
+  TABLES (
+    accounts PRIMARY KEY (account_id),
+    wallets PRIMARY KEY (wallet_id),
+    cards PRIMARY KEY (card_id),
+    payments PRIMARY KEY (payment_id)
+  )
+  RELATIONSHIPS (
+    wallet_owner AS wallets (account_id) REFERENCES accounts,
+    card_wallet AS cards (wallet_id) REFERENCES wallets,
+    payment_payer AS payments (account_id) REFERENCES accounts,
+    payment_wallet AS payments (wallet_id) REFERENCES wallets,
+    payment_card AS payments (card_id) REFERENCES cards
+  )
+  DIMENSIONS (accounts.account AS account_name)
+  METRICS (payments.total_by_wallet_owner USING (wallet_owner) AS SUM(amount));
+
+query II
+SELECT * FROM SEMANTIC_VIEW(payments_sv DIMENSIONS accounts.account METRICS payments.total_by_wallet_owner);
+----
+B	10
+
+# the rule applies at every hop: the store's own country over its city's country
+statement ok
+CREATE TABLE countries (country_id INTEGER, country_name VARCHAR);
+
+statement ok
+INSERT INTO countries VALUES (1, 'Chile'), (2, 'Peru');
+
+statement ok
+CREATE TABLE cities (city_id INTEGER, country_id INTEGER);
+
+statement ok
+INSERT INTO cities VALUES (1, 1), (2, 2);
+
+statement ok
+CREATE TABLE stores (store_id INTEGER, country_id INTEGER, city_id INTEGER);
+
+statement ok
+INSERT INTO stores VALUES (1, 1, 2);
+
+statement ok
+CREATE TABLE visits (visit_id INTEGER, store_id INTEGER, amount INTEGER);
+
+statement ok
+INSERT INTO visits VALUES (1, 1, 10);
+
+statement ok
+CREATE SEMANTIC VIEW visits_sv
+  TABLES (
+    countries PRIMARY KEY (country_id),
+    cities PRIMARY KEY (city_id),
+    stores PRIMARY KEY (store_id),
+    visits PRIMARY KEY (visit_id)
+  )
+  RELATIONSHIPS (
+    city_country AS cities (country_id) REFERENCES countries,
+    store_country AS stores (country_id) REFERENCES countries,
+    store_city AS stores (city_id) REFERENCES cities,
+    visit_store AS visits (store_id) REFERENCES stores
+  )
+  DIMENSIONS (countries.country AS country_name)
+  METRICS (visits.total AS SUM(amount));
+
+query II
+SELECT * FROM SEMANTIC_VIEW(visits_sv DIMENSIONS countries.country METRICS visits.total);
+----
+Chile	10
+
+# Prefer the subscription's TIME over its contract's TIME and the invoice's paid_at.
+statement ok
+CREATE TABLE subscriptions (subscription_id INTEGER, contract_id INTEGER, started_at DATE);
+
+statement ok
+INSERT INTO subscriptions VALUES (1, 1, '2026-01-01');
+
+statement ok
+CREATE TABLE contracts (contract_id INTEGER, warranty_id INTEGER, started_at DATE);
+
+statement ok
+INSERT INTO contracts VALUES (1, 1, '2026-01-05');
+
+statement ok
+CREATE TABLE warranties (warranty_id INTEGER, started_at DATE);
+
+statement ok
+INSERT INTO warranties VALUES (1, '2026-01-07');
+
+statement ok
+CREATE TABLE invoices (invoice_id INTEGER, subscription_id INTEGER, paid_at DATE, amount INTEGER);
+
+statement ok
+INSERT INTO invoices VALUES (1, 1, '2026-01-09', 7);
+
+statement ok
+CREATE SEMANTIC VIEW invoices_sv
+  TABLES (
+    subscriptions PRIMARY KEY (subscription_id) TIME (started_at),
+    contracts PRIMARY KEY (contract_id) TIME (started_at),
+    warranties PRIMARY KEY (warranty_id) TIME (started_at),
+    invoices PRIMARY KEY (invoice_id)
+  )
+  RELATIONSHIPS (
+    invoice_subscription AS invoices (subscription_id) REFERENCES subscriptions,
+    subscription_contract AS subscriptions (contract_id) REFERENCES contracts,
+    contract_warranty AS contracts (warranty_id) REFERENCES warranties,
+    invoice_paid AS invoices (paid_at) REFERENCES metric_time
+  )
+  METRICS (
+    invoices.total AS SUM(amount),
+    invoices.by_contract USING (subscription_contract) AS SUM(amount)
+  );
+
+query II
+SELECT * FROM SEMANTIC_VIEW(invoices_sv DIMENSIONS metric_time.day METRICS invoices.total);
+----
+2026-01-01	7
+
+# USING still selects the contract when both its TIME and the warranty's TIME are reachable.
+query II
+SELECT * FROM SEMANTIC_VIEW(invoices_sv DIMENSIONS metric_time.day METRICS invoices.by_contract);
+----
+2026-01-05	7
