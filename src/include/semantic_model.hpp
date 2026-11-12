@@ -302,10 +302,10 @@ public:
 
 private:
 	//! Up to two paths through `allowed` edges that `accept` accepts (all when null), optionally without detours
-	vector<vector<SemanticEdge>>
-	FindPaths(idx_t from, idx_t to, const std::function<bool(const SemanticEdge &)> &allowed,
-	          const std::function<bool(const vector<SemanticEdge> &)> &accept = nullptr,
-	          bool skip_detours = false) const;
+	vector<vector<SemanticEdge>> FindPaths(idx_t from, idx_t to,
+	                                       const std::function<bool(const SemanticEdge &)> &allowed,
+	                                       const std::function<bool(const vector<SemanticEdge> &)> &accept = nullptr,
+	                                       bool skip_detours = false) const;
 };
 
 //! Builds and validates a model from a parsed definition (catalog lookups through `context`)

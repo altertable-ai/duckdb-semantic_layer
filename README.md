@@ -441,9 +441,8 @@ SELECT sql FROM semantic_view_sql('SELECT * FROM SEMANTIC_VIEW(sales DIMENSIONS 
 
 ### Role-playing relationships (`USING`)
 
-When several relationships connect the same tables (a flight's departure and arrival airports), `USING` on a metric
-chooses the path. Without it, a relationship that references the table directly wins over a detour through other
-tables; anything else, such as the two airports here, is rejected as ambiguous.
+Choose a metric's path with `USING`. Otherwise, `TIME` defaults take priority and direct relationships beat detours
+at any hop. Multiple remaining paths are rejected, including departure and arrival airports.
 
 ```sql
 RELATIONSHIPS (
@@ -572,10 +571,11 @@ from `metric_time` (`orders.order_day AS metric_time.day`) reads that table's ow
 freshness checks or incremental refresh, and a query that would read only the spine (no metric and no fact) is
 rejected: the spine has no rows of its own. Days with no facts are absent from ordinary aggregates.
 
-Each `TIME` is that table's default path to `metric_time`. Another date is an ordinary relationship
-(`shipped AS shipments (shipped_at) REFERENCES metric_time`), chosen with `USING (shipped)`; without `USING`, `TIME`
-wins. A table that reaches two different `TIME` columns and does not choose one is ambiguous, as any other
-relationship is: `USING` the relationship leading to one of them picks its `TIME`. The name `metric_time` is reserved only in a view that uses `TIME`.
+`TIME` defines a table's default path to `metric_time`. To use another date, declare a relationship such as
+`shipped AS shipments (shipped_at) REFERENCES metric_time` and select it with `USING (shipped)`.
+Use `USING` on a relationship leading to a table to select its `TIME`.
+Without `USING`, default-time paths take priority. Direct paths beat detours; remaining ambiguity is rejected.
+`metric_time` is reserved only in views that declare `TIME`.
 
 ### Time offsets (`OFFSET`)
 

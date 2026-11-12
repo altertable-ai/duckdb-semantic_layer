@@ -283,12 +283,18 @@ SELECT * FROM SEMANTIC_VIEW(visits_sv DIMENSIONS countries.country METRICS visit
 ----
 Chile	10
 
-# the TIME defaults are applied before this rule: the subscription's start, not the direct relationship on the payment date
+# Prefer the subscription's TIME over its contract's TIME and the invoice's paid_at.
 statement ok
-CREATE TABLE subscriptions (subscription_id INTEGER, started_at DATE);
+CREATE TABLE subscriptions (subscription_id INTEGER, contract_id INTEGER, started_at DATE);
 
 statement ok
-INSERT INTO subscriptions VALUES (1, '2026-01-01');
+INSERT INTO subscriptions VALUES (1, 1, '2026-01-01');
+
+statement ok
+CREATE TABLE contracts (contract_id INTEGER, started_at DATE);
+
+statement ok
+INSERT INTO contracts VALUES (1, '2026-01-05');
 
 statement ok
 CREATE TABLE invoices (invoice_id INTEGER, subscription_id INTEGER, paid_at DATE, amount INTEGER);
@@ -300,10 +306,12 @@ statement ok
 CREATE SEMANTIC VIEW invoices_sv
   TABLES (
     subscriptions PRIMARY KEY (subscription_id) TIME (started_at),
+    contracts PRIMARY KEY (contract_id) TIME (started_at),
     invoices PRIMARY KEY (invoice_id)
   )
   RELATIONSHIPS (
     invoice_subscription AS invoices (subscription_id) REFERENCES subscriptions,
+    subscription_contract AS subscriptions (contract_id) REFERENCES contracts,
     invoice_paid AS invoices (paid_at) REFERENCES metric_time
   )
   METRICS (invoices.total AS SUM(amount));

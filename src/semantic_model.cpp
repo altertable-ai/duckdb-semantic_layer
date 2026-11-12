@@ -110,9 +110,10 @@ optional_idx SemanticModel::FinestTable(const set<idx_t> &tables) const {
 	return optional_idx();
 }
 
-vector<vector<SemanticEdge>>
-SemanticModel::FindPaths(idx_t from, idx_t to, const std::function<bool(const SemanticEdge &)> &allowed,
-                         const std::function<bool(const vector<SemanticEdge> &)> &accept, bool skip_detours) const {
+vector<vector<SemanticEdge>> SemanticModel::FindPaths(idx_t from, idx_t to,
+                                                      const std::function<bool(const SemanticEdge &)> &allowed,
+                                                      const std::function<bool(const vector<SemanticEdge> &)> &accept,
+                                                      bool skip_detours) const {
 	vector<vector<SemanticEdge>> found;
 	vector<SemanticEdge> path;
 	vector<bool> visited(tables.size(), false);
@@ -211,8 +212,14 @@ SemanticPathResult SemanticModel::TryPath(idx_t from, idx_t to, const vector<idx
 			return allowed(edge) && (edge.target != to || is_default(edge));
 		});
 		if (found.size() != 1) {
-			// still ambiguous: a relationship that references the target directly wins over a detour
-			found = FindPaths(from, to, allowed, nullptr, true);
+			// Ambiguous TIME paths must not fall back to an ordinary date relationship.
+			const bool require_default = !found.empty();
+			found = FindPaths(
+			    from, to,
+			    [&](const SemanticEdge &edge) {
+				    return allowed(edge) && (!require_default || edge.target != to || is_default(edge));
+			    },
+			    nullptr, true);
 			if (found.size() != 1) {
 				return SemanticPathResult::AMBIGUOUS;
 			}
