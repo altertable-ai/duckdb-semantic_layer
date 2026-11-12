@@ -402,6 +402,28 @@ SELECT segment, AGG(revenue) FROM sales GROUP BY segment HAVING RANK() OVER (ORD
 ----
 Window functions are not allowed in HAVING
 
+# also through the alias of a window item
+statement error
+SELECT segment, RANK() OVER (ORDER BY AGG(revenue)) AS rk FROM sales GROUP BY segment HAVING rk = 1;
+----
+Window functions are not allowed in HAVING when querying semantic view "sales" by name; use QUALIFY
+
+statement error
+SELECT segment, RANK() OVER (ORDER BY AGG(revenue)) AS rk FROM sales GROUP BY segment HAVING rk + 0 = 1;
+----
+Window functions are not allowed in HAVING
+
+statement error
+SELECT segment, ROW_NUMBER() OVER (ORDER BY segment) AS rn FROM sales WHERE rn = 1;
+----
+Window functions are not allowed in WHERE
+
+# an alias that is also an input name reads the input
+query II
+SELECT segment AS seg, ROW_NUMBER() OVER (ORDER BY segment) AS segment FROM sales WHERE segment = 'startup';
+----
+startup	1
+
 statement error
 SELECT segment FROM sales WHERE ROW_NUMBER() OVER (ORDER BY invoice_amount) = 1;
 ----

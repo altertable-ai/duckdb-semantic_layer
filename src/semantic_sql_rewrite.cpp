@@ -269,10 +269,23 @@ private:
 
 	//! Windows are evaluated by the outer query, so not in clauses evaluated before them; `hint` follows the error
 	void CheckNoWindow(const ParsedExpression &expr, const string &clause, const string &hint = string()) {
-		if (SemanticAnalyzer::ContainsWindow(expr)) {
+		if (SemanticAnalyzer::ContainsWindow(expr) || ReadsWindowAlias(expr)) {
 			throw BinderException("Window functions are not allowed in %s when querying semantic view \"%s\" by name%s",
 			                      clause, model.Name().name, hint);
 		}
+	}
+
+	//! Whether `expr` reads the select alias of an item with a window function
+	bool ReadsWindowAlias(const ParsedExpression &expr) const {
+		auto alias = OutputAlias(expr);
+		if (alias.IsValid() && select[alias.GetIndex()].has_window &&
+		    !HasInputName(expr.Cast<ColumnRefExpression>().GetColumnName().GetIdentifierName())) {
+			return true;
+		}
+		bool found = false;
+		ParsedExpressionIterator::EnumerateChildren(
+		    expr, [&](const ParsedExpression &child) { found = found || ReadsWindowAlias(child); });
+		return found;
 	}
 
 	//! AGG(...) and time_shift / cumulative calls are metric items, not window functions: windows apply to them

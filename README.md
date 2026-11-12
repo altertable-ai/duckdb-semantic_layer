@@ -497,18 +497,23 @@ GROUP BY customers.segment;
 time_shift(AGG(margin) FILTER (WHERE accounts.segment = 'enterprise'), INTERVAL 1 YEAR)
 ```
 
-It computes exactly what the metric `FILTER` computes: the condition is `AND`-ed into every aggregate the metric is
-computed from, nested metrics included (for `margin` above, into all three aggregates), combined with the filters of
-nested metrics. It is row-level (dimensions, facts and columns; no aggregates, metrics or windows), and every table it
-reads must be reachable from each aggregate's table. It reads stored values (not shifted by `OFFSET` / `time_shift`).
-Unlike the query's `WHERE`, it does not remove groups or cumulative anchors: a filtered metric is 0 / NULL where
-nothing matches. Semi-additive metrics are the exception: as with the metric `FILTER`, the condition filters their
-rows before the last snapshot is picked, like the query's `WHERE`, so a group without matching rows disappears when
-no other metric produces it. `AGG(...)` without `FILTER` is the metric itself; `AGG()` does not take `DISTINCT`,
-`ORDER BY` or more than one argument, and is not a window function (`SUM(AGG(m) FILTER (WHERE ...)) OVER (...)`).
-Ad-hoc aggregates keep their own `FILTER` (`SUM(amount) FILTER (WHERE ...)`). A query-time filtered metric reads, and
-can be stored in, a [materialization](#materializations) like the equivalent filtered metric:
-`ADD MATERIALIZATION ... METRICS AGG(revenue) FILTER (WHERE accounts.segment = 'enterprise') AS enterprise_revenue`.
+It computes exactly what the metric `FILTER` computes:
+
+- **What it filters:** the condition is `AND`-ed into every aggregate the metric is computed from, nested metrics
+  included (for `margin` above, into all three aggregates), together with the filters of nested metrics.
+- **What it can read:** row-level values only (dimensions, facts and columns; no aggregates, metrics or windows), from
+  tables reachable from each aggregate's table. It reads stored values, not values shifted by `OFFSET` / `time_shift`.
+- **Groups are kept:** unlike the query's `WHERE`, it removes no groups and no cumulative anchors; a filtered metric is
+  0 / NULL where nothing matches.
+- **Except for semi-additive metrics:** as with the metric `FILTER`, the condition filters their rows before the last
+  snapshot is picked, like the query's `WHERE`. A group without matching rows disappears unless another metric
+  produces it.
+- **`AGG()` itself:** without `FILTER` it is the metric itself. It takes exactly one argument, without `DISTINCT` or
+  `ORDER BY`, and is not a window function: write `SUM(AGG(m) FILTER (WHERE ...)) OVER (...)`.
+- **Ad-hoc aggregates** keep their own `FILTER`: `SUM(amount) FILTER (WHERE ...)`.
+- **Materializations:** a query-time filtered metric reads, and can be stored in, a
+  [materialization](#materializations) like the equivalent filtered metric:
+  `ADD MATERIALIZATION ... METRICS AGG(revenue) FILTER (WHERE accounts.segment = 'enterprise') AS enterprise_revenue`.
 
 ### Time spine (`TIME`)
 
