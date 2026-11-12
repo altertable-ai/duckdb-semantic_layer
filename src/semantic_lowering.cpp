@@ -115,6 +115,23 @@ unique_ptr<TableRef> SemanticLowering::Query(const ParsedSemanticQuery &query) {
 	return Call(SEMANTIC_VIEW_QUERY_FUNCTION, {Encode(query)});
 }
 
+optional_ptr<unique_ptr<ParsedExpression>> SemanticLowering::QueryArgument(TableRef &ref) {
+	if (ref.type != TableReferenceType::TABLE_FUNCTION) {
+		return nullptr;
+	}
+	auto &function = ref.Cast<TableFunctionRef>().function;
+	if (function->GetExpressionClass() != ExpressionClass::FUNCTION) {
+		return nullptr;
+	}
+	auto &call = function->Cast<FunctionExpression>();
+	if (!StringUtil::CIEquals(call.FunctionName().GetIdentifierName(), SEMANTIC_VIEW_QUERY_FUNCTION) ||
+	    call.GetArguments().size() != 1 ||
+	    call.GetArguments()[0].GetExpression().GetExpressionClass() != ExpressionClass::CONSTANT) {
+		return nullptr;
+	}
+	return &call.GetArgumentsMutable()[0].GetExpressionMutable();
+}
+
 unique_ptr<TableRef> SemanticLowering::WhereNameLike(unique_ptr<TableRef> ref, const string &pattern) {
 	auto node = make_uniq<SelectNode>();
 	node->select_list.push_back(make_uniq<StarExpression>());

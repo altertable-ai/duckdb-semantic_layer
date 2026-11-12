@@ -49,12 +49,16 @@ void CollectReads(const SemanticModel &model, SemanticAnalyzer &analyzer, const 
 }
 
 //! Whether `read` moves with column `column` of table `table` in a block over `home`: it is that column, or it reads
-//! neither that table (other than through the column) nor a table reached through it
+//! neither that table (other than through the column) nor a table reached through it. A column of `home` itself
+//! shifts its rows, whose other values (and those of the tables they reference) move with them.
 bool MovesWith(const SemanticModel &model, const Read &read, idx_t table, const string &column, idx_t home) {
-	if (read.table == table) {
-		return table == home || read.IsColumn(table, column);
+	if (table == home || read.table == home) {
+		return true;
 	}
-	return read.table == home || !model.Reaches(table, read.table);
+	if (read.table == table) {
+		return read.IsColumn(table, column);
+	}
+	return !model.Reaches(table, read.table);
 }
 
 } // namespace
@@ -90,7 +94,7 @@ void CheckSemanticTimeReads(const SemanticModel &model, SemanticAnalyzer &analyz
 		analyzer.Decompose(*item.resolved, SemanticMetricContext(), atoms, SemanticItemWhat(item));
 		for (auto &atom : atoms) {
 			if (atom.context.cumulative != DConstants::INVALID_INDEX) {
-				auto &cumulative = model.cumulatives[atom.context.cumulative];
+				auto &cumulative = analyzer.Transforms().Cumulative(atom.context.cumulative);
 				for (auto &read_item : items) {
 					for (auto &read : read_item.reads) {
 						if (!MovesWith(model, read, cumulative.table, cumulative.column, atom.home)) {
@@ -104,7 +108,7 @@ void CheckSemanticTimeReads(const SemanticModel &model, SemanticAnalyzer &analyz
 				}
 			}
 			for (auto o : atom.context.offsets) {
-				auto &offset = model.offsets[o];
+				auto &offset = analyzer.Transforms().Offset(o);
 				bool shifted = false;
 				for (auto &read_item : items) {
 					for (auto &read : read_item.reads) {

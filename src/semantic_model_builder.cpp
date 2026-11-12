@@ -8,23 +8,19 @@
 #include "duckdb/common/to_string.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/client_context.hpp"
-#include "duckdb/common/error_data.hpp"
-#include "duckdb/parser/expression/cast_expression.hpp"
-#include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/star_expression.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
-#include "duckdb/parser/tableref/emptytableref.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "semantic_analysis.hpp"
 #include "semantic_model.hpp"
 #include "semantic_materialization.hpp"
-#include "semantic_cumulative.hpp"
 #include "semantic_query_compiler.hpp"
 #include "semantic_time_spine.hpp"
+#include "semantic_transforms.hpp"
 
 namespace duckdb {
 
@@ -99,6 +95,11 @@ private:
 	template <typename... ARGS>
 	[[noreturn]] void Fail(const string &message, ARGS... params) {
 		throw BinderException("Invalid semantic view \"%s\": " + message, model->Name().name, params...);
+	}
+
+	//! The prefix of Fail's messages, for the checks shared with query-time transforms (semantic_transforms.hpp)
+	string ErrorPrefix() const {
+		return "Invalid semantic view \"" + model->Name().name + "\": ";
 	}
 
 	string ResolveColumn(const SemanticTable &table, const string &column, const string &what) {
@@ -495,10 +496,6 @@ private:
 		}
 	}
 
-	static bool IsConstant(SemanticAnalyzer &analyzer, const ParsedExpression &expr) {
-		return expr.IsScalar() && !analyzer.ContainsAggregateOrMetric(expr) && !SemanticAnalyzer::ContainsWindow(expr);
-	}
-
 	//! The dimension of a metric's OFFSET / CUMULATIVE clause: a dimension defined as a column (returned)
 	SemanticRef ResolveColumnDimension(const vector<string> &name_parts, idx_t m, const string &what,
 	                                   idx_t &dimension) {
@@ -523,7 +520,7 @@ private:
 	}
 
 	//! OFFSET dimensions resolve to a dimension defined as a column; the interval must be constant and shift the
-	//! column's type. Equal offsets are stored once.
+	//! column's type (SemanticMakeOffset). Equal offsets are stored once.
 	void ResolveOffsets() {
 		SemanticAnalyzer analyzer(*model, context);
 		for (idx_t m = 0; m < model->members.size(); m++) {
@@ -534,22 +531,11 @@ private:
 			}
 			auto what = What(m) + " OFFSET";
 			idx_t dimension;
-			auto column = ResolveColumnDimension(parsed.offset_dimension, m, what, dimension);
-			auto &interval = *parsed.offset_interval;
-			if (!IsConstant(analyzer, interval)) {
-				Fail("%s: the interval must be a constant expression", what);
-			}
-			auto &table = model->tables[column.index];
-			SemanticOffset offset;
-			offset.dimension = dimension;
-			offset.table = column.index;
-			offset.column = column.column;
-			offset.type = table.column_types[table.columns.at(column.column)];
-			offset.interval = interval.Copy();
+			ResolveColumnDimension(parsed.offset_dimension, m, what, dimension);
+			auto offset = SemanticMakeOffset(analyzer, dimension, *parsed.offset_interval, ErrorPrefix() + what);
 			auto existing = std::find_if(model->offsets.begin(), model->offsets.end(),
 			                             [&](const SemanticOffset &other) { return other.Equals(offset); });
 			if (existing == model->offsets.end()) {
-				CheckOffsetType(offset, what);
 				model->offsets.push_back(std::move(offset));
 				existing = model->offsets.end() - 1;
 			}
@@ -557,35 +543,8 @@ private:
 		}
 	}
 
-	//! Binds SELECT <expr>; the binder's error message, or empty
-	string BindError(unique_ptr<ParsedExpression> expr) {
-		auto node = make_uniq<SelectNode>();
-		node->select_list.push_back(std::move(expr));
-		node->from_table = make_uniq<EmptyTableRef>();
-		auto statement = make_uniq<SelectStatement>();
-		statement->node = std::move(node);
-		try {
-			auto binder = Binder::CreateBinder(context);
-			binder->Bind(statement->Cast<SQLStatement>());
-		} catch (std::exception &ex) {
-			ErrorData error(ex);
-			return error.RawMessage();
-		}
-		return string();
-	}
-
-	//! Binds SELECT CAST(CAST(NULL AS <type>) + <interval> AS <type>)
-	void CheckOffsetType(const SemanticOffset &offset, const string &what) {
-		auto error = BindError(SemanticShiftColumn(
-		    make_uniq<CastExpression>(offset.type, ConstantExpression::FromValue(Value())), offset));
-		if (!error.empty()) {
-			Fail("%s: cannot shift column \"%s.%s\" (%s) by %s: %s", what, model->tables[offset.table].name,
-			     offset.column, offset.type.ToString(), offset.interval->ToString(), error);
-		}
-	}
-
 	//! CUMULATIVE dimensions resolve like OFFSET dimensions; the OVER window is constant and the window condition
-	//! binds over the column's type. Equal clauses are stored once.
+	//! binds over the column's type (SemanticMakeCumulative). Equal clauses are stored once.
 	void ResolveCumulatives() {
 		SemanticAnalyzer analyzer(*model, context);
 		for (idx_t m = 0; m < model->members.size(); m++) {
@@ -595,57 +554,18 @@ private:
 				continue;
 			}
 			auto what = What(m) + " CUMULATIVE";
-			SemanticCumulative cumulative;
-			auto column = ResolveColumnDimension(parsed.cumulative_dimension, m, what, cumulative.dimension);
-			auto &table = model->tables[column.index];
-			cumulative.table = column.index;
-			cumulative.column = column.column;
-			cumulative.type = table.column_types[table.columns.at(column.column)];
-			cumulative.period = parsed.cumulative_period;
-			cumulative.kind = SemanticCumulativeKind::ALL;
-			if (parsed.cumulative_window) {
-				if (!IsConstant(analyzer, *parsed.cumulative_window)) {
-					Fail("%s: the window must be a constant expression", what);
-				}
-				cumulative.kind = SemanticCumulativeKind::WINDOW;
-				cumulative.window = parsed.cumulative_window->Copy();
-			} else if (!parsed.cumulative_part.empty()) {
-				if (!SemanticIsTruncationPart(parsed.cumulative_part)) {
-					Fail("%s: \"%s\" is not a date part to truncate to (e.g. day, week, month, quarter, year)", what,
-					     parsed.cumulative_part);
-				}
-				cumulative.kind = SemanticCumulativeKind::GRAIN;
-				cumulative.part = parsed.cumulative_part;
-			}
+			idx_t dimension;
+			ResolveColumnDimension(parsed.cumulative_dimension, m, what, dimension);
+			auto cumulative =
+			    SemanticMakeCumulative(analyzer, dimension, parsed.cumulative_window.get(), parsed.cumulative_part,
+			                           parsed.cumulative_period, ErrorPrefix() + what);
 			auto existing = std::find_if(model->cumulatives.begin(), model->cumulatives.end(),
 			                             [&](const SemanticCumulative &other) { return other.Equals(cumulative); });
 			if (existing == model->cumulatives.end()) {
-				CheckCumulativeType(cumulative, what);
 				model->cumulatives.push_back(std::move(cumulative));
 				existing = model->cumulatives.end() - 1;
 			}
 			member.cumulative = NumericCast<idx_t>(existing - model->cumulatives.begin());
-		}
-	}
-
-	//! Binds SELECT <window condition over CAST(NULL AS <type>)>
-	void CheckCumulativeType(const SemanticCumulative &cumulative, const string &what) {
-		auto null = [&]() {
-			return make_uniq<CastExpression>(cumulative.type, ConstantExpression::FromValue(Value()));
-		};
-		auto error = BindError(SemanticCumulativeWindow(cumulative, null(), null()));
-		if (error.empty()) {
-			return;
-		}
-		auto column = "column \"" + model->tables[cumulative.table].name + "." + cumulative.column + "\" (" +
-		              cumulative.type.ToString() + ")";
-		switch (cumulative.kind) {
-		case SemanticCumulativeKind::WINDOW:
-			Fail("%s: cannot use %s as the window of %s: %s", what, cumulative.window->ToString(), column, error);
-		case SemanticCumulativeKind::GRAIN:
-			Fail("%s: cannot truncate %s to %s: %s", what, column, cumulative.part, error);
-		default:
-			Fail("%s: %s cannot be ordered: %s", what, column, error);
 		}
 	}
 
@@ -713,10 +633,7 @@ private:
 			for (auto below : MetricsBelow(m)) {
 				auto &other = model->members[below];
 				if (cumulative) {
-					const char *clause = other.offset.IsValid()        ? "OFFSET"
-					                     : other.cumulative.IsValid()  ? "CUMULATIVE"
-					                     : !other.non_additive.empty() ? "NON ADDITIVE BY"
-					                                                   : nullptr;
+					auto clause = other.TimeClause();
 					if (clause) {
 						Fail("%s uses CUMULATIVE and cannot reference metric \"%s\", which uses %s", What(m),
 						     model->MemberDisplayName(below), clause);
@@ -770,6 +687,10 @@ private:
 	}
 
 	void CheckMemberKinds() {
+		// first, as the checks of a member also analyze the metrics it references
+		for (idx_t m = 0; m < model->members.size(); m++) {
+			CheckNoQueryForms(m, What(m));
+		}
 		SemanticAnalyzer analyzer(*model, context);
 		for (idx_t m = 0; m < model->members.size(); m++) {
 			auto what = What(m);
@@ -779,6 +700,23 @@ private:
 			} else {
 				CheckMetric(analyzer, m, what);
 			}
+		}
+	}
+
+	//! time_shift() / cumulative() are query-time forms of OFFSET / CUMULATIVE, and AGG(<metric>) [FILTER (WHERE ...)]
+	//! the query-time form of a metric reference [with FILTER]
+	void CheckNoQueryForms(idx_t member, const string &what) {
+		auto &resolved = *model->members[member].resolved;
+		auto call = SemanticFindTransformCall(resolved);
+		if (call) {
+			auto &name = call->FunctionName().GetIdentifierName();
+			Fail("%s: %s() is only allowed in queries; use %s (...) in a definition", what, name,
+			     StringUtil::CIEquals(name, "time_shift") ? "OFFSET" : "CUMULATIVE");
+		}
+		if (SemanticContainsAggCall(resolved)) {
+			Fail("%s: AGG() is only allowed in queries; reference metrics by name in a definition, and filter them "
+			     "with the metric FILTER (WHERE ...) clause",
+			     what);
 		}
 	}
 
@@ -806,6 +744,12 @@ private:
 				     "relationships",
 				     what, model->tables[table].name, model->tables[member.table].name);
 			}
+			vector<SemanticEdge> path;
+			if (model->IsTimeSpine(table) && !model->IsTimeSpine(member.table) &&
+			    model->TryPath(member.table, table, {}, path) != SemanticPathResult::FOUND) {
+				Fail("%s reads \"%s\", which logical table \"%s\" reaches through several TIME columns", what,
+				     model->tables[table].name, model->tables[member.table].name);
+			}
 		}
 	}
 
@@ -814,9 +758,8 @@ private:
 		if (member.cumulative.IsValid() && SemanticAnalyzer::ContainsWindow(*member.resolved)) {
 			Fail("%s: CUMULATIVE metrics cannot use window functions", what);
 		}
-		if (member.filter &&
-		    (analyzer.ContainsAggregateOrMetric(*member.filter) || SemanticAnalyzer::ContainsWindow(*member.filter))) {
-			Fail("%s: FILTER must be a row-level condition (dimensions, facts and columns only)", what);
+		if (member.filter && !SemanticIsRowLevelCondition(analyzer, *member.filter)) {
+			Fail("%s: %s", what, SEMANTIC_ROW_LEVEL_FILTER_ERROR);
 		}
 		if (SemanticAnalyzer::ContainsWindow(*member.resolved)) {
 			set<idx_t> dimensions;

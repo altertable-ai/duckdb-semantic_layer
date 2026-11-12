@@ -1,0 +1,263 @@
+# name: test/sql/semantic_layer/time_edge_cases.test
+# description: time spine reads of dimensions, validation of offsets and windows, offsets on fact dates
+# group: [semantic_layer]
+
+require semantic_layer
+
+statement ok
+PRAGMA enable_verification
+
+#===--------------------------------------------------------------------===#
+# A dimension computed from metric_time reads its own table's TIME
+#===--------------------------------------------------------------------===#
+
+statement ok
+CREATE TABLE o2 (oid INTEGER, od DATE);
+INSERT INTO o2 VALUES (1, '2024-01-15');
+CREATE TABLE l2 (lid INTEGER, oid INTEGER, ld DATE, qty INTEGER);
+INSERT INTO l2 VALUES (1, 1, '2024-03-01', 5);
+
+statement ok
+CREATE SEMANTIC VIEW own_time
+  TABLES (o2 PRIMARY KEY (oid) TIME (od), l2 PRIMARY KEY (lid) TIME (ld))
+  RELATIONSHIPS (l2 (oid) REFERENCES o2)
+  DIMENSIONS (o2.order_day AS metric_time.day, o2.order_day_col AS od)
+  METRICS (l2.q AS SUM(qty), o2.n AS COUNT(*));
+
+query TTI
+SELECT * FROM SEMANTIC_VIEW(own_time DIMENSIONS o2.order_day, o2.order_day_col METRICS l2.q);
+----
+2024-01-15	2024-01-15	5
+
+# the same dimension has the same value for every metric
+query TII
+SELECT * FROM SEMANTIC_VIEW(own_time DIMENSIONS o2.order_day METRICS l2.q, o2.n) ORDER BY 1;
+----
+2024-01-15	5	1
+
+# metric_time itself still follows the metric's table
+query TI
+SELECT * FROM SEMANTIC_VIEW(own_time DIMENSIONS metric_time.day METRICS l2.q);
+----
+2024-03-01	5
+
+#===--------------------------------------------------------------------===#
+# USING picks one of several TIME tables
+#===--------------------------------------------------------------------===#
+
+statement ok
+CREATE TABLE ta (id INTEGER, ad DATE);
+INSERT INTO ta VALUES (1, '2024-01-01');
+CREATE TABLE tb (id INTEGER, bd DATE);
+INSERT INTO tb VALUES (1, '2024-06-01');
+CREATE TABLE tf (id INTEGER, a_id INTEGER, b_id INTEGER);
+INSERT INTO tf VALUES (1, 1, 1);
+
+statement ok
+CREATE SEMANTIC VIEW two_times
+  TABLES (a AS ta PRIMARY KEY (id) TIME (ad), b AS tb PRIMARY KEY (id) TIME (bd), f AS tf PRIMARY KEY (id))
+  RELATIONSHIPS (fa AS f (a_id) REFERENCES a, fb AS f (b_id) REFERENCES b)
+  METRICS (f.n AS COUNT(*), f.na USING (fa) AS COUNT(*), f.nb USING (fb) AS COUNT(*));
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(two_times DIMENSIONS metric_time.day METRICS f.n);
+----
+multiple relationship paths from "f" to "metric_time"
+
+query TI
+SELECT * FROM SEMANTIC_VIEW(two_times DIMENSIONS metric_time.day METRICS f.na);
+----
+2024-01-01	1
+
+query TI
+SELECT * FROM SEMANTIC_VIEW(two_times DIMENSIONS metric_time.day METRICS f.nb);
+----
+2024-06-01	1
+
+# a dimension of a table reaching several TIME columns cannot read metric_time
+statement error
+CREATE SEMANTIC VIEW two_times_dim
+  TABLES (a AS ta PRIMARY KEY (id) TIME (ad), b AS tb PRIMARY KEY (id) TIME (bd), f AS tf PRIMARY KEY (id))
+  RELATIONSHIPS (fa AS f (a_id) REFERENCES a, fb AS f (b_id) REFERENCES b)
+  DIMENSIONS (f.fday AS metric_time.day)
+  METRICS (f.n AS COUNT(*));
+----
+which logical table "f" reaches through several TIME columns
+
+# a table's dimension read from metric_time is its own TIME, also for a metric choosing another date with USING
+statement ok
+CREATE TABLE ts_ship (id INTEGER, ordered_at DATE, shipped_at DATE, amount INTEGER);
+INSERT INTO ts_ship VALUES (1, '2024-01-01', '2024-01-05', 10);
+
+statement ok
+CREATE SEMANTIC VIEW shipping
+  TABLES (s AS ts_ship PRIMARY KEY (id) TIME (ordered_at))
+  RELATIONSHIPS (shipped AS s (shipped_at) REFERENCES metric_time)
+  DIMENSIONS (s.order_day AS metric_time.day)
+  METRICS (s.booked AS SUM(amount), s.shipped_amount USING (shipped) AS SUM(amount));
+
+query TTI
+SELECT * FROM SEMANTIC_VIEW(shipping DIMENSIONS s.order_day, metric_time.day METRICS s.shipped_amount);
+----
+2024-01-01	2024-01-05	10
+
+#===--------------------------------------------------------------------===#
+# Windows and offsets are validated
+#===--------------------------------------------------------------------===#
+
+statement ok
+CREATE TABLE tv (id INTEGER, d DATE, ts TIMESTAMP, n INTEGER, seg VARCHAR, v INTEGER);
+INSERT INTO tv VALUES (1, '2024-01-01', '2024-01-01 10:00', 1, 'a', 1), (2, '2024-01-03', '2024-01-03 10:00', 3, 'b', 2);
+
+statement error
+CREATE SEMANTIC VIEW bad TABLES (t AS tv PRIMARY KEY (id) TIME (d))
+  METRICS (t.m CUMULATIVE (metric_time.day OVER INTERVAL '-7 days') AS SUM(v));
+----
+must be positive
+
+statement error
+CREATE SEMANTIC VIEW bad TABLES (t AS tv PRIMARY KEY (id) TIME (d))
+  METRICS (t.m CUMULATIVE (metric_time.day OVER INTERVAL 0 DAY) AS SUM(v));
+----
+must be positive
+
+statement error
+CREATE SEMANTIC VIEW bad TABLES (t AS tv PRIMARY KEY (id) TIME (d)) DIMENSIONS (t.n AS n)
+  METRICS (t.m CUMULATIVE (t.n OVER -3) AS SUM(v));
+----
+must be positive
+
+statement error
+CREATE SEMANTIC VIEW bad TABLES (t AS tv PRIMARY KEY (id) TIME (d))
+  METRICS (t.m CUMULATIVE (metric_time.day OVER NULL) AS SUM(v));
+----
+cannot be NULL
+
+statement error
+CREATE SEMANTIC VIEW bad TABLES (t AS tv PRIMARY KEY (id) TIME (d))
+  METRICS (t.m OFFSET (metric_time.day BY NULL) AS SUM(v));
+----
+cannot be NULL
+
+# a DATE only moves by whole days
+statement error
+CREATE SEMANTIC VIEW bad TABLES (t AS tv PRIMARY KEY (id) TIME (d))
+  METRICS (t.m OFFSET (metric_time.day BY INTERVAL 1 HOUR) AS SUM(v));
+----
+whole number of days
+
+statement error
+CREATE SEMANTIC VIEW bad TABLES (t AS tv PRIMARY KEY (id) TIME (d)) DIMENSIONS (t.seg AS seg)
+  METRICS (t.m OFFSET (t.seg BY INTERVAL 1 DAY) AS SUM(v));
+----
+cannot shift column "t.seg" (VARCHAR): OFFSET and time_shift() move a DATE, TIMESTAMP or numeric column
+
+statement ok
+CREATE SEMANTIC VIEW tv_view TABLES (t AS tv PRIMARY KEY (id) TIME (d))
+  DIMENSIONS (t.ts AS ts, t.seg AS seg)
+  METRICS (t.total AS SUM(v),
+           t.back OFFSET (metric_time.day BY INTERVAL '-1 day') AS SUM(v),
+           t.hourly OFFSET (t.ts BY INTERVAL 1 HOUR) AS SUM(v));
+
+# negative offsets look forward; sub-day offsets of a timestamp are fine
+query TII
+SELECT * FROM SEMANTIC_VIEW(tv_view DIMENSIONS metric_time.day METRICS t.total, t.back) ORDER BY 1;
+----
+2023-12-31	NULL	1
+2024-01-01	1	NULL
+2024-01-02	NULL	2
+2024-01-03	2	NULL
+
+query TI
+SELECT * FROM SEMANTIC_VIEW(tv_view DIMENSIONS t.ts METRICS t.hourly) ORDER BY 1;
+----
+2024-01-01 11:00:00	1
+2024-01-03 11:00:00	2
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(tv_view DIMENSIONS metric_time.day METRICS cumulative(t.total, trailing_window := INTERVAL '-7 days'));
+----
+must be positive
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(tv_view DIMENSIONS metric_time.day METRICS time_shift(t.total, NULL::INTERVAL));
+----
+cannot be NULL
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(tv_view DIMENSIONS metric_time.day METRICS time_shift(t.total, INTERVAL 1 HOUR));
+----
+whole number of days
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(tv_view DIMENSIONS t.seg METRICS time_shift(t.total, INTERVAL 1 DAY, dimension := t.seg));
+----
+cannot shift column "t.seg" (VARCHAR): OFFSET and time_shift() move a DATE, TIMESTAMP or numeric column
+
+#===--------------------------------------------------------------------===#
+# Offsets and cumulative windows over a date column of the fact table, with dimensions of referenced tables
+#===--------------------------------------------------------------------===#
+
+statement ok
+CREATE TABLE fc (id INTEGER, segment VARCHAR);
+INSERT INTO fc VALUES (1, 'a'), (2, 'b');
+CREATE TABLE fo (id INTEGER, customer_id INTEGER, amount INTEGER, day DATE);
+INSERT INTO fo VALUES (1, 1, 10, '2023-05-01'), (2, 1, 20, '2024-05-01'), (3, 2, 5, '2024-05-01');
+
+statement ok
+CREATE SEMANTIC VIEW fact_dates
+  TABLES (o AS fo PRIMARY KEY (id), c AS fc PRIMARY KEY (id))
+  RELATIONSHIPS (o (customer_id) REFERENCES c)
+  DIMENSIONS (c.segment AS segment, o.day AS day, o.yr AS YEAR(day))
+  METRICS (o.rev AS SUM(amount),
+           o.rev_ly OFFSET (o.day BY INTERVAL 1 YEAR) AS o.rev,
+           o.rev_cum CUMULATIVE (o.day) AS SUM(amount));
+
+query TIII
+SELECT * FROM SEMANTIC_VIEW(fact_dates DIMENSIONS c.segment, o.yr METRICS o.rev, o.rev_ly) ORDER BY ALL;
+----
+a	2023	10	NULL
+a	2024	20	10
+a	2025	NULL	20
+b	2024	5	NULL
+b	2025	NULL	5
+
+query TII
+SELECT * FROM SEMANTIC_VIEW(fact_dates DIMENSIONS c.segment, o.yr METRICS time_shift(o.rev, INTERVAL 1 YEAR, dimension := o.day) AS ly) ORDER BY ALL;
+----
+a	2024	10
+a	2025	20
+b	2025	5
+
+query TTI
+SELECT * FROM SEMANTIC_VIEW(fact_dates DIMENSIONS c.segment, o.day METRICS o.rev_cum) ORDER BY ALL;
+----
+a	2023-05-01	10
+a	2024-05-01	30
+b	2024-05-01	5
+
+query TII
+SELECT segment, o.yr, time_shift(AGG(rev), INTERVAL 1 YEAR, dimension := o.day) FROM fact_dates GROUP BY ALL ORDER BY ALL;
+----
+a	2024	10
+a	2025	20
+b	2025	5
+
+# a referenced table's own date still does not move with the shifted column
+statement ok
+CREATE TABLE fc2 (id INTEGER, signup DATE);
+INSERT INTO fc2 VALUES (1, '2020-01-01');
+CREATE TABLE fo2 (id INTEGER, customer_id INTEGER, amount INTEGER, day DATE);
+INSERT INTO fo2 VALUES (1, 1, 10, '2023-05-01');
+
+statement ok
+CREATE SEMANTIC VIEW fact_dates2
+  TABLES (o AS fo2 PRIMARY KEY (id), c AS fc2 PRIMARY KEY (id))
+  RELATIONSHIPS (o (customer_id) REFERENCES c)
+  DIMENSIONS (c.signup AS signup, o.day AS day)
+  METRICS (o.rev_ly OFFSET (o.day BY INTERVAL 1 YEAR) AS SUM(amount));
+
+query TTI
+SELECT * FROM SEMANTIC_VIEW(fact_dates2 DIMENSIONS c.signup, o.day METRICS o.rev_ly);
+----
+2020-01-01	2024-05-01	10

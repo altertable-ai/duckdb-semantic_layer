@@ -1,0 +1,168 @@
+# name: test/sql/semantic_layer/standard_sql_statements.test
+# description: queries by name inside other statements, subqueries and CTEs; names of subquery columns
+# group: [semantic_layer]
+
+require semantic_layer
+
+statement ok
+CREATE TABLE customers (id INTEGER, name VARCHAR);
+INSERT INTO customers VALUES (1, 'Alice'), (2, 'Bob');
+CREATE TABLE orders (id INTEGER, customer_id INTEGER, amount DECIMAL(10, 2), status VARCHAR);
+INSERT INTO orders VALUES (1, 1, 100, 'open'), (2, 1, 50, 'closed'), (3, 2, 200, 'open');
+
+statement ok
+CREATE SEMANTIC VIEW shop
+  TABLES (c AS customers PRIMARY KEY (id), o AS orders PRIMARY KEY (id))
+  RELATIONSHIPS (o (customer_id) REFERENCES c)
+  DIMENSIONS (c.customer_name AS c.name, o.status AS status)
+  METRICS (o.revenue AS SUM(amount));
+
+#===--------------------------------------------------------------------===#
+# Statements other than SELECT
+#===--------------------------------------------------------------------===#
+
+statement ok
+COPY (SELECT status, AGG(revenue) FROM shop GROUP BY status ORDER BY status) TO '{TEST_DIR}/shop_by_status.csv' (FORMAT csv);
+
+query TR
+SELECT * FROM read_csv('{TEST_DIR}/shop_by_status.csv') ORDER BY 1;
+----
+closed	50.00
+open	300.00
+
+query TRR
+PIVOT (SELECT status, c.customer_name, AGG(revenue) AS r FROM shop GROUP BY ALL) ON status USING first(r) ORDER BY 1;
+----
+Alice	50.00	100.00
+Bob	NULL	200.00
+
+query TTR
+SELECT * FROM (SELECT status, AGG(revenue) AS r FROM shop GROUP BY ALL) UNPIVOT (v FOR k IN (r)) ORDER BY 1;
+----
+closed	r	50.00
+open	r	300.00
+
+statement ok
+CREATE TABLE t (x VARCHAR);
+INSERT INTO t VALUES ('open'), ('zzz'), ('qqq');
+
+statement ok
+DELETE FROM t WHERE x IN (SELECT status FROM shop GROUP BY status);
+
+statement ok
+UPDATE t SET x = 'y' WHERE x IN (SELECT 'zzz' FROM shop GROUP BY status HAVING AGG(revenue) > 100);
+
+query T
+SELECT x FROM t ORDER BY 1;
+----
+qqq
+y
+
+statement ok
+SET VARIABLE total_revenue = (SELECT AGG(revenue) FROM shop);
+
+query R
+SELECT getvariable('total_revenue');
+----
+350.00
+
+statement ok
+CREATE MACRO by_status() AS TABLE SELECT status, AGG(revenue) AS r FROM shop GROUP BY status;
+
+query TR
+FROM by_status() ORDER BY 1;
+----
+closed	50.00
+open	300.00
+
+statement ok
+CREATE TABLE totals (status VARCHAR PRIMARY KEY, revenue DECIMAL(10, 2));
+INSERT INTO totals VALUES ('open', 0);
+
+statement ok
+MERGE INTO totals USING (SELECT status, AGG(revenue) AS r FROM shop GROUP BY status) AS src
+  ON totals.status = src.status
+  WHEN MATCHED THEN UPDATE SET revenue = src.r
+  WHEN NOT MATCHED THEN INSERT VALUES (src.status, src.r);
+
+query TR
+SELECT * FROM totals ORDER BY 1;
+----
+closed	50.00
+open	300.00
+
+statement ok
+INSERT INTO totals SELECT status, AGG(revenue) FROM shop GROUP BY status
+  ON CONFLICT DO UPDATE SET revenue = excluded.revenue + 1;
+
+query TR
+SELECT * FROM totals ORDER BY 1;
+----
+closed	51.00
+open	301.00
+
+#===--------------------------------------------------------------------===#
+# Queries by name inside a SEMANTIC_VIEW(...) WHERE clause
+#===--------------------------------------------------------------------===#
+
+query TR
+SELECT * FROM SEMANTIC_VIEW(shop DIMENSIONS status METRICS revenue
+  WHERE status IN (SELECT status FROM shop GROUP BY status HAVING AGG(revenue) > 100));
+----
+open	300.00
+
+#===--------------------------------------------------------------------===#
+# A CTE named like the view reads the view in its own body
+#===--------------------------------------------------------------------===#
+
+query TR
+WITH shop AS (SELECT status, AGG(revenue) AS r FROM shop GROUP BY status) SELECT * FROM shop ORDER BY 1;
+----
+closed	50.00
+open	300.00
+
+#===--------------------------------------------------------------------===#
+# Correlated subqueries and aliases of subqueries
+#===--------------------------------------------------------------------===#
+
+statement error
+SELECT s.status, (SELECT count(*) FROM orders x WHERE x.status = s.status) AS n FROM shop s WHERE n > 1;
+----
+Subqueries in WHERE cannot reference semantic view "shop" when querying it by name
+
+statement error
+SELECT s.status, (SELECT count(*) FROM orders x WHERE x.status = s.status) AS n, AGG(revenue) FROM shop s GROUP BY ALL;
+----
+Subqueries in GROUP BY cannot reference semantic view "shop" when querying it by name
+
+statement error
+SELECT x.status, (SELECT AGG(revenue) FROM shop WHERE status = x.status) FROM orders x;
+----
+cannot reference the outer query
+
+statement error
+SELECT x.status, (SELECT revenue FROM SEMANTIC_VIEW(shop METRICS revenue WHERE status = x.status)) FROM orders x;
+----
+cannot reference the outer query
+
+#===--------------------------------------------------------------------===#
+# Column names of subqueries are the expressions as written
+#===--------------------------------------------------------------------===#
+
+statement ok
+CREATE TABLE names1 AS SELECT (SELECT AGG(revenue) FROM shop), (SELECT AGG(revenue) FROM shop) AS total;
+
+query T
+SELECT column_name FROM information_schema.columns WHERE table_name = 'names1' ORDER BY ordinal_position;
+----
+(SELECT agg(revenue) FROM shop)
+total
+
+statement ok
+CREATE TABLE names2 AS SELECT status, AGG(revenue) / (SELECT AGG(revenue) FROM shop) FROM shop GROUP BY 1;
+
+query T
+SELECT column_name FROM information_schema.columns WHERE table_name = 'names2' ORDER BY ordinal_position;
+----
+status
+(agg(revenue) / (SELECT agg(revenue) FROM shop))

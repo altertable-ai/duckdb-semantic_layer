@@ -251,7 +251,7 @@ must appear in the GROUP BY clause
 statement error
 SELECT status, AGG(revenue) OVER () FROM shop GROUP BY status;
 ----
-Window functions are not supported
+AGG() cannot be used as a window function
 
 statement error
 SELECT AGG(o.revenue) FROM shop JOIN orders ON true;
@@ -304,7 +304,12 @@ SELECT DISTINCT ON (o.status) o.status, o.line_count FROM shop ORDER BY o.status
 closed	1
 open	0
 
-statement error
+# Window functions are evaluated over the fact rows, here as a sort key.
+query I
 SELECT o.status FROM shop ORDER BY ROW_NUMBER() OVER (ORDER BY o.order_date);
 ----
-Window functions are not supported
+open
+closed
+open
+open
+open

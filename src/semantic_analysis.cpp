@@ -3,6 +3,8 @@
 #include "semantic_ast_helpers.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/macro_catalog_entry.hpp"
+#include "duckdb/function/scalar_macro_function.hpp"
 #include "duckdb/catalog/entry_lookup_info.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
@@ -12,11 +14,12 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/parser/expression/window_expression.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
+#include "duckdb/parser/result_modifier.hpp"
 
 namespace duckdb {
 
 SemanticAnalyzer::SemanticAnalyzer(const SemanticModel &model, ClientContext &context)
-    : model(model), context(context) {
+    : model(model), context(context), transforms(model) {
 }
 
 bool SemanticAnalyzer::IsAggregate(const ParsedExpression &expr) {
@@ -37,7 +40,49 @@ bool SemanticAnalyzer::IsAggregate(const ParsedExpression &expr) {
 	    context, EntryLookupInfo(CatalogType::AGGREGATE_FUNCTION_ENTRY, function_name), OnEntryNotFound::RETURN_NULL);
 	bool is_aggregate = catalog_entry && catalog_entry->type == CatalogType::AGGREGATE_FUNCTION_ENTRY;
 	aggregate_cache[key] = is_aggregate;
+	if (!is_aggregate && IsAggregateMacro(expr)) {
+		aggregate_cache[key] = is_aggregate = true;
+	}
 	return is_aggregate;
+}
+
+bool SemanticAnalyzer::IsAggregateMacro(const ParsedExpression &expr) {
+	if (expr.GetExpressionClass() != ExpressionClass::FUNCTION || expr.Cast<FunctionExpression>().IsOperator()) {
+		return false;
+	}
+	auto &function_name = expr.Cast<FunctionExpression>().GetQualifiedName();
+	auto key = function_name.ToString();
+	auto cached = aggregate_macro_cache.find(key);
+	if (cached != aggregate_macro_cache.end()) {
+		return cached->second;
+	}
+	aggregate_macro_cache[key] = false;
+	auto entry = Catalog::GetEntry(context, EntryLookupInfo(CatalogType::MACRO_ENTRY, function_name),
+	                               OnEntryNotFound::RETURN_NULL);
+	bool result = false;
+	if (entry && entry->type == CatalogType::MACRO_ENTRY) {
+		// a scalar macro whose body aggregates, such as CREATE MACRO total(x) AS sum(x), is an aggregate
+		std::function<bool(const ParsedExpression &)> aggregates = [&](const ParsedExpression &node) {
+			if (IsAggregate(node)) {
+				return true;
+			}
+			if (node.GetExpressionClass() == ExpressionClass::WINDOW ||
+			    node.GetExpressionClass() == ExpressionClass::SUBQUERY) {
+				return false;
+			}
+			bool found = false;
+			ParsedExpressionIterator::EnumerateChildren(
+			    node, [&](const ParsedExpression &child) { found = found || aggregates(child); });
+			return found;
+		};
+		for (auto &macro : entry->Cast<MacroCatalogEntry>().macros) {
+			if (macro->type == MacroType::SCALAR_MACRO) {
+				result = result || aggregates(*macro->Cast<ScalarMacroFunction>().expression);
+			}
+		}
+	}
+	aggregate_macro_cache[key] = result;
+	return result;
 }
 
 bool SemanticAnalyzer::ContainsAggregateOrMetric(const ParsedExpression &expr) {
@@ -107,20 +152,65 @@ idx_t SemanticAnalyzer::FinestTable(const set<idx_t> &tables, const string &what
 	                                  StringUtil::Join(names, ", "));
 }
 
-idx_t SemanticAnalyzer::AggregateHome(const FunctionExpression &aggregate, idx_t context_table, const string &what) {
+//! Calls `callback` on the FILTER and ORDER BY expressions of `aggregate`
+static void ForEachAggregateClause(const FunctionExpression &aggregate,
+                                   const std::function<void(const ParsedExpression &)> &callback) {
+	if (aggregate.Filter()) {
+		callback(*aggregate.Filter());
+	}
+	if (aggregate.OrderBy()) {
+		for (auto &order : aggregate.OrderBy()->orders) {
+			callback(*order.expression);
+		}
+	}
+}
+
+void SemanticAnalyzer::CheckReadableFrom(idx_t home, const ParsedExpression &expr, idx_t context_table,
+                                         const FunctionExpression &aggregate, const std::function<string()> &describe,
+                                         const string &what) {
 	set<idx_t> tables;
-	ParsedExpressionIterator::EnumerateChildren(
-	    aggregate, [&](const ParsedExpression &child) { RowTables(child, context_table, tables, what); });
+	RowTables(expr, context_table, tables, what);
+	for (auto table : tables) {
+		if (!model.Reaches(home, table)) {
+			throw SemanticDefinitionException(
+			    "%s: %s references logical table \"%s\", which is not reachable from \"%s\" (aggregated by %s)", what,
+			    describe(), model.tables[table].name, model.tables[home].name,
+			    SemanticDisplayExpression(model, aggregate)->ToString());
+		}
+	}
+}
+
+idx_t SemanticAnalyzer::AggregateHome(const FunctionExpression &aggregate, idx_t context_table, const string &what) {
+	// the arguments choose the rows aggregated; FILTER and ORDER BY read those rows (and the tables they reference)
+	set<idx_t> tables;
+	for (auto &argument : aggregate.GetArguments()) {
+		RowTables(argument.GetExpression(), context_table, tables, what);
+	}
 	if (context_table != DConstants::INVALID_INDEX) {
 		tables.insert(context_table);
 	}
 	if (tables.empty()) {
-		throw SemanticDefinitionException(
-		    "%s: cannot determine the logical table of %s; define it as a metric of a logical "
-		    "table instead",
-		    what, aggregate.ToString());
+		// an ad-hoc COUNT(*) FILTER (WHERE ...) aggregates the rows its clauses read
+		ForEachAggregateClause(aggregate,
+		                       [&](const ParsedExpression &clause) { RowTables(clause, context_table, tables, what); });
 	}
-	return FinestTable(tables, what);
+	if (tables.empty()) {
+		throw SemanticDefinitionException(
+		    "%s: cannot determine the logical table of %s; reference a column of a logical table in it, or "
+		    "define it as a metric of a logical table instead",
+		    what, DisplayText(aggregate));
+	}
+	auto home = FinestTable(tables, what);
+	ForEachAggregateClause(aggregate, [&](const ParsedExpression &clause) {
+		CheckReadableFrom(
+		    home, clause, context_table, aggregate,
+		    [&]() {
+			    auto text = DisplayText(*SemanticDisplayExpression(model, clause));
+			    return &clause == aggregate.Filter().get() ? "FILTER (WHERE " + text + ")" : "ORDER BY " + text;
+		    },
+		    what);
+	});
+	return home;
 }
 
 bool SemanticAnalyzer::ContainsWindow(const ParsedExpression &expr) {
@@ -131,6 +221,27 @@ bool SemanticAnalyzer::ContainsWindow(const ParsedExpression &expr) {
 	ParsedExpressionIterator::EnumerateChildren(
 	    expr, [&](const ParsedExpression &child) { found = found || ContainsWindow(child); });
 	return found;
+}
+
+bool SemanticAnalyzer::IsWindowMetric(idx_t member) const {
+	auto &entry = model.members[member];
+	if (entry.Kind() != SemanticMemberKind::METRIC) {
+		return false;
+	}
+	std::function<bool(const ParsedExpression &)> visit = [&](const ParsedExpression &node) {
+		if (node.GetExpressionClass() == ExpressionClass::WINDOW) {
+			return true;
+		}
+		auto ref = SemanticMarkers::Classify(node);
+		if (ref.Is(SemanticRefKind::MEMBER)) {
+			return IsWindowMetric(ref.index);
+		}
+		bool found = false;
+		ParsedExpressionIterator::EnumerateChildren(
+		    node, [&](const ParsedExpression &child) { found = found || visit(child); });
+		return found;
+	};
+	return visit(*entry.resolved);
 }
 
 void SemanticAnalyzer::WindowDimensions(const ParsedExpression &expr, set<idx_t> &dimensions) const {
@@ -187,7 +298,7 @@ SemanticMetricContext SemanticAnalyzer::MetricContext(idx_t metric, const Semant
 
 void SemanticAnalyzer::ApplyMetricContext(SemanticAtom &atom, const string &what) {
 	for (auto o : atom.context.offsets) {
-		auto &offset = model.offsets[o];
+		auto &offset = transforms.Offset(o);
 		if (!model.Reaches(atom.home, offset.table)) {
 			throw SemanticDefinitionException("%s: OFFSET dimension \"%s\" is not reachable from logical table \"%s\"",
 			                                  what, model.MemberDisplayName(offset.dimension),
@@ -195,7 +306,7 @@ void SemanticAnalyzer::ApplyMetricContext(SemanticAtom &atom, const string &what
 		}
 	}
 	if (atom.context.cumulative != DConstants::INVALID_INDEX) {
-		auto &cumulative = model.cumulatives[atom.context.cumulative];
+		auto &cumulative = transforms.Cumulative(atom.context.cumulative);
 		if (!model.Reaches(atom.home, cumulative.table)) {
 			throw SemanticDefinitionException(
 			    "%s: CUMULATIVE dimension \"%s\" is not reachable from logical table \"%s\"", what,
@@ -203,29 +314,24 @@ void SemanticAnalyzer::ApplyMetricContext(SemanticAtom &atom, const string &what
 		}
 	}
 	auto &aggregate = atom.aggregate->Cast<FunctionExpression>();
-	for (auto metric : atom.context.filters) {
-		set<idx_t> tables;
-		RowTables(*model.members[metric].filter, DConstants::INVALID_INDEX, tables, what);
-		for (auto table : tables) {
-			if (!model.Reaches(atom.home, table)) {
-				throw SemanticDefinitionException(
-				    "%s: FILTER of metric \"%s\" references logical table \"%s\", which is not reachable from \"%s\" "
-				    "(aggregated by %s)",
-				    what, model.MemberDisplayName(metric), model.tables[table].name, model.tables[atom.home].name,
-				    aggregate.ToString());
-			}
-		}
+	for (auto filter : atom.context.filters) {
+		CheckReadableFrom(
+		    atom.home, transforms.Filter(filter), DConstants::INVALID_INDEX, aggregate,
+		    [&]() { return transforms.FilterDisplayName(filter); }, what);
 	}
 	if (atom.context.non_additive_member != DConstants::INVALID_INDEX) {
-		// the last snapshot is picked among the filtered rows
-		atom.row_filters = std::move(atom.context.filters);
+		// the last snapshot is picked among the filtered rows; equal conditions (of metrics or query-time filters)
+		// filter the same rows, so they share an aggregation
+		for (auto filter : atom.context.filters) {
+			atom.row_filters.push_back(transforms.CanonicalFilter(filter));
+		}
 	} else if (!atom.context.filters.empty()) {
 		vector<unique_ptr<ParsedExpression>> conditions;
 		if (aggregate.Filter()) {
 			conditions.push_back(std::move(aggregate.FilterMutable()));
 		}
-		for (auto metric : atom.context.filters) {
-			conditions.push_back(model.members[metric].filter->Copy());
+		for (auto filter : atom.context.filters) {
+			conditions.push_back(transforms.Filter(filter).Copy());
 		}
 		aggregate.FilterMutable() = AndAll(std::move(conditions));
 	}
@@ -244,6 +350,31 @@ unique_ptr<ParsedExpression> SemanticAnalyzer::Decompose(const ParsedExpression 
 	std::function<void(unique_ptr<ParsedExpression> &)> rewrite_window_key;
 	std::function<void(unique_ptr<ParsedExpression> &)> rewrite = [&](unique_ptr<ParsedExpression> &node) {
 		auto alias = node->GetAlias();
+		auto transform = SemanticMarkers::ClassifyTransform(*node);
+		if (transform.kind != SemanticTransformKind::NONE) {
+			// a query-time transform applies like the clause of an inlined metric (innermost first)
+			auto inner = context;
+			switch (transform.kind) {
+			case SemanticTransformKind::OFFSET:
+				inner.offsets.insert(inner.offsets.begin(), transform.index);
+				break;
+			case SemanticTransformKind::CUMULATIVE:
+				// cumulative() only wraps plain metrics (SemanticResolveTransforms)
+				D_ASSERT(context.cumulative == DConstants::INVALID_INDEX);
+				inner.cumulative = transform.index;
+				break;
+			case SemanticTransformKind::FILTER:
+				// outer filters first, as for a metric defined with FILTER (MetricContext)
+				inner.filters.push_back(transform.index);
+				break;
+			default:
+				throw InternalException("Unexpected semantic transform kind");
+			}
+			auto &argument = node->Cast<FunctionExpression>().GetArguments()[1].GetExpression();
+			node = Decompose(argument, inner, atoms, what);
+			node->SetAlias(Identifier(alias));
+			return;
+		}
 		if (IsAggregate(*node)) {
 			SemanticAtom atom;
 			atom.home = AggregateHome(node->Cast<FunctionExpression>(), context.table, what);
@@ -313,7 +444,8 @@ unique_ptr<ParsedExpression> SemanticAnalyzer::Decompose(const ParsedExpression 
 			    "%s: the window clause must reference dimensions or metrics, not column \"%s.%s\"", what,
 			    model.tables[ref.index].name, ref.column);
 		}
-		if (IsAggregate(*node) || ref.Is(SemanticRefKind::MEMBER)) {
+		if (IsAggregate(*node) || ref.Is(SemanticRefKind::MEMBER) ||
+		    SemanticMarkers::ClassifyTransform(*node).kind != SemanticTransformKind::NONE) {
 			rewrite(node);
 			return;
 		}

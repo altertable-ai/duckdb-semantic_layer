@@ -1,0 +1,450 @@
+# name: test/sql/semantic_layer/standard_sql_windows.test
+# description: window functions and QUALIFY when querying a semantic view by name
+# group: [semantic_layer]
+
+require semantic_layer
+
+statement ok
+PRAGMA enable_verification
+
+statement ok
+CREATE TABLE accounts (account_id INTEGER, segment VARCHAR, country VARCHAR);
+
+statement ok
+INSERT INTO accounts VALUES (1, 'enterprise', 'FR'), (2, 'startup', 'US'), (3, 'enterprise', 'DE');
+
+# revenue by segment and year: enterprise 150, 340, 120; startup 200, 120, 210
+statement ok
+CREATE TABLE invoices (invoice_id INTEGER, account_id INTEGER, invoiced_at DATE, amount INTEGER);
+
+statement ok
+INSERT INTO invoices VALUES
+  (1, 1, '2024-02-01', 100), (2, 2, '2024-03-01', 200), (3, 3, '2024-06-01', 50),
+  (4, 1, '2025-01-15', 300), (5, 2, '2025-04-01', 120), (6, 3, '2025-09-01', 40),
+  (7, 1, '2026-02-01', 90), (8, 2, '2026-05-01', 210), (9, 3, '2026-07-01', 30);
+
+statement ok
+CREATE SEMANTIC VIEW sales
+  TABLES (account AS accounts PRIMARY KEY (account_id), invoices PRIMARY KEY (invoice_id) TIME (invoiced_at))
+  RELATIONSHIPS (invoices (account_id) REFERENCES account)
+  FACTS (invoices.invoice_amount AS amount)
+  DIMENSIONS (account.segment AS segment, account.country AS country, invoices.invoice_date AS invoiced_at)
+  METRICS (invoices.revenue AS SUM(amount));
+
+#===--------------------------------------------------------------------===#
+# Windows over the aggregated rows
+#===--------------------------------------------------------------------===#
+
+# share of total
+query I
+WITH by_name AS (
+  SELECT segment, metric_time.year AS y,
+         AGG(revenue) / SUM(AGG(revenue)) OVER (PARTITION BY metric_time.year) AS share
+  FROM sales GROUP BY segment, metric_time.year),
+expected AS (
+  SELECT segment, y, revenue / SUM(revenue) OVER (PARTITION BY y) AS share
+  FROM SEMANTIC_VIEW(sales DIMENSIONS segment, metric_time.year AS y METRICS revenue))
+SELECT (SELECT count(*) FROM (FROM by_name EXCEPT ALL FROM expected)) = 0
+   AND (SELECT count(*) FROM (FROM expected EXCEPT ALL FROM by_name)) = 0
+   AND (SELECT count(*) FROM by_name) > 0;
+----
+true
+
+# rank, filtered with QUALIFY on the alias ...
+query I
+WITH by_name AS (
+  SELECT metric_time.year AS y, segment, AGG(revenue) AS rev,
+         RANK() OVER (PARTITION BY metric_time.year ORDER BY AGG(revenue) DESC) AS rnk
+  FROM sales GROUP BY metric_time.year, segment
+  QUALIFY rnk <= 1),
+expected AS (
+  SELECT y, segment, revenue, RANK() OVER (PARTITION BY y ORDER BY revenue DESC) AS rnk
+  FROM SEMANTIC_VIEW(sales DIMENSIONS metric_time.year AS y, segment METRICS revenue)
+  QUALIFY rnk <= 1)
+SELECT (SELECT count(*) FROM (FROM by_name EXCEPT ALL FROM expected)) = 0
+   AND (SELECT count(*) FROM (FROM expected EXCEPT ALL FROM by_name)) = 0
+   AND (SELECT count(*) FROM by_name) > 0;
+----
+true
+
+query TII
+SELECT segment, AGG(revenue) AS rev, RANK() OVER (PARTITION BY metric_time.year ORDER BY AGG(revenue) DESC) AS rnk
+FROM sales GROUP BY metric_time.year, segment
+QUALIFY rnk <= 1
+ORDER BY metric_time.year;
+----
+startup	200	1
+enterprise	340	1
+startup	210	1
+
+# ... and on the window expression itself
+query TI
+SELECT segment, AGG(revenue) AS rev
+FROM sales GROUP BY metric_time.year, segment
+QUALIFY RANK() OVER (PARTITION BY metric_time.year ORDER BY AGG(revenue) DESC) = 2
+ORDER BY metric_time.year;
+----
+enterprise	150
+startup	120
+enterprise	120
+
+# LAG over the periods
+query I
+WITH by_name AS (
+  SELECT segment, metric_time.year AS y, AGG(revenue) AS rev,
+         LAG(AGG(revenue)) OVER (PARTITION BY segment ORDER BY metric_time.year) AS prev
+  FROM sales GROUP BY segment, metric_time.year),
+expected AS (
+  SELECT segment, y, revenue, LAG(revenue) OVER (PARTITION BY segment ORDER BY y) AS prev
+  FROM SEMANTIC_VIEW(sales DIMENSIONS segment, metric_time.year AS y METRICS revenue))
+SELECT (SELECT count(*) FROM (FROM by_name EXCEPT ALL FROM expected)) = 0
+   AND (SELECT count(*) FROM (FROM expected EXCEPT ALL FROM by_name)) = 0
+   AND (SELECT count(prev) FROM by_name) > 0;
+----
+true
+
+# PARTITION BY EXCLUDING segment: every group but segment
+query I
+WITH by_name AS (
+  SELECT segment, metric_time.year AS y,
+         RANK() OVER (PARTITION BY EXCLUDING segment ORDER BY AGG(revenue) DESC) AS r
+  FROM sales GROUP BY segment, metric_time.year),
+expected AS (
+  SELECT segment, metric_time.year AS y,
+         RANK() OVER (PARTITION BY metric_time.year ORDER BY AGG(revenue) DESC) AS r
+  FROM sales GROUP BY segment, metric_time.year)
+SELECT (SELECT count(*) FROM (FROM by_name EXCEPT ALL FROM expected)) = 0
+   AND (SELECT count(*) FROM (FROM expected EXCEPT ALL FROM by_name)) = 0
+   AND (SELECT count(*) FROM by_name) > 0;
+----
+true
+
+# ... excluding every group: one partition
+query I
+WITH by_name AS (
+  SELECT segment, metric_time.year AS y,
+         RANK() OVER (PARTITION BY EXCLUDING segment, metric_time.year ORDER BY AGG(revenue) DESC) AS r
+  FROM sales GROUP BY segment, metric_time.year),
+expected AS (
+  SELECT segment, y, RANK() OVER (ORDER BY revenue DESC) AS r
+  FROM SEMANTIC_VIEW(sales DIMENSIONS segment, metric_time.year AS y METRICS revenue))
+SELECT (SELECT count(*) FROM (FROM by_name EXCEPT ALL FROM expected)) = 0
+   AND (SELECT count(*) FROM (FROM expected EXCEPT ALL FROM by_name)) = 0
+   AND (SELECT count(*) FROM by_name) > 0;
+----
+true
+
+# ... naming a group as GROUP BY does: by a select alias or by its expression, however GROUP BY wrote it
+foreach excluded y metric_time.year
+
+query I
+WITH by_name AS (
+  SELECT segment, metric_time.year AS y,
+         RANK() OVER (PARTITION BY EXCLUDING {excluded} ORDER BY AGG(revenue) DESC) AS r
+  FROM sales GROUP BY segment, y),
+expected AS (
+  SELECT segment, y, RANK() OVER (PARTITION BY segment ORDER BY revenue DESC) AS r
+  FROM SEMANTIC_VIEW(sales DIMENSIONS segment, metric_time.year AS y METRICS revenue))
+SELECT (SELECT count(*) FROM (FROM by_name EXCEPT ALL FROM expected)) = 0
+   AND (SELECT count(*) FROM (FROM expected EXCEPT ALL FROM by_name)) = 0
+   AND (SELECT count(*) FROM by_name) > 0;
+----
+true
+
+query I
+WITH by_name AS (
+  SELECT segment, metric_time.year AS y,
+         RANK() OVER (PARTITION BY EXCLUDING {excluded} ORDER BY AGG(revenue) DESC) AS r
+  FROM sales GROUP BY 1, 2),
+expected AS (
+  SELECT segment, y, RANK() OVER (PARTITION BY segment ORDER BY revenue DESC) AS r
+  FROM SEMANTIC_VIEW(sales DIMENSIONS segment, metric_time.year AS y METRICS revenue))
+SELECT (SELECT count(*) FROM (FROM by_name EXCEPT ALL FROM expected)) = 0
+   AND (SELECT count(*) FROM (FROM expected EXCEPT ALL FROM by_name)) = 0
+   AND (SELECT count(*) FROM by_name) > 0;
+----
+true
+
+query I
+WITH by_name AS (
+  SELECT segment, metric_time.year AS y,
+         RANK() OVER (PARTITION BY EXCLUDING {excluded} ORDER BY AGG(revenue) DESC) AS r
+  FROM sales GROUP BY segment, metric_time.year),
+expected AS (
+  SELECT segment, y, RANK() OVER (PARTITION BY segment ORDER BY revenue DESC) AS r
+  FROM SEMANTIC_VIEW(sales DIMENSIONS segment, metric_time.year AS y METRICS revenue))
+SELECT (SELECT count(*) FROM (FROM by_name EXCEPT ALL FROM expected)) = 0
+   AND (SELECT count(*) FROM (FROM expected EXCEPT ALL FROM by_name)) = 0
+   AND (SELECT count(*) FROM by_name) > 0;
+----
+true
+
+endloop
+
+# ... or another spelling of a grouped dimension
+foreach excluded account.segment "account.segment" sales.segment
+
+query I
+WITH by_name AS (
+  SELECT segment, metric_time.year AS y,
+         RANK() OVER (PARTITION BY EXCLUDING {excluded} ORDER BY AGG(revenue) DESC) AS r
+  FROM sales GROUP BY segment, y),
+expected AS (
+  SELECT segment, y, RANK() OVER (PARTITION BY y ORDER BY revenue DESC) AS r
+  FROM SEMANTIC_VIEW(sales DIMENSIONS segment, metric_time.year AS y METRICS revenue))
+SELECT (SELECT count(*) FROM (FROM by_name EXCEPT ALL FROM expected)) = 0
+   AND (SELECT count(*) FROM (FROM expected EXCEPT ALL FROM by_name)) = 0
+   AND (SELECT count(*) FROM by_name) > 0;
+----
+true
+
+endloop
+
+query I
+WITH by_name AS (
+  SELECT account.segment, metric_time.year AS y,
+         RANK() OVER (PARTITION BY EXCLUDING segment ORDER BY AGG(revenue) DESC) AS r
+  FROM sales GROUP BY account.segment, y),
+expected AS (
+  SELECT segment, y, RANK() OVER (PARTITION BY y ORDER BY revenue DESC) AS r
+  FROM SEMANTIC_VIEW(sales DIMENSIONS segment, metric_time.year AS y METRICS revenue))
+SELECT (SELECT count(*) FROM (FROM by_name EXCEPT ALL FROM expected)) = 0
+   AND (SELECT count(*) FROM (FROM expected EXCEPT ALL FROM by_name)) = 0
+   AND (SELECT count(*) FROM by_name) > 0;
+----
+true
+
+# GROUP BY ALL: a window item is not a group, even without an aggregate inside
+query I
+WITH by_name AS (
+  SELECT segment, metric_time.year AS y, AGG(revenue) AS rev,
+         SUM(AGG(revenue)) OVER (PARTITION BY segment) AS segment_total,
+         ROW_NUMBER() OVER (PARTITION BY segment ORDER BY metric_time.year) AS n
+  FROM sales GROUP BY ALL),
+expected AS (
+  SELECT segment, y, revenue, SUM(revenue) OVER (PARTITION BY segment) AS segment_total,
+         ROW_NUMBER() OVER (PARTITION BY segment ORDER BY y) AS n
+  FROM SEMANTIC_VIEW(sales DIMENSIONS segment, metric_time.year AS y METRICS revenue))
+SELECT (SELECT count(*) FROM (FROM by_name EXCEPT ALL FROM expected)) = 0
+   AND (SELECT count(*) FROM (FROM expected EXCEPT ALL FROM by_name)) = 0
+   AND (SELECT count(*) FROM by_name) > 0;
+----
+true
+
+# HAVING filters the groups before the windows, QUALIFY after them
+query I
+WITH by_name AS (
+  SELECT segment, metric_time.year AS y, AGG(revenue) AS rev,
+         RANK() OVER (PARTITION BY segment ORDER BY AGG(revenue)) AS r
+  FROM sales GROUP BY ALL
+  HAVING AGG(revenue) > 125
+  QUALIFY r <= 1),
+expected AS (
+  SELECT segment, y, revenue, RANK() OVER (PARTITION BY segment ORDER BY revenue) AS r
+  FROM SEMANTIC_VIEW(sales DIMENSIONS segment, metric_time.year AS y METRICS revenue)
+  WHERE revenue > 125
+  QUALIFY r <= 1)
+SELECT (SELECT count(*) FROM (FROM by_name EXCEPT ALL FROM expected)) = 0
+   AND (SELECT count(*) FROM (FROM expected EXCEPT ALL FROM by_name)) = 0
+   AND (SELECT count(*) FROM by_name) > 0;
+----
+true
+
+query TII
+SELECT segment, AGG(revenue) AS rev, RANK() OVER (PARTITION BY segment ORDER BY AGG(revenue)) AS r
+FROM sales GROUP BY segment, metric_time.year
+HAVING AGG(revenue) > 125
+QUALIFY r <= 1
+ORDER BY segment;
+----
+enterprise	150	1
+startup	200	1
+
+# a window over an ad-hoc aggregate
+query I
+WITH by_name AS (
+  SELECT segment, SUM(invoices.amount) AS amount, RANK() OVER (ORDER BY SUM(invoices.amount) DESC) AS r
+  FROM sales GROUP BY segment),
+expected AS (
+  SELECT segment, revenue, RANK() OVER (ORDER BY revenue DESC) AS r
+  FROM SEMANTIC_VIEW(sales DIMENSIONS segment METRICS revenue))
+SELECT (SELECT count(*) FROM (FROM by_name EXCEPT ALL FROM expected)) = 0
+   AND (SELECT count(*) FROM (FROM expected EXCEPT ALL FROM by_name)) = 0
+   AND (SELECT count(*) FROM by_name) > 0;
+----
+true
+
+query TII
+SELECT segment, SUM(invoices.amount) AS amount, RANK() OVER (ORDER BY SUM(invoices.amount) DESC) AS r
+FROM sales GROUP BY segment ORDER BY r;
+----
+enterprise	610	1
+startup	530	2
+
+# a window in ORDER BY
+query TI
+SELECT segment, AGG(revenue) AS rev
+FROM sales GROUP BY segment, metric_time.year
+ORDER BY RANK() OVER (PARTITION BY metric_time.year ORDER BY AGG(revenue) DESC), metric_time.year;
+----
+startup	200
+enterprise	340
+startup	210
+enterprise	150
+startup	120
+enterprise	120
+
+# ... by the alias of a window item
+query TII
+SELECT segment, AGG(revenue) AS rev, RANK() OVER (PARTITION BY metric_time.year ORDER BY AGG(revenue) DESC) AS rnk
+FROM sales GROUP BY segment, metric_time.year
+ORDER BY rnk DESC, metric_time.year;
+----
+enterprise	150	2
+startup	120	2
+enterprise	120	2
+startup	200	1
+enterprise	340	1
+startup	210	1
+
+# a window over a query-time transform
+query I
+WITH by_name AS (
+  SELECT segment, metric_time.year AS y,
+         RANK() OVER (PARTITION BY metric_time.year
+                      ORDER BY time_shift(AGG(revenue), INTERVAL 1 YEAR) DESC NULLS LAST) AS r
+  FROM sales GROUP BY segment, metric_time.year),
+expected AS (
+  SELECT segment, y, RANK() OVER (PARTITION BY y ORDER BY revenue_ly DESC NULLS LAST) AS r
+  FROM SEMANTIC_VIEW(sales DIMENSIONS segment, metric_time.year AS y
+                     METRICS time_shift(revenue, INTERVAL 1 YEAR) AS revenue_ly))
+SELECT (SELECT count(*) FROM (FROM by_name EXCEPT ALL FROM expected)) = 0
+   AND (SELECT count(*) FROM (FROM expected EXCEPT ALL FROM by_name)) = 0
+   AND (SELECT count(*) FROM by_name) > 0;
+----
+true
+
+#===--------------------------------------------------------------------===#
+# Windows over fact rows
+#===--------------------------------------------------------------------===#
+
+# keys need not be selected (country)
+query I
+WITH by_name AS (
+  SELECT segment, invoice_date, invoice_amount,
+         SUM(invoice_amount) OVER (PARTITION BY segment) AS segment_total,
+         ROW_NUMBER() OVER (PARTITION BY country ORDER BY invoice_amount DESC) AS n
+  FROM sales
+  QUALIFY n <= 2),
+expected AS (
+  SELECT a.segment, i.invoiced_at, i.amount, SUM(i.amount) OVER (PARTITION BY a.segment) AS segment_total,
+         ROW_NUMBER() OVER (PARTITION BY a.country ORDER BY i.amount DESC) AS n
+  FROM invoices i JOIN accounts a USING (account_id)
+  QUALIFY n <= 2)
+SELECT (SELECT count(*) FROM (FROM by_name EXCEPT ALL FROM expected)) = 0
+   AND (SELECT count(*) FROM (FROM expected EXCEPT ALL FROM by_name)) = 0
+   AND (SELECT count(*) FROM by_name) > 0;
+----
+true
+
+# a window first in the select list, with several keys, and ordered by its alias
+query II
+SELECT ROW_NUMBER() OVER (ORDER BY country, invoice_amount) AS n, invoice_amount
+FROM sales ORDER BY n DESC LIMIT 3;
+----
+9	210
+8	200
+7	120
+
+#===--------------------------------------------------------------------===#
+# Errors
+#===--------------------------------------------------------------------===#
+
+statement error
+SELECT segment, RANK() OVER (ORDER BY country) FROM sales GROUP BY segment;
+----
+must appear in the GROUP BY clause
+
+statement error
+SELECT segment, metric_time.year, RANK() OVER (PARTITION BY EXCLUDING country ORDER BY AGG(revenue))
+FROM sales GROUP BY segment, metric_time.year;
+----
+PARTITION BY EXCLUDING only accepts grouped dimensions
+
+statement error
+SELECT segment, metric_time.year, AGG(revenue) AS rev, RANK() OVER (PARTITION BY EXCLUDING rev ORDER BY AGG(revenue))
+FROM sales GROUP BY segment, metric_time.year;
+----
+"rev" is not in the GROUP BY clause
+
+statement error
+SELECT segment, ROW_NUMBER() OVER (PARTITION BY EXCLUDING segment ORDER BY invoice_amount) FROM sales;
+----
+PARTITION BY EXCLUDING only accepts grouped dimensions
+
+statement error
+SELECT segment, AGG(revenue) OVER () FROM sales GROUP BY segment;
+----
+AGG() cannot be used as a window function
+
+statement error
+SELECT metric_time.year, time_shift(AGG(revenue), INTERVAL 1 YEAR) OVER () FROM sales GROUP BY metric_time.year;
+----
+time_shift() cannot be used as a window function
+
+statement error
+SELECT metric_time.year, cumulative(AGG(revenue)) OVER () FROM sales GROUP BY metric_time.year;
+----
+cumulative() cannot be used as a window function
+
+statement error
+SELECT segment, AGG(revenue) FROM sales GROUP BY segment HAVING RANK() OVER (ORDER BY AGG(revenue)) = 1;
+----
+Window functions are not allowed in HAVING
+
+# also through the alias of a window item
+statement error
+SELECT segment, RANK() OVER (ORDER BY AGG(revenue)) AS rk FROM sales GROUP BY segment HAVING rk = 1;
+----
+Window functions are not allowed in HAVING when querying semantic view "sales" by name; use QUALIFY
+
+statement error
+SELECT segment, RANK() OVER (ORDER BY AGG(revenue)) AS rk FROM sales GROUP BY segment HAVING rk + 0 = 1;
+----
+Window functions are not allowed in HAVING
+
+statement error
+SELECT segment, ROW_NUMBER() OVER (ORDER BY segment) AS rn FROM sales WHERE rn = 1;
+----
+Window functions are not allowed in WHERE
+
+# an alias that is also an input name reads the input
+query II
+SELECT segment AS seg, ROW_NUMBER() OVER (ORDER BY segment) AS segment FROM sales WHERE segment = 'startup';
+----
+startup	1
+
+statement error
+SELECT segment FROM sales WHERE ROW_NUMBER() OVER (ORDER BY invoice_amount) = 1;
+----
+Window functions are not allowed in WHERE
+
+statement error
+SELECT segment, ROW_NUMBER() OVER () AS n, AGG(revenue) FROM sales GROUP BY segment, n;
+----
+Window functions are not allowed in GROUP BY
+
+statement error
+SELECT segment, AGG(revenue / SUM(revenue) OVER ()) FROM sales GROUP BY segment;
+----
+AGG() takes a metric, not a window function
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(sales DIMENSIONS segment METRICS AGG(revenue / SUM(revenue) OVER ()) AS x);
+----
+<REGEX>:.*Invalid metric "x": AGG\(\) takes a metric, not a window function.*
+
+statement error
+SELECT invoice_amount, ROW_NUMBER() OVER (ORDER BY n) AS n FROM sales;
+----
+Window function alias "n" cannot be referenced in its own definition

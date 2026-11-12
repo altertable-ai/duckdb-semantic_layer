@@ -1,0 +1,236 @@
+# name: test/sql/semantic_layer/aggregate_forms.test
+# description: aggregates with constant arguments, aggregate macros, inline FILTER homes, facts aggregating finer rows
+# group: [semantic_layer]
+
+require semantic_layer
+
+statement ok
+PRAGMA enable_verification
+
+#===--------------------------------------------------------------------===#
+# Aggregates with constant arguments (quantiles, separators, k)
+#===--------------------------------------------------------------------===#
+
+statement ok
+CREATE TABLE t (id INTEGER, g VARCHAR, x DOUBLE);
+INSERT INTO t VALUES (1, 'a', 1), (2, 'a', 3), (3, 'b', 5);
+
+statement ok
+CREATE SEMANTIC VIEW constants
+  TABLES (t PRIMARY KEY (id))
+  DIMENSIONS (t.g AS g)
+  METRICS (
+    t.p50 AS QUANTILE_CONT(x, 0.5),
+    t.p_disc AS QUANTILE_DISC(x, [0.25, 0.75]),
+    t.names AS STRING_AGG(g, ',' ORDER BY id),
+    t.approx AS APPROX_QUANTILE(x, 0.5),
+    t.n AS COUNT(*)
+  );
+
+query TRTI
+SELECT * FROM SEMANTIC_VIEW(constants DIMENSIONS t.g METRICS t.p50, t.names, t.n) ORDER BY g;
+----
+a	2.0	a,a	2
+b	5.0	b	1
+
+query T
+SELECT * FROM SEMANTIC_VIEW(constants METRICS t.p_disc);
+----
+[1.0, 5.0]
+
+query R
+SELECT * FROM SEMANTIC_VIEW(constants METRICS t.approx);
+----
+3.0
+
+# ad-hoc aggregates with constant arguments, in both query forms
+query TR
+SELECT * FROM SEMANTIC_VIEW(constants DIMENSIONS t.g METRICS QUANTILE_CONT(t.x, 0.5) AS p50) ORDER BY g;
+----
+a	2.0
+b	5.0
+
+query TT
+SELECT g, STRING_AGG(g, '|' ORDER BY id) FROM constants GROUP BY g ORDER BY g;
+----
+a	a|a
+b	b
+
+query R
+SELECT QUANTILE_CONT(x, 0.5) FROM constants;
+----
+3.0
+
+# a receiver-style call reads its receiver: amount.doubled_arg() is doubled_arg(amount), not a constant
+statement ok
+CREATE MACRO doubled_arg(x) AS x * 2;
+
+statement ok
+CREATE SEMANTIC VIEW receivers TABLES (t PRIMARY KEY (id)) METRICS (t.doubled AS SUM(x.doubled_arg()));
+
+query R
+SELECT * FROM SEMANTIC_VIEW(receivers METRICS t.doubled);
+----
+18.0
+
+# a constant argument is not a column of the rows: a non-constant one is still rejected by DuckDB
+statement error
+SELECT * FROM SEMANTIC_VIEW(constants METRICS QUANTILE_CONT(t.x, t.x) AS p);
+----
+must be a constant expression
+
+#===--------------------------------------------------------------------===#
+# Aggregate macros are aggregates
+#===--------------------------------------------------------------------===#
+
+statement ok
+CREATE TABLE orders (id INTEGER, amount DECIMAL(10, 2));
+INSERT INTO orders VALUES (1, 100), (2, 50), (3, 200), (4, 10);
+CREATE TABLE line_items (order_id INTEGER, line_no INTEGER, qty INTEGER);
+INSERT INTO line_items VALUES (1, 1, 2), (1, 2, 1), (2, 1, 5), (3, 1, 1), (3, 2, 1);
+
+statement ok
+CREATE MACRO total(x) AS sum(x);
+
+statement ok
+CREATE MACRO doubled(x) AS x * 2;
+
+statement ok
+CREATE SEMANTIC VIEW shop
+  TABLES (o AS orders PRIMARY KEY (id), li AS line_items PRIMARY KEY (order_id, line_no))
+  RELATIONSHIPS (li (order_id) REFERENCES o)
+  FACTS (o.amount2 AS doubled(amount))
+  METRICS (o.revenue AS SUM(amount), o.revenue_macro AS total(amount), li.qty AS total(qty));
+
+# an aggregate macro is aggregated at its own table's grain
+query RRR
+SELECT * FROM SEMANTIC_VIEW(shop METRICS o.revenue, o.revenue_macro, li.qty);
+----
+360.00	360.00	10
+
+query R
+SELECT total(amount) FROM shop;
+----
+360.00
+
+# a scalar macro is still row-level
+query R
+SELECT SUM(amount2) FROM shop;
+----
+720.00
+
+# a filter on finer rows does not fan the macro out: it is rejected like the aggregate it expands to
+statement error
+SELECT total(amount) FROM shop WHERE li.line_no >= 1;
+----
+granularity
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(shop FACTS total(o.amount) WHERE li.line_no >= 1);
+----
+metrics and aggregates are only allowed in METRICS
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(shop FACTS total(o.amount));
+----
+metrics and aggregates are only allowed in METRICS
+
+#===--------------------------------------------------------------------===#
+# An aggregate's own FILTER does not change the table it aggregates
+#===--------------------------------------------------------------------===#
+
+statement ok
+CREATE TABLE cust (cid INTEGER, seg VARCHAR);
+INSERT INTO cust VALUES (1, 'A'), (2, 'A'), (3, 'B');
+CREATE TABLE ord (oid INTEGER, cid INTEGER, amount INTEGER);
+INSERT INTO ord VALUES (1, 1, 10), (2, 1, 20), (3, 2, 5), (4, NULL, 100);
+
+# COUNT(*) of customers filtered on their orders would count orders: rejected like the metric FILTER clause
+statement error
+CREATE SEMANTIC VIEW inline_filter
+  TABLES (c AS cust PRIMARY KEY (cid), o AS ord PRIMARY KEY (oid))
+  RELATIONSHIPS (o (cid) REFERENCES c)
+  METRICS (c.ncust_big AS COUNT(*) FILTER (WHERE o.amount > 5));
+----
+references logical table "o", which is not reachable from "c"
+
+statement ok
+CREATE SEMANTIC VIEW customers_orders
+  TABLES (c AS cust PRIMARY KEY (cid), o AS ord PRIMARY KEY (oid))
+  RELATIONSHIPS (o (cid) REFERENCES c)
+  DIMENSIONS (c.seg AS seg)
+  METRICS (c.ncust AS COUNT(*), o.norders_a AS COUNT(*) FILTER (WHERE c.seg = 'A'));
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(customers_orders METRICS COUNT(c.cid) FILTER (WHERE o.amount > 5) AS n);
+----
+references logical table "o", which is not reachable from "c"
+
+# a FILTER reading a coarser table is fine
+query TII
+SELECT * FROM SEMANTIC_VIEW(customers_orders DIMENSIONS c.seg METRICS c.ncust, o.norders_a) ORDER BY ALL;
+----
+A	2	3
+B	1	NULL
+NULL	NULL	0
+
+#===--------------------------------------------------------------------===#
+# Facts that aggregate finer rows are NULL for rows without a referenced row
+#===--------------------------------------------------------------------===#
+
+statement ok
+CREATE TABLE hdr (order_id INTEGER, status VARCHAR);
+INSERT INTO hdr VALUES (1, 'open'), (2, 'open');
+CREATE TABLE lns (line_id INTEGER, order_id INTEGER, amount INTEGER);
+INSERT INTO lns VALUES (1, 1, 10), (2, 1, 20), (3, 99, 1000), (4, NULL, 500);
+
+statement ok
+CREATE SEMANTIC VIEW orphans
+  TABLES (orders AS hdr PRIMARY KEY (order_id), lines AS lns PRIMARY KEY (line_id))
+  RELATIONSHIPS (lines (order_id) REFERENCES orders)
+  FACTS (orders.line_count AS COUNT(lines.line_id), orders.line_ids AS LIST(lines.line_id ORDER BY lines.line_id))
+  METRICS (lines.revenue AS SUM(amount), orders.norders AS COUNT(*));
+
+# orphan lines have no order, so no line count: they are not in the group of the orders without lines
+query III
+SELECT * FROM SEMANTIC_VIEW(orphans DIMENSIONS orders.line_count METRICS lines.revenue, orders.norders) ORDER BY 1;
+----
+0	NULL	1
+2	30	1
+NULL	1500	NULL
+
+query I
+SELECT * FROM SEMANTIC_VIEW(orphans METRICS lines.revenue WHERE orders.line_count = 0);
+----
+NULL
+
+query I
+SELECT * FROM SEMANTIC_VIEW(orphans METRICS lines.revenue WHERE orders.line_count IS NULL);
+----
+1500
+
+query TI
+SELECT * FROM SEMANTIC_VIEW(orphans DIMENSIONS orders.line_ids METRICS lines.revenue) ORDER BY 2;
+----
+[1, 2]	30
+NULL	1500
+
+query II
+SELECT line_id, line_count FROM orphans ORDER BY line_id;
+----
+1	2
+2	2
+3	NULL
+4	NULL
+
+#===--------------------------------------------------------------------===#
+# Aggregating a metric inside a nested aggregate
+#===--------------------------------------------------------------------===#
+
+statement error
+CREATE SEMANTIC VIEW nested_metric
+  TABLES (c AS cust PRIMARY KEY (cid), o AS ord PRIMARY KEY (oid))
+  RELATIONSHIPS (o (cid) REFERENCES c)
+  METRICS (o.amount AS SUM(amount), c.avg_amount AS AVG(SUM(o.amount)));
+----
+"o.amount" is a metric

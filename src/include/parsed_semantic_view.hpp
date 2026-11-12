@@ -156,6 +156,9 @@ struct ParsedSemanticQueryItem {
 	//! Logical table of a wildcard
 	string star_table;
 	string alias;
+	//! The item's name in error messages, when not its alias (or, unaliased, its expression): a query by name gives
+	//! its items internal aliases, and names them by what the user wrote
+	string display_name;
 
 	ParsedSemanticQueryItem() = default;
 	ParsedSemanticQueryItem(const ParsedSemanticQueryItem &) = delete;

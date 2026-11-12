@@ -56,6 +56,7 @@ public:
 private:
 	unique_ptr<ParsedExpression> CompileRow(const ParsedExpression &expr, SemanticJoinScope &scope, idx_t context_table,
 	                                        const string &what, SemanticColumnMap &map);
+	void CheckNoMetricArgument(const FunctionExpression &aggregate, const string &what);
 	unique_ptr<ParsedExpression> ChildAggregate(const SemanticAtom &atom, idx_t context, SemanticJoinScope &outer,
 	                                            const string &what);
 	const SemanticModel &model;

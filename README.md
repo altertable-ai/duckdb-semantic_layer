@@ -264,14 +264,21 @@ table's primary key, or to its only unique key. Unnamed relationships get a gene
 
 - **Facts and dimensions** are row-level expressions of their table. They can use the table's columns and other
   facts and dimensions of the same table or of tables it references (many-to-one). They can also aggregate the rows of
-  a table that references them (`orders.line_count AS COUNT(lines.l_linenumber)` counts the lines of each order).
-- **Table metrics** (`<table>.<metric>`) aggregate the rows of their table: `SUM(lines.net_price)`, `COUNT(*)`.
+  a table that references them (`orders.line_count AS COUNT(lines.l_linenumber)` counts the lines of each order);
+  such an aggregation is NULL for a line without an order.
+- **Table metrics** (`<table>.<metric>`) aggregate the rows of their table: `SUM(lines.net_price)`, `COUNT(*)`. The
+  arguments of an aggregate choose the rows it aggregates; its `FILTER` and `ORDER BY` can read those rows and the
+  tables they reference, not finer ones.
   Aggregates may be nested to aggregate a finer table first (`customers.avg_orders AS AVG(SUM(orders.o_totalprice))`),
   and metrics may combine other metrics of the same or referenced tables.
 - **Derived metrics** (no table prefix) combine metrics of different tables:
   `revenue_per_customer AS lines.revenue / customers.customers`.
 - **`PRIVATE`** facts and metrics can be used in other definitions but not queried.
-- Names are referenced as `<table>.<name>`, or by bare name when it is unique in the view.
+- Names are referenced as `<table>.<name>`, or by bare name: a member of the expression's own table, then a column
+  of that table, then a name unique in the view (so `o.total AS SUM(amount)` reads `o`'s own `amount` even when another
+  table defines a member `amount`). DuckDB's keyword functions (`current_timestamp`, `current_schema`, ...) can be
+  used without parentheses, and struct fields as `<name>.<field>`.
+- Aggregate SQL macros (`CREATE MACRO total(x) AS sum(x)`) are aggregates: in metrics, and as ad-hoc metrics.
 
 ## Querying
 
@@ -289,8 +296,9 @@ SELECT ... FROM SEMANTIC_VIEW(
 
 - The result has one column per requested item, in clause order, named after the member (or its alias).
 - `DIMENSIONS` items can be expressions over dimensions and facts (`YEAR(orders.order_date) AS year`). `METRICS` items
-  can be expressions over metrics or ad-hoc aggregates (`COUNT(DISTINCT customers.segment)`). `<table>.*` selects every
-  public member of that kind of a logical table.
+  can be expressions over metrics or ad-hoc aggregates (`COUNT(DISTINCT customers.segment)`), and can filter a metric
+  with [`AGG(<metric>) FILTER (WHERE ...)`](#metric-filters-filter). `<table>.*` selects every public member of that
+  kind of a logical table.
 - `WHERE` filters rows before aggregation. It may reference dimensions and facts (not metrics) and uncorrelated
   subqueries.
 - `FACTS` returns row-level values (grouped by `DIMENSIONS` when both are given). `FACTS` and `METRICS` cannot be
@@ -316,13 +324,110 @@ ORDER BY 2 DESC;
 In this form:
 
 - `GROUP BY` expressions become dimensions.
-- Metrics are wrapped in `AGG(...)`; other aggregate functions over dimensions or facts are ad-hoc metrics.
-- `WHERE` filters before aggregation, `HAVING` after.
+- Metrics are wrapped in `AGG(...)`, which takes a metric or an expression over metrics and ad-hoc aggregates
+  (`AGG(lines.revenue + 1)`); other aggregate functions over dimensions or facts are ad-hoc metrics. An ad-hoc metric
+  must read a column to know its logical table: `COUNT(lines.line_number)`, not `COUNT(*)`.
+  `AGG(<metric>) FILTER (WHERE ...)` filters a metric at query time, like a [metric `FILTER`](#metric-filters-filter).
+- `WHERE` filters before aggregation, so it cannot contain metrics or aggregates; `HAVING` filters after. As in
+  DuckDB, `HAVING` without `GROUP BY` aggregates the whole view into one row.
 - Without aggregation, the select list is evaluated as facts, row by row.
-- Names can be bare, qualified (`customers.segment`) or quoted as BI tools write them (`"customers.segment"`).
-- Joins with the semantic view, window functions, `QUALIFY`, `SELECT *`, and multiple grouping sets (`ROLLUP`,
-  `CUBE`, or `GROUPING SETS`) are not supported in this form. For subtotals, use `UNION ALL` of separately grouped
-  semantic queries so each metric is evaluated at the appropriate grain.
+- Names can be bare, qualified (`customers.segment`, `sales.segment`, `main.sales.segment`) or quoted as BI tools
+  write them (`"customers.segment"`, which also names the result column); every spelling of a name is the same group.
+  As in DuckDB, `WHERE` and the later select items can read select aliases (`SELECT AGG(m) AS r, r * 2`), and a view
+  name takes precedence over an alias (physical columns of the logical tables are not view names). Lambda parameters
+  (`lambda x: ...`) take precedence over both.
+- Queries by name can be used wherever a query can: subqueries and CTEs, `CREATE TABLE AS`, `INSERT`, `COPY`,
+  `PIVOT`, `UPDATE` / `DELETE` conditions, `SET VARIABLE`, table macros, and the `WHERE` of `SEMANTIC_VIEW(...)`.
+- Subqueries can read the view's columns, qualified by its name or alias, in the select list, `HAVING`, `QUALIFY`
+  and `ORDER BY` (`SELECT ..., (SELECT ... WHERE t.segment = s.segment) FROM sales s`); in an aggregated query, those
+  columns must be grouped. They cannot in `WHERE` and `GROUP BY`, which the semantic query evaluates.
+- `USING SAMPLE` samples the rows the semantic query returns, so it is only supported in row-level queries without
+  `WHERE`.
+- Joins with the semantic view, `SELECT *`, `TABLESAMPLE`, column aliases (`FROM sales AS s(a, b)`), `AT (...)` and
+  multiple grouping sets (`ROLLUP`, `CUBE`, or `GROUPING SETS`) are not supported in this form (`GROUPING(...)` of a
+  group is always 0). For subtotals, use `UNION ALL` of separately grouped semantic queries so each metric is
+  evaluated at the appropriate grain.
+
+Window functions and `QUALIFY` work as in a hand-written `GROUP BY` query: a window reads the groups and metrics
+(`AGG(...)`, ad-hoc aggregates) of the finished rows, `HAVING` filters the groups before the windows, and `QUALIFY`
+after them. As in [window function metrics](#window-function-metrics), `PARTITION BY EXCLUDING d` partitions by every
+group except `d`:
+
+```sql
+SELECT customers.segment, metric_time.year,
+       AGG(lines.revenue) / SUM(AGG(lines.revenue)) OVER (PARTITION BY metric_time.year)       AS share,
+       RANK() OVER (PARTITION BY EXCLUDING customers.segment ORDER BY AGG(lines.revenue) DESC) AS rnk
+FROM sales
+GROUP BY ALL
+QUALIFY rnk <= 3;
+```
+
+Without aggregation, windows are evaluated over the fact rows. Those rows are at the grain of the finest table among
+all the facts the query reads (in the select list, `WHERE`, `ORDER BY`, `QUALIFY`, and the windows' keys and
+arguments), so a window key or filter on a finer fact changes the row count: `SELECT customers.segment FROM sales`
+returns one row per customer, `SELECT customers.segment FROM sales WHERE lines.net_price > 0` and
+`SELECT customers.segment, ROW_NUMBER() OVER (ORDER BY lines.net_price) FROM sales` one row per line, and
+`SELECT customers.segment, COUNT(*) OVER (PARTITION BY customers.segment) FROM sales` counts customers, not lines.
+
+Like any SQL window, `LAG(AGG(m)) OVER (ORDER BY metric_time.month)` sees only the periods that have rows: a missing
+month makes it read an older one. To compare with a previous period, use
+[`time_shift(...)`](#query-time-transforms-time_shift-cumulative). `AGG(...)` and the transforms are not window
+functions themselves (`SUM(AGG(m)) OVER (...)`, not `AGG(m) OVER (...)`).
+
+### Query-time transforms (`time_shift`, `cumulative`)
+
+Without defining a metric first, `time_shift(...)` and `cumulative(...)` apply [`OFFSET`](#time-offsets-offset) and
+[`CUMULATIVE`](#cumulative-metrics-cumulative) to a metric expression inside a query:
+
+```sql
+time_shift(<metric>, <interval> [, dimension := <dimension>])
+cumulative(<metric> [, trailing_window := <interval> | to_date := '<date part>']
+                    [, period := 'first' | 'last' | 'average'] [, dimension := <dimension>])
+```
+
+| Function | Equivalent DDL clause |
+|---|---|
+| `time_shift(m, INTERVAL 1 YEAR)` | `OFFSET (metric_time.day BY INTERVAL 1 YEAR)` |
+| `time_shift(m, INTERVAL 1 MONTH, dimension := invoices.invoice_date)` | `OFFSET (invoices.invoice_date BY INTERVAL 1 MONTH)` |
+| `cumulative(m)` | `CUMULATIVE (metric_time.day)` (running total) |
+| `cumulative(m, period := 'average')` | `CUMULATIVE (metric_time.day AVERAGE)` |
+| `cumulative(m, trailing_window := INTERVAL 7 DAYS)` | `CUMULATIVE (metric_time.day OVER INTERVAL 7 DAYS)` |
+| `cumulative(m, to_date := 'month')` | `CUMULATIVE (metric_time.day TO MONTH)` |
+| `cumulative(m, to_date := 'year', period := 'first')` | `CUMULATIVE (metric_time.day TO YEAR FIRST)` |
+
+```sql
+SELECT * FROM SEMANTIC_VIEW(sales
+  DIMENSIONS metric_time.month, customers.segment
+  METRICS lines.revenue,
+          time_shift(lines.revenue, INTERVAL 1 YEAR)                     AS revenue_ly,
+          lines.revenue / time_shift(lines.revenue, INTERVAL 1 YEAR) - 1 AS growth,
+          cumulative(lines.revenue, to_date := 'year')                   AS revenue_ytd);
+
+-- by name: metrics inside a transform stay wrapped in AGG()
+SELECT metric_time.month, AGG(lines.revenue), time_shift(AGG(lines.revenue), INTERVAL 1 YEAR) AS revenue_ly
+FROM sales
+GROUP BY metric_time.month;
+```
+
+- **Sign:** as for `OFFSET`, a positive interval reads the past: rows dated *t − interval*.
+- **`dimension`** defaults to `metric_time.day` when the view declares [`TIME`](#time-spine-time). Otherwise it is
+  required. It must be a dimension defined as a column of its table; the error lists the valid ones.
+  `trailing_window` and `to_date` are mutually exclusive, and `period` defaults to `'last'`.
+- **Where:** in `METRICS` (and, by name, in the select list, `HAVING`, `QUALIFY` and `ORDER BY` expressions over
+  metrics). They are rejected in `DIMENSIONS`, `FACTS`, `WHERE`, inside an aggregate's argument
+  (`AGG(time_shift(...))` too), and in `CREATE SEMANTIC VIEW` definitions. `time_shift(cumulative(...))` is allowed;
+  `cumulative()` cannot wrap another transform or a metric that uses `OFFSET`, `CUMULATIVE` or `NON ADDITIVE BY`, and
+  `period := 'average'` needs a metric computed from a single aggregate. A window function can wrap a transform but
+  not appear inside its metric argument. Only unqualified calls are transforms (`main.time_shift(...)` is not).
+- **Arguments** are checked as in the DDL: `trailing_window` takes what `OVER` takes for the dimension's type (a
+  positive interval, or a positive number for a numeric column). `FILTER`, `DISTINCT` and `ORDER BY` go on the aggregate inside the call
+  (`time_shift(SUM(x) FILTER (WHERE ...), ...)`, or a [metric filter](#metric-filters-filter):
+  `time_shift(AGG(m) FILTER (WHERE ...), ...)`), not on the call itself.
+- Query-time transforms cannot be [materialized](#materializations); in a query that mixes them with plain metrics, the
+  plain metrics still read the materializations.
+- `duckdb_functions()` lists both functions with their parameter names, a description and examples. They are never
+  executed: calling them outside a semantic query fails. The names `__sv_offset`, `__sv_cumulative` and `__sv_filter`
+  are reserved.
 
 ### Seeing the generated SQL
 
@@ -395,6 +500,43 @@ is row-level (dimensions, facts and columns), and every table it reads must be r
 aggregate it applies to. A filtered metric is an ordinary aggregate with a `FILTER` clause, so it can be materialized.
 For semi-additive metrics, the filter applies before the last snapshot is picked, like a query's `WHERE`.
 
+**At query time**, `AGG(<metric>) FILTER (WHERE <condition>)` filters a metric without defining one, in both query
+forms:
+
+```sql
+-- SEMANTIC_VIEW(...): AGG(<metric>) is the metric, FILTER filters it
+SELECT * FROM SEMANTIC_VIEW(finance
+  DIMENSIONS metric_time.month
+  METRICS margin, AGG(margin) FILTER (WHERE accounts.segment = 'enterprise') AS enterprise_margin);
+
+-- by name
+SELECT customers.segment,
+       AGG(margin) FILTER (WHERE accounts.segment = 'enterprise') AS enterprise_margin
+FROM finance
+GROUP BY customers.segment;
+
+-- composes with the query-time transforms
+time_shift(AGG(margin) FILTER (WHERE accounts.segment = 'enterprise'), INTERVAL 1 YEAR)
+```
+
+It computes exactly what the metric `FILTER` computes:
+
+- **What it filters:** the condition is `AND`-ed into every aggregate the metric is computed from, nested metrics
+  included (for `margin` above, into all three aggregates), together with the filters of nested metrics.
+- **What it can read:** row-level values only (dimensions, facts and columns; no aggregates, metrics or windows), from
+  tables reachable from each aggregate's table. It reads stored values, not values shifted by `OFFSET` / `time_shift`.
+- **Groups are kept:** unlike the query's `WHERE`, it removes no groups and no cumulative anchors; a filtered metric is
+  0 / NULL where nothing matches.
+- **Except for semi-additive metrics:** as with the metric `FILTER`, the condition filters their rows before the last
+  snapshot is picked, like the query's `WHERE`. A group without matching rows disappears unless another metric
+  produces it.
+- **`AGG()` itself:** without `FILTER` it is the metric itself. It takes exactly one argument, without `DISTINCT` or
+  `ORDER BY`, and is not a window function: write `SUM(AGG(m) FILTER (WHERE ...)) OVER (...)`.
+- **Ad-hoc aggregates** keep their own `FILTER`: `SUM(amount) FILTER (WHERE ...)`.
+- **Materializations:** a query-time filtered metric reads, and can be stored in, a
+  [materialization](#materializations) like the equivalent filtered metric:
+  `ADD MATERIALIZATION ... METRICS AGG(revenue) FILTER (WHERE accounts.segment = 'enterprise') AS enterprise_revenue`.
+
 ### Time spine (`TIME`)
 
 ```sql
@@ -424,16 +566,19 @@ Monday). Further dimensions, such as a fiscal quarter, can be defined on `metric
 cannot.
 
 `metric_time` is never joined or scanned. A query reads the time column of the table that owns it, joining only up to
-that table, so a line item inherits its invoice's time through an ordinary relationship. It is not a source for
+that table, so a line item inherits its invoice's time through an ordinary relationship. A dimension of a table defined
+from `metric_time` (`orders.order_day AS metric_time.day`) reads that table's own time, whatever the metric. It is not a source for
 freshness checks or incremental refresh, and a query that would read only the spine (no metric and no fact) is
 rejected: the spine has no rows of its own. Days with no facts are absent from ordinary aggregates.
 
 Each `TIME` is that table's default path to `metric_time`. Another date is an ordinary relationship
 (`shipped AS shipments (shipped_at) REFERENCES metric_time`), chosen with `USING (shipped)`; without `USING`, `TIME`
 wins. A table that reaches two different `TIME` columns and does not choose one is ambiguous, as any other
-relationship is. The name `metric_time` is reserved only in a view that uses `TIME`.
+relationship is: `USING` the relationship leading to one of them picks its `TIME`. The name `metric_time` is reserved only in a view that uses `TIME`.
 
 ### Time offsets (`OFFSET`)
+
+To shift a metric in a single query without defining it, see [query-time transforms](#query-time-transforms-time_shift-cumulative).
 
 ```sql
 METRICS (
@@ -448,11 +593,16 @@ every dimension computed from that column moves with it, so the offset works at 
 `metric_time.year`, ...), and a `WHERE` on time selects the previous period's rows. Only that column is shifted, so a
 query with an offset metric must have a dimension or `WHERE` condition computed from it, and cannot read other columns
 of a date table (a stored `d_year` would not move with the date: define `metric_time.year`, or `dates.year AS year(day)`,
-instead). The metric's own definition (its aggregates and filters) reads the stored values. Offsets of nested metrics
-add up. Offset metrics cannot be materialized (the other metrics of a query still read materializations) or referenced
+instead). A date column of the metric's own table shifts its rows, so the other columns of those rows, and of the
+tables they reference, can be read. The interval cannot be NULL, and a `DATE` only moves by whole days. The metric's
+own definition (its aggregates and filters) reads the stored values. Offsets of nested metrics are applied one after
+the other (innermost first): a month-end date moved twice by one month can land before the same date moved once by
+two months. Offset metrics cannot be materialized (the other metrics of a query still read materializations) or referenced
 by facts and dimensions.
 
 ### Cumulative metrics (`CUMULATIVE`)
+
+To accumulate a metric in a single query without defining it, see [query-time transforms](#query-time-transforms-time_shift-cumulative).
 
 ```sql
 METRICS (
@@ -464,7 +614,7 @@ METRICS (
 ```
 
 For a group dated *t* (the *anchor*), a cumulative metric aggregates the rows dated up to *t*: all of them, those of
-the last `OVER` interval (*t − interval < date ≤ t*), or those since the start of *t*'s `TO` period (`week`, `month`,
+the last `OVER` interval (*t − interval < date ≤ t*, a positive interval), or those since the start of *t*'s `TO` period (`week`, `month`,
 `quarter`, `year`, ...). It is computed from the rows themselves, so distinct counts are exact and days without data
 do not shorten a window. As with `OFFSET`, the dimension must be defined as a column (typically `metric_time.day`),
 dimensions and `WHERE` conditions computed from it read the anchor (`WHERE metric_time.day >= '2024-01-01'` selects
@@ -677,7 +827,13 @@ relationships are about 9x faster than a hand-written range join. See [docs/benc
   fails with an unknown `__semantic_view_placeholder` function.
 - No placeholder is created in read-only databases or in attached non-DuckDB catalogs (Postgres, SQLite, ...). Such
   semantic views work but are not listed. A plain `DROP VIEW x` removes only the placeholder.
+- `time_shift()` and `cumulative()` are extensions: they are not allowed in definitions, cannot be materialized, and
+  a user function of the same name in the default schema may conflict with their catalog entries.
 - A DuckDB view cannot be defined over the query-by-name form; use `SEMANTIC_VIEW(...)` in view definitions.
+- Semantic queries cannot reference the columns of an outer query (correlated subqueries over a semantic view).
+- Member types are recorded when the view is created: after the type of a source column changes, the catalog
+  (`DESCRIBE`, `information_schema`) shows the old type until the view is re-created.
+- An unaliased select item containing a `SEMANTIC_VIEW(...)` subquery is named after its internal form; alias it.
 - The semantic view syntax is a grammar extension that `LOAD semantic_layer` turns on for every connection. A
   connection that was already open switches once its current (or, when the extension is loaded through an API rather
   than a `LOAD` statement, next) query ends, so `LOAD semantic_layer; SHOW SEMANTIC VIEWS;` sent as a single query
@@ -759,7 +915,8 @@ SERVICE`, `AI_SQL_GENERATION`, `AI_QUESTION_CATEGORIZATION`, `AI_VERIFIED_QUERIE
 - Metric `FILTER (WHERE ...)`, `OFFSET (<dimension> BY <interval>)` and `CUMULATIVE (...)` clauses, and the built-in
   time spine (`TIME (<column>)`, logical table `metric_time`) are extensions, modeled on
   [dbt MetricFlow](https://docs.getdbt.com/docs/build/about-metricflow)'s time spine, cumulative metrics and offsets;
-  adjacent string literals in DDL are concatenated.
+  adjacent string literals in DDL are concatenated. The query-time `time_shift()` and `cumulative()` functions and
+  `AGG(<metric>) FILTER (WHERE ...)` are extensions too.
 
 ## Contributing
 

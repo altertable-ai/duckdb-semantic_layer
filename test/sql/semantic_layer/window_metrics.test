@@ -152,3 +152,31 @@ query II
 SELECT name, required FROM (SHOW SEMANTIC DIMENSIONS IN argument_order FOR METRIC last_value);
 ----
 id	true
+
+#===--------------------------------------------------------------------===#
+# QUALIFY on window metrics when querying by name
+#===--------------------------------------------------------------------===#
+
+statement ok
+CREATE TABLE lag_sales (id INTEGER, day DATE, qty INTEGER);
+INSERT INTO lag_sales VALUES (1, '2024-01-01', 1), (2, '2024-01-02', 2), (3, '2024-01-03', 3);
+
+statement ok
+CREATE SEMANTIC VIEW lag_view TABLES (s AS lag_sales PRIMARY KEY (id)) DIMENSIONS (s.d AS day)
+  METRICS (s.total AS SUM(qty), s.prev AS LAG(s.total) OVER (ORDER BY s.d));
+
+query TI
+SELECT d, AGG(total) FROM lag_view GROUP BY d QUALIFY AGG(prev) IS NOT NULL ORDER BY d;
+----
+2024-01-02	2
+2024-01-03	3
+
+query TI
+SELECT d, AGG(prev) AS p FROM lag_view GROUP BY d QUALIFY p > 1 ORDER BY d;
+----
+2024-01-03	2
+
+query TI
+SELECT d, AGG(total) FROM lag_view GROUP BY d ORDER BY AGG(prev) DESC NULLS LAST LIMIT 1;
+----
+2024-01-03	3

@@ -3,6 +3,7 @@
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "semantic_catalog.hpp"
 #include "semantic_layer_registry.hpp"
+#include "semantic_transforms.hpp"
 
 namespace duckdb {
 
@@ -58,6 +59,7 @@ void RegisterSemanticViewsFunctions(ExtensionLoader &loader, shared_ptr<Semantic
 	RegisterSemanticShowFunctions(loader, state);
 	RegisterSemanticQueryFunctions(loader, state);
 	RegisterSemanticPlaceholderFunction(loader, state);
+	RegisterSemanticTransformFunctions(loader);
 }
 
 } // namespace duckdb
