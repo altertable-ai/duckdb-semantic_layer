@@ -85,6 +85,15 @@ bool SemanticBridgeResolver::TryCandidate(idx_t home, idx_t bridge, const set<id
 	return true;
 }
 
+bool SemanticBridgeResolver::IsPinned(idx_t bridge, const vector<idx_t> &using_relationships) const {
+	for (auto rel : using_relationships) {
+		if (model.relationships[rel].from_table == bridge) {
+			return true;
+		}
+	}
+	return false;
+}
+
 vector<SemanticBridge> SemanticBridgeResolver::Candidates(idx_t home, const set<idx_t> &tables,
                                                           const vector<idx_t> &using_relationships) const {
 	vector<SemanticBridge> candidates;
@@ -98,11 +107,8 @@ vector<SemanticBridge> SemanticBridgeResolver::Candidates(idx_t home, const set<
 		// USING (relationship) on the metric selects the bridge the relationship starts from
 		vector<SemanticBridge> pinned;
 		for (auto &candidate : candidates) {
-			for (auto rel : using_relationships) {
-				if (model.relationships[rel].from_table == candidate.bridge) {
-					pinned.push_back(candidate);
-					break;
-				}
+			if (IsPinned(candidate.bridge, using_relationships)) {
+				pinned.push_back(candidate);
 			}
 		}
 		if (!pinned.empty()) {

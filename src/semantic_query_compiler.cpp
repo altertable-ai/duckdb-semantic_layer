@@ -176,7 +176,7 @@ public:
 	//! The reference, in the block's rows, to dimension `expr` (output column `column`) when it is reached through a
 	//! bridge; nullptr when the home table reaches it
 	unique_ptr<ParsedExpression> Dimension(const ParsedExpression &expr, const string &column, const string &what) {
-		auto group = Place(expr, what, string());
+		auto group = Place(expr, what, false);
 		if (!group) {
 			return nullptr;
 		}
@@ -187,7 +187,7 @@ public:
 	//! Whether WHERE conjunct `expr` is reached through a bridge: it then filters the bridge's mapping subquery,
 	//! which becomes a semi-join
 	bool Condition(const ParsedExpression &expr) {
-		auto group = Place(expr, WHERE_WHAT, "; split it into separate conditions combined with AND");
+		auto group = Place(expr, WHERE_WHAT, true);
 		if (!group) {
 			return false;
 		}
@@ -241,8 +241,19 @@ private:
 		return "__sv_k" + to_string(index);
 	}
 
+	bool CanFilter(idx_t bridge, const set<idx_t> &tables) const {
+		for (auto table : tables) {
+			vector<SemanticEdge> path;
+			if (model.TryPath(bridge, table, block.using_relationships, path) != SemanticPathResult::FOUND ||
+			    (!path.empty() && resolver.IsSpecialJoin(path[0]))) {
+				return false;
+			}
+		}
+		return true;
+	}
+
 	//! The group of the bridge `expr` is reached through; nullptr when the home table reaches it
-	optional_ptr<Group> Place(const ParsedExpression &expr, const string &what, const string &hint) {
+	optional_ptr<Group> Place(const ParsedExpression &expr, const string &what, bool is_condition) {
 		set<idx_t> tables;
 		analyzer.RowTables(expr, DConstants::INVALID_INDEX, tables, what);
 		bool local = true;
@@ -252,7 +263,36 @@ private:
 		if (local) {
 			return nullptr;
 		}
-		auto bridge = resolver.Resolve(block.home, tables, block.using_relationships, what, hint);
+		bool pinned_bridge = false;
+		if (is_condition && !block.using_relationships.empty()) {
+			for (auto &candidate : resolver.Candidates(block.home, tables, block.using_relationships)) {
+				pinned_bridge |= resolver.IsPinned(candidate.bridge, block.using_relationships);
+			}
+		}
+		if (is_condition && !pinned_bridge) {
+			vector<Group *> selected;
+			vector<Group *> pinned;
+			for (auto &group : groups) {
+				// Dimensions are registered before conditions; WHERE-created groups do not select a bridge.
+				if (group.dimensions.empty() || !CanFilter(group.bridge.bridge, tables)) {
+					continue;
+				}
+				selected.push_back(&group);
+				if (resolver.IsPinned(group.bridge.bridge, block.using_relationships)) {
+					pinned.push_back(&group);
+				}
+			}
+			auto &matches = pinned.empty() ? selected : pinned;
+			if (matches.size() > 1) {
+				throw SemanticDefinitionException("%s: multiple selected many-to-many bridges can filter these tables",
+				                                  what);
+			}
+			if (!matches.empty()) {
+				return matches[0];
+			}
+		}
+		auto bridge = resolver.Resolve(block.home, tables, block.using_relationships, what,
+		                               is_condition ? "; split it into separate conditions combined with AND" : "");
 		for (auto &group : groups) {
 			if (group.bridge.SameAs(bridge)) {
 				return &group;

@@ -1,0 +1,164 @@
+# name: test/sql/semantic_layer/bridge_filters.test
+# description: filters on selected many-to-many bridges and their metric-side paths
+# group: [semantic_layer]
+
+require semantic_layer
+
+statement ok
+PRAGMA enable_verification
+
+statement ok
+CREATE TABLE customers (customer_id INTEGER);
+INSERT INTO customers VALUES (1), (2), (3);
+CREATE TABLE products (product_id INTEGER, category VARCHAR);
+INSERT INTO products VALUES (10, 'toys'), (11, 'books');
+CREATE TABLE orders (order_id INTEGER, customer_id INTEGER, ordered_on DATE);
+INSERT INTO orders VALUES (1, 1, '1997-01-01'), (2, 1, '1996-01-01'), (3, 2, '1996-01-01');
+CREATE TABLE order_lines (line_id INTEGER, order_id INTEGER, product_id INTEGER, amount INTEGER);
+INSERT INTO order_lines VALUES (1, 1, 10, 5), (2, 1, 10, 7), (3, 2, 11, 3), (4, 3, 10, 4);
+
+statement ok
+CREATE SEMANTIC VIEW shop
+  TABLES (
+    customers PRIMARY KEY (customer_id), products PRIMARY KEY (product_id),
+    orders PRIMARY KEY (order_id), order_lines PRIMARY KEY (line_id),
+    returns AS order_lines PRIMARY KEY (line_id), returned_products AS products PRIMARY KEY (product_id)
+  )
+  RELATIONSHIPS (
+    orders (customer_id) REFERENCES customers,
+    order_lines (order_id) REFERENCES orders, purchased_product AS order_lines (product_id) REFERENCES products,
+    returns (order_id) REFERENCES orders, returns (product_id) REFERENCES returned_products
+  )
+  DIMENSIONS (
+    products.category AS category, returned_products.returned_category AS category,
+    orders.ordered_on AS ordered_on, order_lines.amount AS amount
+  )
+  METRICS (customers.customer_count AS COUNT(*), customers.buyers USING (purchased_product) AS COUNT(*));
+
+# Only the qualifying purchase contributes its category; duplicate lines count the customer once.
+query II
+SELECT * FROM SEMANTIC_VIEW(shop DIMENSIONS products.category METRICS customers.customer_count WHERE year(orders.ordered_on) = 1997);
+----
+toys	1
+
+# A filter can read the selected bridge itself.
+query II
+SELECT * FROM SEMANTIC_VIEW(shop DIMENSIONS products.category METRICS customers.customer_count WHERE order_lines.amount >= 5);
+----
+toys	1
+
+# The whole OR is evaluated on the same purchase before deduplication.
+query II
+SELECT * FROM SEMANTIC_VIEW(shop DIMENSIONS products.category METRICS customers.customer_count WHERE year(orders.ordered_on) = 1996 OR order_lines.amount >= 7) ORDER BY 1;
+----
+books	1
+toys	2
+
+# A bridge reached by an earlier WHERE condition does not select one for the next condition.
+statement error
+SELECT * FROM SEMANTIC_VIEW(shop METRICS customers.customer_count WHERE products.category = 'toys' AND year(orders.ordered_on) = 1997);
+----
+must be related to and have an equal or lower level of granularity
+
+# Selecting a bridge for grouping does not allow finer dimensions.
+statement error
+SELECT * FROM SEMANTIC_VIEW(shop DIMENSIONS products.category, orders.ordered_on METRICS customers.customer_count);
+----
+must be related to and have an equal or lower level of granularity
+
+# Both selected bridges reach orders: USING picks the purchases, otherwise the filter is ambiguous.
+query III
+SELECT * FROM SEMANTIC_VIEW(shop DIMENSIONS products.category, returned_products.returned_category METRICS customers.buyers WHERE year(orders.ordered_on) = 1997) ORDER BY 1, 2;
+----
+toys	books	1
+toys	toys	1
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(shop DIMENSIONS products.category, returned_products.returned_category METRICS customers.customer_count WHERE year(orders.ordered_on) = 1997);
+----
+WHERE clause: multiple selected many-to-many bridges
+
+# Grouping by the purchase channel makes filters constrain those purchases, rather than unsold offers.
+statement ok
+CREATE TABLE offers (offer_id INTEGER, customer_id INTEGER, product_id INTEGER);
+INSERT INTO offers VALUES (1, 1, 10), (2, 1, 11);
+CREATE TABLE channels (channel_id INTEGER, channel_name VARCHAR);
+INSERT INTO channels VALUES (1, 'web');
+CREATE TABLE purchases (purchase_id INTEGER, offer_id INTEGER, customer_id INTEGER, product_id INTEGER, channel_id INTEGER);
+INSERT INTO purchases VALUES (1, 1, 1, 10, 1);
+
+statement ok
+CREATE SEMANTIC VIEW shop_offers
+  TABLES (customers PRIMARY KEY (customer_id), products PRIMARY KEY (product_id),
+          offers PRIMARY KEY (offer_id), purchases PRIMARY KEY (purchase_id), channels PRIMARY KEY (channel_id))
+  RELATIONSHIPS (
+    offers (customer_id) REFERENCES customers, offered_product AS offers (product_id) REFERENCES products,
+    purchases (offer_id) REFERENCES offers, purchases (channel_id) REFERENCES channels
+  )
+  DIMENSIONS (products.category AS category, channels.channel_name AS channel_name)
+  METRICS (customers.customer_count AS COUNT(*), customers.offer_count USING (offered_product) AS COUNT(*));
+
+query II
+SELECT * FROM SEMANTIC_VIEW(shop_offers DIMENSIONS channels.channel_name METRICS customers.customer_count WHERE products.category = 'books');
+----
+
+# Explicit USING preserves the ability to filter by an unsold offer.
+query II
+SELECT * FROM SEMANTIC_VIEW(shop_offers DIMENSIONS channels.channel_name METRICS customers.offer_count WHERE products.category = 'books');
+----
+web	1
+
+# Selecting a bridge does not bypass the existing exclusion of ASOF relationships.
+statement ok
+CREATE TABLE bands (lower_amount INTEGER, label VARCHAR);
+INSERT INTO bands VALUES (0, 'small');
+
+statement ok
+CREATE SEMANTIC VIEW shop_bands
+  TABLES (
+    customers PRIMARY KEY (customer_id), products PRIMARY KEY (product_id),
+    orders PRIMARY KEY (order_id), order_lines PRIMARY KEY (line_id),
+    asof_bands AS bands UNIQUE (lower_amount)
+  )
+  RELATIONSHIPS (
+    orders (customer_id) REFERENCES customers,
+    order_lines (order_id) REFERENCES orders, order_lines (product_id) REFERENCES products,
+    order_lines (amount) REFERENCES asof_bands (ASOF lower_amount)
+  )
+  DIMENSIONS (products.category AS category, asof_bands.label AS label)
+  METRICS (customers.customer_count AS COUNT(*));
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(shop_bands DIMENSIONS products.category METRICS customers.customer_count WHERE asof_bands.label = 'small');
+----
+must be related to and have an equal or lower level of granularity
+
+statement ok
+CREATE TABLE flags (flag_id INTEGER, label VARCHAR);
+INSERT INTO flags VALUES (1, 'yes'), (0, 'no');
+CREATE TABLE bought (id INTEGER, customer_id INTEGER, product_id INTEGER, flag_id INTEGER);
+INSERT INTO bought VALUES (1, 1, 10, 1), (2, 1, 11, 0);
+CREATE TABLE returned (id INTEGER, customer_id INTEGER, product_id INTEGER, flag_id INTEGER);
+INSERT INTO returned VALUES (1, 1, 10, 0), (2, 1, 11, 0);
+
+statement ok
+CREATE SEMANTIC VIEW shop_flags
+  TABLES (
+    customers PRIMARY KEY (customer_id), products PRIMARY KEY (product_id),
+    returned_products AS products PRIMARY KEY (product_id),
+    bought PRIMARY KEY (id), returned PRIMARY KEY (id), flags PRIMARY KEY (flag_id)
+  )
+  RELATIONSHIPS (
+    bought (customer_id) REFERENCES customers, bought (product_id) REFERENCES products,
+    bought (flag_id) REFERENCES flags,
+    returned (customer_id) REFERENCES customers,
+    returned_product AS returned (product_id) REFERENCES returned_products,
+    returned (flag_id) REFERENCES flags
+  )
+  DIMENSIONS (products.category AS category, flags.label AS label)
+  METRICS (customers.returners USING (returned_product) AS COUNT(*));
+
+# A bridge explicitly selected by USING wins even when the named relationship targets another table.
+query II
+SELECT * FROM SEMANTIC_VIEW(shop_flags DIMENSIONS products.category METRICS customers.returners WHERE flags.label = 'yes');
+----

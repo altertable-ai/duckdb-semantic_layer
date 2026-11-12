@@ -51,12 +51,15 @@ public:
 	//! A table outside `tables` that reaches all of them through diverging paths (the base of a dimension-only
 	//! query across a bridge), preferring coarser candidates; INVALID_INDEX when none remain, throws on ambiguity
 	idx_t CommonBase(const set<idx_t> &tables) const;
+	//! Whether `edge` follows an ASOF or range relationship, which a bridge's mapping cannot go through
+	bool IsSpecialJoin(const SemanticEdge &edge) const;
+	//! Whether one of `using_relationships` starts from `bridge`, so that USING on the metric selects it
+	bool IsPinned(idx_t bridge, const vector<idx_t> &using_relationships) const;
 
 private:
 	bool TryCandidate(idx_t home, idx_t bridge, const set<idx_t> &tables, const vector<idx_t> &using_relationships,
 	                  SemanticBridge &result) const;
 	bool PathFrom(idx_t from, idx_t to, const vector<idx_t> &using_relationships, vector<SemanticEdge> &path) const;
-	bool IsSpecialJoin(const SemanticEdge &edge) const;
 	template <class TABLES>
 	string TableList(const TABLES &tables) const;
 	BinderException AmbiguityError(idx_t home, const vector<idx_t> &far_tables,

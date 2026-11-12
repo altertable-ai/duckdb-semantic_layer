@@ -475,6 +475,12 @@ the metric selects a bridge explicitly; unrelated or equal-grain alternatives re
 Rows without any bridge row (a book without authors) get NULL bridged dimensions. A `WHERE` condition on bridged
 tables keeps only the rows with a matching bridge row.
 
+When a grouping dimension already goes through a bridge, a `WHERE` condition that the bridge can evaluate (on the
+bridge or on tables it reaches, including those on its way back to the metric) filters that same bridge, so it
+constrains the rows the groups come from. `USING` on the metric still selects a bridge explicitly. A condition no
+selected bridge can evaluate resolves its bridge as usual, and one that several selected bridges can evaluate is
+rejected as ambiguous.
+
 ### Semi-additive metrics (`NON ADDITIVE BY`)
 
 ```sql
