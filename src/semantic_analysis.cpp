@@ -250,15 +250,21 @@ unique_ptr<ParsedExpression> SemanticAnalyzer::Decompose(const ParsedExpression 
 		if (transform.kind != SemanticTransformKind::NONE) {
 			// a query-time transform applies like the clause of an inlined metric (innermost first)
 			auto inner = context;
-			if (transform.kind == SemanticTransformKind::OFFSET) {
+			switch (transform.kind) {
+			case SemanticTransformKind::OFFSET:
 				inner.offsets.insert(inner.offsets.begin(), transform.index);
-			} else if (transform.kind == SemanticTransformKind::FILTER) {
-				// outer filters first, as for a metric defined with FILTER (MetricContext)
-				inner.filters.push_back(transform.index);
-			} else {
+				break;
+			case SemanticTransformKind::CUMULATIVE:
 				// cumulative() only wraps plain metrics (SemanticResolveTransforms)
 				D_ASSERT(context.cumulative == DConstants::INVALID_INDEX);
 				inner.cumulative = transform.index;
+				break;
+			case SemanticTransformKind::FILTER:
+				// outer filters first, as for a metric defined with FILTER (MetricContext)
+				inner.filters.push_back(transform.index);
+				break;
+			default:
+				throw InternalException("Unexpected semantic transform kind");
 			}
 			auto &argument = node->Cast<FunctionExpression>().GetArguments()[1].GetExpression();
 			node = Decompose(argument, inner, atoms, what);
