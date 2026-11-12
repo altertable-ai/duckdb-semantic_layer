@@ -74,6 +74,33 @@ SELECT * FROM SEMANTIC_VIEW(two_times DIMENSIONS metric_time.day METRICS f.nb);
 ----
 2024-06-01	1
 
+# a dimension of a table reaching several TIME columns cannot read metric_time
+statement error
+CREATE SEMANTIC VIEW two_times_dim
+  TABLES (a AS ta PRIMARY KEY (id) TIME (ad), b AS tb PRIMARY KEY (id) TIME (bd), f AS tf PRIMARY KEY (id))
+  RELATIONSHIPS (fa AS f (a_id) REFERENCES a, fb AS f (b_id) REFERENCES b)
+  DIMENSIONS (f.fday AS metric_time.day)
+  METRICS (f.n AS COUNT(*));
+----
+which logical table "f" reaches through several TIME columns
+
+# a table's dimension read from metric_time is its own TIME, also for a metric choosing another date with USING
+statement ok
+CREATE TABLE ts_ship (id INTEGER, ordered_at DATE, shipped_at DATE, amount INTEGER);
+INSERT INTO ts_ship VALUES (1, '2024-01-01', '2024-01-05', 10);
+
+statement ok
+CREATE SEMANTIC VIEW shipping
+  TABLES (s AS ts_ship PRIMARY KEY (id) TIME (ordered_at))
+  RELATIONSHIPS (shipped AS s (shipped_at) REFERENCES metric_time)
+  DIMENSIONS (s.order_day AS metric_time.day)
+  METRICS (s.booked AS SUM(amount), s.shipped_amount USING (shipped) AS SUM(amount));
+
+query TTI
+SELECT * FROM SEMANTIC_VIEW(shipping DIMENSIONS s.order_day, metric_time.day METRICS s.shipped_amount);
+----
+2024-01-01	2024-01-05	10
+
 #===--------------------------------------------------------------------===#
 # Windows and offsets are validated
 #===--------------------------------------------------------------------===#

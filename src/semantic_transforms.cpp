@@ -178,21 +178,6 @@ static string BindError(ClientContext &context, unique_ptr<ParsedExpression> exp
 	return string();
 }
 
-//! The value of a constant expression (IsConstant)
-static Value EvaluateConstant(ClientContext &context, const ParsedExpression &expr) {
-	auto binder = Binder::CreateBinder(context);
-	ConstantBinder constant_binder(*binder, context, "semantic view");
-	auto copy = expr.Copy();
-	auto bound = constant_binder.Bind(copy);
-	return ExpressionExecutor::EvaluateScalar(context, *bound, true);
-}
-
-//! The first line of a binder error (without DuckDB's list of candidate functions)
-static string FirstLine(const string &error) {
-	auto newline = error.find('\n');
-	return newline == string::npos ? error : error.substr(0, newline);
-}
-
 static SemanticQueryForm QueryFormOfName(const QualifiedName &qualified_name, const string &name) {
 	if (qualified_name.Path().size() != 1) {
 		return SemanticQueryForm::NONE;
@@ -253,18 +238,51 @@ bool SemanticIsRowLevelCondition(SemanticAnalyzer &analyzer, const ParsedExpress
 	       !SemanticContainsAggCall(condition) && !SemanticFindTransformCall(condition);
 }
 
-//! The checks of an OFFSET's interval that do not depend on its dimension
-static void CheckOffsetInterval(SemanticAnalyzer &analyzer, const ParsedExpression &interval, const string &what) {
+//! The value of a constant expression (IsConstant)
+static Value EvaluateConstant(ClientContext &context, const ParsedExpression &expr) {
+	auto binder = Binder::CreateBinder(context);
+	ConstantBinder constant_binder(*binder, context, "semantic view");
+	auto copy = expr.Copy();
+	auto bound = constant_binder.Bind(copy);
+	return ExpressionExecutor::EvaluateScalar(context, *bound, true);
+}
+
+//! The first line of a binder error (without DuckDB's list of candidate functions)
+static string FirstLine(const string &error) {
+	auto newline = error.find('\n');
+	return newline == string::npos ? error : error.substr(0, newline);
+}
+
+//! The checks of an OFFSET's interval that do not depend on its dimension; returns its value
+static Value CheckOffsetInterval(SemanticAnalyzer &analyzer, const ParsedExpression &interval, const string &what) {
 	if (!IsConstant(analyzer, interval)) {
 		throw SemanticDefinitionException("%s: the interval must be a constant expression", what);
 	}
+	auto value = EvaluateConstant(analyzer.Context(), interval);
+	if (value.IsNull()) {
+		throw SemanticDefinitionException("%s: the interval cannot be NULL", what);
+	}
+	return value;
 }
 
 //! The checks of a CUMULATIVE's window / date part that do not depend on its dimension
 static void CheckCumulativeFrame(SemanticAnalyzer &analyzer, const ParsedExpression *window, const string &part,
                                  const string &what) {
-	if (window && !IsConstant(analyzer, *window)) {
-		throw SemanticDefinitionException("%s: the window must be a constant expression", what);
+	if (window) {
+		if (!IsConstant(analyzer, *window)) {
+			throw SemanticDefinitionException("%s: the window must be a constant expression", what);
+		}
+		// a trailing window holds the rows of a positive interval (or number) before each anchor
+		auto value = EvaluateConstant(analyzer.Context(), *window);
+		if (value.IsNull()) {
+			throw SemanticDefinitionException("%s: the window cannot be NULL", what);
+		}
+		auto &type = value.type();
+		if ((type.id() == LogicalTypeId::INTERVAL &&
+		     !Interval::GreaterThan(value.GetValue<interval_t>(), interval_t())) ||
+		    (type.IsNumeric() && value.DefaultCastAs(LogicalType::DOUBLE).GetValue<double>() <= 0)) {
+			throw SemanticDefinitionException("%s: the window must be positive, not %s", what, value.ToString());
+		}
 	}
 	if (!window && !part.empty() && !SemanticIsTruncationPart(part)) {
 		throw SemanticDefinitionException(
@@ -280,7 +298,7 @@ SemanticOffset SemanticMakeOffset(SemanticAnalyzer &analyzer, idx_t dimension, c
 		throw InternalException("OFFSET dimension \"%s\" is not defined as a column",
 		                        model.MemberDisplayName(dimension));
 	}
-	CheckOffsetInterval(analyzer, interval, what);
+	auto value = CheckOffsetInterval(analyzer, interval, what);
 	auto &table = model.tables[column.index];
 	SemanticOffset offset;
 	offset.dimension = dimension;
@@ -302,10 +320,6 @@ SemanticOffset SemanticMakeOffset(SemanticAnalyzer &analyzer, idx_t dimension, c
 		                                  offset.column, offset.type.ToString(), offset.interval->ToString(),
 		                                  FirstLine(error));
 	}
-	auto value = EvaluateConstant(analyzer.Context(), *offset.interval);
-	if (value.IsNull()) {
-		throw SemanticDefinitionException("%s: the interval cannot be NULL", what);
-	}
 	if (offset.type.id() == LogicalTypeId::DATE && value.type().id() == LogicalTypeId::INTERVAL &&
 	    value.GetValue<interval_t>().micros != 0) {
 		throw SemanticDefinitionException(
@@ -313,23 +327,6 @@ SemanticOffset SemanticMakeOffset(SemanticAnalyzer &analyzer, idx_t dimension, c
 		    offset.column, value.ToString());
 	}
 	return offset;
-}
-
-//! A trailing window holds the rows of a positive interval (or number) before each anchor
-static void CheckWindowSize(SemanticAnalyzer &analyzer, const ParsedExpression &window, const string &what) {
-	auto value = EvaluateConstant(analyzer.Context(), window);
-	if (value.IsNull()) {
-		throw SemanticDefinitionException("%s: the window cannot be NULL", what);
-	}
-	bool positive;
-	if (value.type().id() == LogicalTypeId::INTERVAL) {
-		positive = Interval::GreaterThan(value.GetValue<interval_t>(), interval_t());
-	} else {
-		positive = value.DefaultCastAs(LogicalType::DOUBLE).GetValue<double>() > 0;
-	}
-	if (!positive) {
-		throw SemanticDefinitionException("%s: the window must be positive, not %s", what, value.ToString());
-	}
 }
 
 SemanticCumulative SemanticMakeCumulative(SemanticAnalyzer &analyzer, idx_t dimension, const ParsedExpression *window,
@@ -362,9 +359,6 @@ SemanticCumulative SemanticMakeCumulative(SemanticAnalyzer &analyzer, idx_t dime
 	};
 	auto error = BindError(analyzer.Context(), SemanticCumulativeWindow(cumulative, null(), null()));
 	if (error.empty()) {
-		if (cumulative.kind == SemanticCumulativeKind::WINDOW) {
-			CheckWindowSize(analyzer, *cumulative.window, what);
-		}
 		return cumulative;
 	}
 	error = FirstLine(error);

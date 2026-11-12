@@ -119,18 +119,6 @@ inline void GroupByAll(SelectNode &node) {
 	node.groups.grouping_sets.push_back(std::move(set));
 }
 
-//! Whether `expr` reads the rows it is evaluated over (a column or a subquery), as opposed to a constant
-inline bool ReadsRows(const ParsedExpression &expr) {
-	if (expr.GetExpressionClass() == ExpressionClass::COLUMN_REF ||
-	    expr.GetExpressionClass() == ExpressionClass::SUBQUERY) {
-		return true;
-	}
-	bool found = false;
-	ParsedExpressionIterator::EnumerateChildren(
-	    expr, [&](const ParsedExpression &child) { found = found || ReadsRows(child); });
-	return found;
-}
-
 //! `expr` as SQL, for messages: COUNT(*) as written rather than as the parser's count_star()
 inline string DisplayText(const ParsedExpression &expr) {
 	return StringUtil::Replace(expr.ToString(), "count_star()", "count(*)");

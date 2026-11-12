@@ -281,6 +281,14 @@ public:
 	//! several paths or none. `using_relationships` (USING on metrics) restricts
 	//! how the tables they reference are reached.
 	vector<SemanticEdge> Path(idx_t from, idx_t to, const vector<idx_t> &using_relationships = {}) const;
+	//! The relationship through which the rows of `from` reach the time spine: their TIME
+	SemanticEdge TimeEdge(idx_t from, const vector<idx_t> &using_relationships = {}) const;
+	//! Whose TIME a row-level expression evaluated for `context` reads from the time spine: `context`'s own (its
+	//! TimeEdge, whatever the metric), or, for the spine itself and view-level expressions (INVALID_INDEX), the
+	//! time of the rows aggregated
+	idx_t TimeReader(idx_t context) const {
+		return context == DConstants::INVALID_INDEX || IsTimeSpine(context) ? DConstants::INVALID_INDEX : context;
+	}
 
 	//! Looks up a (possibly qualified) name: a member or a column; NONE with
 	//! `error` set when unknown or ambiguous

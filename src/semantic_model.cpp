@@ -204,6 +204,11 @@ SemanticPathResult SemanticModel::TryPath(idx_t from, idx_t to, const vector<idx
 	return SemanticPathResult::FOUND;
 }
 
+SemanticEdge SemanticModel::TimeEdge(idx_t from, const vector<idx_t> &using_relationships) const {
+	D_ASSERT(time_spine.IsValid() && from != time_spine.GetIndex());
+	return Path(from, time_spine.GetIndex(), using_relationships).back();
+}
+
 vector<SemanticEdge> SemanticModel::Path(idx_t from, idx_t to, const vector<idx_t> &using_relationships) const {
 	vector<SemanticEdge> path;
 	switch (TryPath(from, to, using_relationships, path)) {
@@ -326,7 +331,8 @@ SemanticRef SemanticModel::Lookup(const vector<string> &names, const SemanticRes
 	    StringUtil::Format("Unsupported reference \"%s\": use <logical table>.<name>", StringUtil::Join(names, ".")));
 }
 
-//! DuckDB's keyword functions written without parentheses (Binder::GetSQLValueFunction)
+//! DuckDB's keyword functions written without parentheses: a copy of the table of Binder::GetSQLValueFunction
+//! (planner/column_qualifier.cpp), which needs a binder that model resolution does not have
 static string SQLValueFunctionName(const string &name) {
 	static const case_insensitive_map_t<string> FUNCTIONS = {{"current_catalog", "current_catalog"},
 	                                                         {"current_date", "current_date"},

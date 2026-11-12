@@ -13,16 +13,18 @@
 #include "duckdb/parser/query_node/copy_query_node.hpp"
 #include "duckdb/parser/query_node/delete_query_node.hpp"
 #include "duckdb/parser/query_node/insert_query_node.hpp"
+#include "duckdb/parser/query_node/merge_query_node.hpp"
 #include "duckdb/parser/query_node/update_query_node.hpp"
 #include "duckdb/parser/statement/copy_statement.hpp"
 #include "duckdb/parser/statement/create_statement.hpp"
 #include "duckdb/parser/statement/delete_statement.hpp"
+#include "duckdb/parser/statement/insert_statement.hpp"
+#include "duckdb/parser/statement/merge_into_statement.hpp"
 #include "duckdb/parser/statement/multi_statement.hpp"
 #include "duckdb/parser/statement/set_statement.hpp"
 #include "duckdb/parser/statement/update_statement.hpp"
 #include "duckdb/parser/tableref/pivotref.hpp"
 #include "duckdb/parser/statement/explain_statement.hpp"
-#include "duckdb/parser/statement/insert_statement.hpp"
 #include "duckdb/parser/statement/prepare_statement.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/tableref/expressionlistref.hpp"
@@ -72,10 +74,17 @@ void SemanticStatementVisitor::VisitStatement(SQLStatement &statement) {
 		}
 		break;
 	}
+	case StatementType::MERGE_INTO_STATEMENT: {
+		auto &merge = statement.Cast<MergeIntoStatement>();
+		if (merge.node) {
+			VisitNode(*merge.node);
+		}
+		break;
+	}
 	case StatementType::COPY_STATEMENT: {
 		auto &copy = statement.Cast<CopyStatement>();
-		if (copy.info && copy.info->select_statement) {
-			VisitNode(*copy.info->select_statement);
+		if (copy.info) {
+			VisitCopyInfo(*copy.info);
 		}
 		break;
 	}
@@ -184,6 +193,12 @@ void SemanticStatementVisitor::VisitNode(QueryNode &node) {
 		if (insert.select_statement) {
 			VisitNode(*insert.select_statement->node);
 		}
+		if (insert.on_conflict_info) {
+			VisitSetInfo(insert.on_conflict_info->set_info);
+			if (insert.on_conflict_info->condition) {
+				VisitExpression(insert.on_conflict_info->condition);
+			}
+		}
 		VisitExpressions(insert.returning_list);
 		break;
 	}
@@ -203,22 +218,35 @@ void SemanticStatementVisitor::VisitNode(QueryNode &node) {
 		if (update.from_table) {
 			VisitRef(update.from_table, true);
 		}
-		if (update.set_info) {
-			if (update.set_info->condition) {
-				VisitExpression(update.set_info->condition);
-			}
-			VisitExpressions(update.set_info->expressions);
-		}
+		VisitSetInfo(update.set_info);
 		VisitExpressions(update.returning_list);
 		break;
 	}
-	case QueryNodeType::COPY_QUERY_NODE: {
-		auto &copy = node.Cast<CopyQueryNode>();
-		if (copy.info && copy.info->select_statement) {
-			VisitNode(*copy.info->select_statement);
+	case QueryNodeType::MERGE_QUERY_NODE: {
+		auto &merge = node.Cast<MergeQueryNode>();
+		if (merge.source) {
+			VisitRef(merge.source, true);
 		}
+		if (merge.join_condition) {
+			VisitExpression(merge.join_condition);
+		}
+		for (auto &entry : merge.actions) {
+			for (auto &action : entry.second) {
+				if (action->condition) {
+					VisitExpression(action->condition);
+				}
+				VisitSetInfo(action->update_info);
+				VisitExpressions(action->expressions);
+			}
+		}
+		VisitExpressions(merge.returning_list);
 		break;
 	}
+	case QueryNodeType::COPY_QUERY_NODE:
+		if (node.Cast<CopyQueryNode>().info) {
+			VisitCopyInfo(*node.Cast<CopyQueryNode>().info);
+		}
+		break;
 	case QueryNodeType::RECURSIVE_CTE_NODE: {
 		auto &recursive = node.Cast<RecursiveCTENode>();
 		VisitNode(*recursive.left);
@@ -283,6 +311,30 @@ void SemanticStatementVisitor::VisitRef(unique_ptr<TableRef> &ref, bool in_join)
 		break;
 	}
 	VisitTableRef(ref, in_join);
+}
+
+void SemanticStatementVisitor::VisitCopyInfo(CopyInfo &info) {
+	if (info.select_statement) {
+		VisitNode(*info.select_statement);
+	}
+	if (info.file_path_expression) {
+		VisitExpression(info.file_path_expression);
+	}
+	for (auto &option : info.parsed_options) {
+		if (option.second) {
+			VisitExpression(option.second);
+		}
+	}
+}
+
+void SemanticStatementVisitor::VisitSetInfo(unique_ptr<UpdateSetInfo> &info) {
+	if (!info) {
+		return;
+	}
+	VisitExpressions(info->expressions);
+	if (info->condition) {
+		VisitExpression(info->condition);
+	}
 }
 
 void SemanticStatementVisitor::VisitExpressions(vector<unique_ptr<ParsedExpression>> &expressions) {

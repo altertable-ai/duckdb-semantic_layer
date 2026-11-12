@@ -131,6 +131,8 @@ public:
 	//! Whether `expr` contains an aggregate or a metric reference (not looking into subqueries)
 	bool ContainsAggregateOrMetric(const ParsedExpression &expr);
 	static bool ContainsWindow(const ParsedExpression &expr);
+	//! Whether `member` is a metric computed with a window function (directly or through the metrics it reads)
+	bool IsWindowMetric(idx_t member) const;
 
 	//! Logical tables a row-level expression reads, evaluated in the row context of `context_table`
 	//! (INVALID_INDEX for view-level expressions). Child aggregations count as `context_table`.
@@ -139,6 +141,11 @@ public:
 	idx_t FinestTable(const set<idx_t> &tables, const string &what);
 	//! Home table of an aggregate call evaluated in `context_table` (INVALID_INDEX = view level)
 	idx_t AggregateHome(const FunctionExpression &aggregate, idx_t context_table, const string &what);
+	//! Rejects a row-level `expr` (`describe`d in the error) of `aggregate` reading a table its rows, of `home`, do
+	//! not reference
+	void CheckReadableFrom(idx_t home, const ParsedExpression &expr, idx_t context_table,
+	                       const FunctionExpression &aggregate, const std::function<string()> &describe,
+	                       const string &what);
 
 	//! Splits a metric-level expression into a post-aggregation expression over atom markers. Metric references
 	//! are inlined recursively (with their own USING / NON ADDITIVE BY); window functions are kept, with their

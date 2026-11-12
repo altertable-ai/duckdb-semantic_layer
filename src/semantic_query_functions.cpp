@@ -54,19 +54,15 @@ public:
 
 protected:
 	void VisitTableRef(unique_ptr<TableRef> &ref, bool) override {
-		if (ref->type != TableReferenceType::TABLE_FUNCTION) {
+		auto argument = SemanticLowering::QueryArgument(*ref);
+		if (!argument) {
 			return;
 		}
-		auto &function_ref = ref->Cast<TableFunctionRef>();
-		auto &function = function_ref.function->Cast<FunctionExpression>();
-		if (!StringUtil::CIEquals(function.FunctionName().GetIdentifierName(), SEMANTIC_VIEW_QUERY_FUNCTION)) {
-			return;
-		}
-		auto replacement = CompileSemanticQuery(context, state, ConstantValue(Argument(function, 0)), nullptr);
+		auto replacement = CompileSemanticQuery(context, state, ConstantValue(**argument), nullptr);
 		if (!ref->alias.empty()) {
 			replacement->alias = ref->alias;
 		}
-		replacement->column_name_alias = function_ref.column_name_alias;
+		replacement->column_name_alias = ref->Cast<TableFunctionRef>().column_name_alias;
 		ref = std::move(replacement);
 	}
 

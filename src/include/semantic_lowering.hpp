@@ -73,6 +73,8 @@ struct SemanticLowering {
 	static unique_ptr<TableRef> ShowDimensionsForMetric(const SemanticQualifiedName &view,
 	                                                    const vector<string> &metric);
 	static unique_ptr<TableRef> Query(const ParsedSemanticQuery &query);
+	//! The encoded ParsedSemanticQuery argument of a `ref` lowered by Query(), or null for any other reference
+	static optional_ptr<unique_ptr<ParsedExpression>> QueryArgument(TableRef &ref);
 
 	//! Restricts a SHOW / DESCRIBE result to the rows whose `name` matches `pattern` (case-insensitive LIKE)
 	static unique_ptr<TableRef> WhereNameLike(unique_ptr<TableRef> ref, const string &pattern);

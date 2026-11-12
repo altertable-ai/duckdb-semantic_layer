@@ -86,13 +86,8 @@ unique_ptr<ParsedExpression> SemanticJoinScope::ColumnReference(idx_t table, con
 }
 
 unique_ptr<ParsedExpression> SemanticJoinScope::TimeColumn(idx_t spine, idx_t reader) {
-	vector<SemanticEdge> path;
-	if (reader == DConstants::INVALID_INDEX || reader == base || model.IsTimeSpine(reader) ||
-	    model.TryPath(reader, spine, vector<idx_t>(), path) != SemanticPathResult::FOUND) {
-		// the spine itself (metric_time.day): the time of the rows aggregated, along the metric's USING
-		path = model.Path(base, spine, using_relationships);
-	}
-	auto edge = path.back();
+	auto edge =
+	    reader == DConstants::INVALID_INDEX ? model.TimeEdge(base, using_relationships) : model.TimeEdge(reader);
 	auto &rel = model.relationships[edge.relationship];
 	auto &from = model.tables[rel.from_table];
 	auto &column = rel.from_columns[0];

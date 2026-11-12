@@ -5,8 +5,8 @@
 //
 // Walks every query node and table reference of a statement - CTEs, joins,
 // subqueries in FROM and in expressions, PIVOT, DESCRIBE / SHOW, EXPLAIN,
-// PREPARE, CREATE TABLE AS / MACRO / TYPE, INSERT, UPDATE, DELETE, COPY and
-// SET VARIABLE - so that subclasses can rewrite them.
+// PREPARE, CREATE TABLE AS / MACRO / TYPE, INSERT, UPDATE, DELETE, MERGE,
+// COPY and SET VARIABLE - so that subclasses can rewrite them.
 //
 //===----------------------------------------------------------------------===//
 
@@ -14,7 +14,9 @@
 
 #include "duckdb/common/case_insensitive_map.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
+#include "duckdb/parser/parsed_data/copy_info.hpp"
 #include "duckdb/parser/parsed_data/create_info.hpp"
+#include "duckdb/parser/statement/update_statement.hpp"
 #include "duckdb/parser/sql_statement.hpp"
 #include "duckdb/parser/tableref/showref.hpp"
 
@@ -49,6 +51,8 @@ protected:
 
 private:
 	void VisitCreateInfo(CreateInfo &info);
+	void VisitCopyInfo(CopyInfo &info);
+	void VisitSetInfo(unique_ptr<UpdateSetInfo> &info);
 	void VisitRef(unique_ptr<TableRef> &ref, bool in_join);
 	void VisitExpressions(vector<unique_ptr<ParsedExpression>> &expressions);
 

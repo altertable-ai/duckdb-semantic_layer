@@ -62,14 +62,12 @@ unique_ptr<ParsedExpression> SemanticExpressionCompiler::CompileRow(const Parsed
 	auto ref = SemanticMarkers::Classify(expr);
 	unique_ptr<ParsedExpression> result;
 	if (ref.Is(SemanticRefKind::COLUMN)) {
-		result = map.Column(ref.index, ref.column, scope.ColumnReference(ref.index, ref.column, context_table));
+		result = map.Column(ref.index, ref.column,
+		                    scope.ColumnReference(ref.index, ref.column, model.TimeReader(context_table)));
 	} else if (ref.Is(SemanticRefKind::MEMBER) && model.members[ref.index].IsRowLevel()) {
 		auto &member = model.members[ref.index];
-		// a time spine dimension read by a row-level expression of another table is that table's time
-		auto table = member.table;
-		if (model.IsTimeSpine(table) && context_table != DConstants::INVALID_INDEX) {
-			table = context_table;
-		}
+		// the time spine's dimensions are evaluated for the expression reading them (SemanticModel::TimeReader)
+		auto table = model.IsTimeSpine(member.table) ? context_table : member.table;
 		result = CompileRow(*member.resolved, scope, table, what, map);
 	} else if (ref.Is(SemanticRefKind::MEMBER)) {
 		// a metric in a row-level expression: aggregate the finer rows belonging to the current row

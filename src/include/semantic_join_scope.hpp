@@ -57,7 +57,7 @@ public:
 	//! Reference to `column` of `table`. Tables reached through a range relationship are read with a correlated
 	//! scalar subquery: DuckDB decorrelates it on the distinct values of the referencing column, so the lookup is a
 	//! small join of those values with the range table instead of a range join over every row.
-	//! A column of the time spine read by a row-level expression of `reader` is the day of `reader`'s own TIME.
+	//! A column of the time spine is the day of `reader`'s TIME (SemanticModel::TimeReader).
 	unique_ptr<ParsedExpression> ColumnReference(idx_t table, const string &column,
 	                                             idx_t reader = DConstants::INVALID_INDEX);
 	unique_ptr<TableRef> BuildFrom() const;

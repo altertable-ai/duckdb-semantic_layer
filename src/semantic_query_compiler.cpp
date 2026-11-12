@@ -421,7 +421,7 @@ private:
 		// the aggregates read their arguments, FILTERs and ORDER BYs from the rows, as __sv_x<n>
 		idx_t argument_count = 0;
 		auto extract = [&](unique_ptr<ParsedExpression> &argument) {
-			if (!ReadsRows(*argument)) {
+			if (argument->IsScalar()) {
 				// constant parameters (QUANTILE_CONT(x, 0.5), STRING_AGG(x, ',')) must stay constants
 				return;
 			}

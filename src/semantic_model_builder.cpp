@@ -744,6 +744,12 @@ private:
 				     "relationships",
 				     what, model->tables[table].name, model->tables[member.table].name);
 			}
+			vector<SemanticEdge> path;
+			if (model->IsTimeSpine(table) && !model->IsTimeSpine(member.table) &&
+			    model->TryPath(member.table, table, {}, path) != SemanticPathResult::FOUND) {
+				Fail("%s reads \"%s\", which logical table \"%s\" reaches through several TIME columns", what,
+				     model->tables[table].name, model->tables[member.table].name);
+			}
 		}
 	}
 

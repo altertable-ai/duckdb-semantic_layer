@@ -75,6 +75,32 @@ FROM by_status() ORDER BY 1;
 closed	50.00
 open	300.00
 
+statement ok
+CREATE TABLE totals (status VARCHAR PRIMARY KEY, revenue DECIMAL(10, 2));
+INSERT INTO totals VALUES ('open', 0);
+
+statement ok
+MERGE INTO totals USING (SELECT status, AGG(revenue) AS r FROM shop GROUP BY status) AS src
+  ON totals.status = src.status
+  WHEN MATCHED THEN UPDATE SET revenue = src.r
+  WHEN NOT MATCHED THEN INSERT VALUES (src.status, src.r);
+
+query TR
+SELECT * FROM totals ORDER BY 1;
+----
+closed	50.00
+open	300.00
+
+statement ok
+INSERT INTO totals SELECT status, AGG(revenue) FROM shop GROUP BY status
+  ON CONFLICT DO UPDATE SET revenue = excluded.revenue + 1;
+
+query TR
+SELECT * FROM totals ORDER BY 1;
+----
+closed	51.00
+open	301.00
+
 #===--------------------------------------------------------------------===#
 # Queries by name inside a SEMANTIC_VIEW(...) WHERE clause
 #===--------------------------------------------------------------------===#
