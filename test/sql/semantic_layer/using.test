@@ -124,7 +124,8 @@ CREATE SEMANTIC VIEW orders_sv
   )
   METRICS (
     orders.total AS SUM(amount),
-    orders.total_to_recipient USING (shipment_recipient) AS SUM(amount)
+    orders.total_to_recipient USING (shipment_recipient) AS SUM(amount),
+    orders.total_via_shipment USING (order_shipment) AS SUM(amount)
   );
 
 # the buyer (direct) over the recipient (through shipments)
@@ -144,6 +145,13 @@ South	40
 # USING still selects the detour
 query II
 SELECT * FROM SEMANTIC_VIEW(orders_sv DIMENSIONS customers.customer METRICS orders.total_to_recipient) ORDER BY 1;
+----
+Ann	40
+Bob	30
+
+# USING can select the detour by its first hop without excluding the direct edge.
+query II
+SELECT * FROM SEMANTIC_VIEW(orders_sv DIMENSIONS customers.customer METRICS orders.total_via_shipment) ORDER BY 1;
 ----
 Ann	40
 Bob	30
@@ -291,10 +299,16 @@ statement ok
 INSERT INTO subscriptions VALUES (1, 1, '2026-01-01');
 
 statement ok
-CREATE TABLE contracts (contract_id INTEGER, started_at DATE);
+CREATE TABLE contracts (contract_id INTEGER, warranty_id INTEGER, started_at DATE);
 
 statement ok
-INSERT INTO contracts VALUES (1, '2026-01-05');
+INSERT INTO contracts VALUES (1, 1, '2026-01-05');
+
+statement ok
+CREATE TABLE warranties (warranty_id INTEGER, started_at DATE);
+
+statement ok
+INSERT INTO warranties VALUES (1, '2026-01-07');
 
 statement ok
 CREATE TABLE invoices (invoice_id INTEGER, subscription_id INTEGER, paid_at DATE, amount INTEGER);
@@ -307,16 +321,27 @@ CREATE SEMANTIC VIEW invoices_sv
   TABLES (
     subscriptions PRIMARY KEY (subscription_id) TIME (started_at),
     contracts PRIMARY KEY (contract_id) TIME (started_at),
+    warranties PRIMARY KEY (warranty_id) TIME (started_at),
     invoices PRIMARY KEY (invoice_id)
   )
   RELATIONSHIPS (
     invoice_subscription AS invoices (subscription_id) REFERENCES subscriptions,
     subscription_contract AS subscriptions (contract_id) REFERENCES contracts,
+    contract_warranty AS contracts (warranty_id) REFERENCES warranties,
     invoice_paid AS invoices (paid_at) REFERENCES metric_time
   )
-  METRICS (invoices.total AS SUM(amount));
+  METRICS (
+    invoices.total AS SUM(amount),
+    invoices.by_contract USING (subscription_contract) AS SUM(amount)
+  );
 
 query II
 SELECT * FROM SEMANTIC_VIEW(invoices_sv DIMENSIONS metric_time.day METRICS invoices.total);
 ----
 2026-01-01	7
+
+# USING still selects the contract when both its TIME and the warranty's TIME are reachable.
+query II
+SELECT * FROM SEMANTIC_VIEW(invoices_sv DIMENSIONS metric_time.day METRICS invoices.by_contract);
+----
+2026-01-05	7

@@ -117,33 +117,46 @@ vector<vector<SemanticEdge>> SemanticModel::FindPaths(idx_t from, idx_t to,
 	vector<vector<SemanticEdge>> found;
 	vector<SemanticEdge> path;
 	vector<bool> visited(tables.size(), false);
+	auto is_detour = [&]() {
+		idx_t source = from;
+		for (idx_t start = 0; start + 1 < path.size(); start++) {
+			for (auto &direct : edges[source]) {
+				if (!allowed(direct)) {
+					continue;
+				}
+				for (idx_t end = start + 1; end < path.size(); end++) {
+					if (direct.target != path[end].target) {
+						continue;
+					}
+					if (!accept) {
+						return true;
+					}
+					// A shorter path must still include the relationship selected by USING.
+					vector<SemanticEdge> shorter(path.begin(), path.begin() + start);
+					shorter.push_back(direct);
+					shorter.insert(shorter.end(), path.begin() + end + 1, path.end());
+					if (accept(shorter)) {
+						return true;
+					}
+				}
+			}
+			source = path[start].target;
+		}
+		return false;
+	};
 	std::function<void(idx_t)> dfs = [&](idx_t node) {
 		if (found.size() > 1) {
 			return;
 		}
 		if (node == to) {
-			if (!accept || accept(path)) {
+			if ((!accept || accept(path)) && (!skip_detours || !is_detour())) {
 				found.push_back(path);
 			}
 			return;
 		}
 		visited[node] = true;
-		// a detour reaches a table that an earlier table of the path (the visited ones) references directly
-		auto is_detour = [&](idx_t target) {
-			for (idx_t earlier = 0; earlier < tables.size(); earlier++) {
-				if (!visited[earlier] || earlier == node) {
-					continue;
-				}
-				for (auto &direct : edges[earlier]) {
-					if (direct.target == target && allowed(direct)) {
-						return true;
-					}
-				}
-			}
-			return false;
-		};
 		for (auto &edge : edges[node]) {
-			if (visited[edge.target] || !allowed(edge) || (skip_detours && is_detour(edge.target))) {
+			if (visited[edge.target] || !allowed(edge)) {
 				continue;
 			}
 			path.push_back(edge);
@@ -181,9 +194,9 @@ SemanticPathResult SemanticModel::TryPath(idx_t from, idx_t to, const vector<idx
 	if (found.empty()) {
 		return SemanticPathResult::EXCLUDED_BY_USING;
 	}
+	std::function<bool(const vector<SemanticEdge> &)> accept;
 	if (found.size() > 1 && !using_relationships.empty()) {
-		// the paths through a USING relationship: USING (fa) picks the TIME reached through fa
-		auto through_using = FindPaths(from, to, allowed, [&](const vector<SemanticEdge> &path) {
+		accept = [&](const vector<SemanticEdge> &path) {
 			for (auto &edge : path) {
 				for (auto rel : using_relationships) {
 					if (edge.relationship == rel) {
@@ -192,37 +205,25 @@ SemanticPathResult SemanticModel::TryPath(idx_t from, idx_t to, const vector<idx
 				}
 			}
 			return false;
-		});
-		if (through_using.size() == 1) {
+		};
+		auto through_using = FindPaths(from, to, allowed, accept);
+		if (through_using.empty()) {
+			accept = nullptr;
+		} else {
 			found = std::move(through_using);
 		}
 	}
 	if (found.size() > 1) {
-		// Default relationships (TIME) settle it: the table's own wins, then the only path entering `to` through one
-		auto is_default = [&](const SemanticEdge &edge) {
-			return !edge.reversed && relationships[edge.relationship].is_default;
+		auto through_default = [&](const SemanticEdge &edge) {
+			return allowed(edge) &&
+			       (edge.target != to || (!edge.reversed && relationships[edge.relationship].is_default));
 		};
-		for (auto &edge : edges[from]) {
-			if (edge.target == to && is_default(edge) && allowed(edge)) {
-				result.push_back(edge);
-				return SemanticPathResult::FOUND;
-			}
+		found = FindPaths(from, to, through_default, accept, true);
+		if (found.empty()) {
+			found = FindPaths(from, to, allowed, accept, true);
 		}
-		found = FindPaths(from, to, [&](const SemanticEdge &edge) {
-			return allowed(edge) && (edge.target != to || is_default(edge));
-		});
 		if (found.size() != 1) {
-			// Ambiguous TIME paths must not fall back to an ordinary date relationship.
-			const bool require_default = !found.empty();
-			found = FindPaths(
-			    from, to,
-			    [&](const SemanticEdge &edge) {
-				    return allowed(edge) && (!require_default || edge.target != to || is_default(edge));
-			    },
-			    nullptr, true);
-			if (found.size() != 1) {
-				return SemanticPathResult::AMBIGUOUS;
-			}
+			return SemanticPathResult::AMBIGUOUS;
 		}
 	}
 	result = std::move(found[0]);

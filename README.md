@@ -443,6 +443,7 @@ SELECT sql FROM semantic_view_sql('SELECT * FROM SEMANTIC_VIEW(sales DIMENSIONS 
 
 Choose a metric's path with `USING`. Otherwise, `TIME` defaults take priority and direct relationships beat detours
 at any hop. Multiple remaining paths are rejected, including departure and arrival airports.
+Pin an intended detour with `USING`; adding a direct relationship can otherwise change the selected path.
 
 ```sql
 RELATIONSHIPS (
@@ -468,8 +469,8 @@ RELATIONSHIPS (book_authors (author_id) REFERENCES authors, book_authors (book_i
 with two French authors counts once for `FR`. Totals without bridged dimensions are unchanged. Any table with
 relationships to both sides acts as a bridge, fact tables included: `customers.customer_count` by
 `products.category` through `sales` counts the customers who bought in each category. A dimension stored on the
-bridge itself is still rejected. When several bridges connect the same tables, `USING (<relationship>)` on the metric
-picks one.
+bridge itself is still rejected. Prefer a bridge over finer tables that reference it. `USING (<relationship>)` on
+the metric selects a bridge explicitly; unrelated or equal-grain alternatives remain ambiguous.
 
 Rows without any bridge row (a book without authors) get NULL bridged dimensions. A `WHERE` condition on bridged
 tables keeps only the rows with a matching bridge row.
