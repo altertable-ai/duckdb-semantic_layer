@@ -79,7 +79,7 @@ CREATE SEMANTIC VIEW bad TABLES (airports PRIMARY KEY (airport_code), flights PR
 ----
 Unknown relationship "nope"
 
-# without USING the shortest path wins when it is the only one of its length
+# without USING, a relationship that references the table directly wins over a detour through other tables
 statement ok
 CREATE TABLE regions (region_id INTEGER, region_name VARCHAR);
 
@@ -127,14 +127,14 @@ CREATE SEMANTIC VIEW orders_sv
     orders.total_to_recipient USING (shipment_recipient) AS SUM(amount)
   );
 
-# direct relationship (1 edge) over the detour through shipments (2 edges)
+# the buyer (direct) over the recipient (through shipments)
 query II
 SELECT * FROM SEMANTIC_VIEW(orders_sv DIMENSIONS customers.customer METRICS orders.total) ORDER BY 1;
 ----
 Ann	30
 Bob	40
 
-# further target: 2 edges through the buyer over 3 edges through the recipient
+# also for a table further away: the buyer's region
 query II
 SELECT * FROM SEMANTIC_VIEW(orders_sv DIMENSIONS regions.region METRICS orders.total) ORDER BY 1;
 ----
@@ -148,134 +148,167 @@ SELECT * FROM SEMANTIC_VIEW(orders_sv DIMENSIONS customers.customer METRICS orde
 Ann	40
 Bob	30
 
-query II
-SELECT * FROM SEMANTIC_VIEW(orders_sv DIMENSIONS regions.region METRICS orders.total_to_recipient) ORDER BY 1;
-----
-North	40
-South	30
-
-# two unrelated routes of different lengths stay ambiguous: only a direct relationship beats a detour
+# two unrelated routes stay ambiguous whatever their lengths: the agent's team's office or the queue's office
 statement ok
-CREATE TABLE p_t (id INTEGER, label VARCHAR);
+CREATE TABLE offices (office_id INTEGER, office_name VARCHAR);
 
 statement ok
-CREATE TABLE p_x (id INTEGER, t_id INTEGER);
+CREATE TABLE teams (team_id INTEGER, office_id INTEGER);
 
 statement ok
-CREATE TABLE p_c (id INTEGER, x_id INTEGER);
+CREATE TABLE agents (agent_id INTEGER, team_id INTEGER);
 
 statement ok
-CREATE TABLE p_s (id INTEGER, t_id INTEGER);
+CREATE TABLE queues (queue_id INTEGER, office_id INTEGER);
 
 statement ok
-CREATE TABLE p_o (id INTEGER, c_id INTEGER, s_id INTEGER);
+CREATE TABLE tickets (ticket_id INTEGER, agent_id INTEGER, queue_id INTEGER);
 
 statement ok
-CREATE SEMANTIC VIEW routes_sv
-  TABLES (p_t PRIMARY KEY (id), p_x PRIMARY KEY (id), p_c PRIMARY KEY (id), p_s PRIMARY KEY (id), p_o PRIMARY KEY (id))
-  RELATIONSHIPS (
-    x_t AS p_x (t_id) REFERENCES p_t,
-    c_x AS p_c (x_id) REFERENCES p_x,
-    s_t AS p_s (t_id) REFERENCES p_t,
-    o_c AS p_o (c_id) REFERENCES p_c,
-    o_s AS p_o (s_id) REFERENCES p_s
+CREATE SEMANTIC VIEW tickets_sv
+  TABLES (
+    offices PRIMARY KEY (office_id),
+    teams PRIMARY KEY (team_id),
+    agents PRIMARY KEY (agent_id),
+    queues PRIMARY KEY (queue_id),
+    tickets PRIMARY KEY (ticket_id)
   )
-  DIMENSIONS (p_t.label AS label)
-  METRICS (p_o.n AS COUNT(*));
+  RELATIONSHIPS (
+    team_office AS teams (office_id) REFERENCES offices,
+    agent_team AS agents (team_id) REFERENCES teams,
+    queue_office AS queues (office_id) REFERENCES offices,
+    ticket_agent AS tickets (agent_id) REFERENCES agents,
+    ticket_queue AS tickets (queue_id) REFERENCES queues
+  )
+  DIMENSIONS (offices.office AS office_name)
+  METRICS (tickets.ticket_count AS COUNT(*));
 
 statement error
-SELECT * FROM SEMANTIC_VIEW(routes_sv DIMENSIONS p_t.label METRICS p_o.n);
+SELECT * FROM SEMANTIC_VIEW(tickets_sv DIMENSIONS offices.office METRICS tickets.ticket_count);
 ----
 multiple relationship paths
 
-# the direct relationship that makes a path a detour must itself be allowed by USING
+# USING is applied first: a direct relationship it excludes (the payer) does not turn the remaining paths into detours
 statement ok
-CREATE TABLE q_c (id INTEGER, name VARCHAR);
+CREATE TABLE accounts (account_id INTEGER, account_name VARCHAR);
 
 statement ok
-INSERT INTO q_c VALUES (1, 'A'), (2, 'B');
+INSERT INTO accounts VALUES (1, 'A'), (2, 'B');
 
 statement ok
-CREATE TABLE q_w (id INTEGER, c_id INTEGER);
+CREATE TABLE wallets (wallet_id INTEGER, account_id INTEGER);
 
 statement ok
-INSERT INTO q_w VALUES (1, 1), (2, 2);
+INSERT INTO wallets VALUES (1, 1), (2, 2);
 
 statement ok
-CREATE TABLE q_s (id INTEGER, w_id INTEGER);
+CREATE TABLE cards (card_id INTEGER, wallet_id INTEGER);
 
 statement ok
-INSERT INTO q_s VALUES (1, 1), (2, 2);
+INSERT INTO cards VALUES (1, 1), (2, 2);
 
 statement ok
-CREATE TABLE q_o (id INTEGER, c_id INTEGER, w_id INTEGER, s_id INTEGER, amount INTEGER);
+CREATE TABLE payments (payment_id INTEGER, account_id INTEGER, wallet_id INTEGER, card_id INTEGER, amount INTEGER);
 
 statement ok
-INSERT INTO q_o VALUES (1, 1, 2, 1, 10);
+INSERT INTO payments VALUES (1, 1, 2, 1, 10);
 
 statement ok
-CREATE SEMANTIC VIEW pinned_sv
-  TABLES (q_c PRIMARY KEY (id), q_w PRIMARY KEY (id), q_s PRIMARY KEY (id), q_o PRIMARY KEY (id))
-  RELATIONSHIPS (
-    w_c AS q_w (c_id) REFERENCES q_c,
-    s_w AS q_s (w_id) REFERENCES q_w,
-    o_c AS q_o (c_id) REFERENCES q_c,
-    o_w AS q_o (w_id) REFERENCES q_w,
-    o_s AS q_o (s_id) REFERENCES q_s
+CREATE SEMANTIC VIEW payments_sv
+  TABLES (
+    accounts PRIMARY KEY (account_id),
+    wallets PRIMARY KEY (wallet_id),
+    cards PRIMARY KEY (card_id),
+    payments PRIMARY KEY (payment_id)
   )
-  DIMENSIONS (q_c.customer AS name)
-  METRICS (q_o.total USING (w_c) AS SUM(amount));
+  RELATIONSHIPS (
+    wallet_owner AS wallets (account_id) REFERENCES accounts,
+    card_wallet AS cards (wallet_id) REFERENCES wallets,
+    payment_payer AS payments (account_id) REFERENCES accounts,
+    payment_wallet AS payments (wallet_id) REFERENCES wallets,
+    payment_card AS payments (card_id) REFERENCES cards
+  )
+  DIMENSIONS (accounts.account AS account_name)
+  METRICS (payments.total_by_wallet_owner USING (wallet_owner) AS SUM(amount));
 
 query II
-SELECT * FROM SEMANTIC_VIEW(pinned_sv DIMENSIONS q_c.customer METRICS q_o.total);
+SELECT * FROM SEMANTIC_VIEW(payments_sv DIMENSIONS accounts.account METRICS payments.total_by_wallet_owner);
 ----
 B	10
 
-# an intermediate table's direct relationship makes a longer route a detour (not only the starting table's)
+# the rule applies at every hop: the store's own country over its city's country
 statement ok
-CREATE TABLE m_t (id INTEGER, label VARCHAR);
-INSERT INTO m_t VALUES (1, 'T1'), (2, 'T2');
-CREATE TABLE m_b (id INTEGER, t_id INTEGER);
-INSERT INTO m_b VALUES (1, 1), (2, 2);
-CREATE TABLE m_a (id INTEGER, t_id INTEGER, b_id INTEGER);
-INSERT INTO m_a VALUES (1, 1, 2);
-CREATE TABLE m_o (id INTEGER, a_id INTEGER, amount INTEGER);
-INSERT INTO m_o VALUES (1, 1, 10);
+CREATE TABLE countries (country_id INTEGER, country_name VARCHAR);
 
 statement ok
-CREATE SEMANTIC VIEW mid_sv
-  TABLES (m_t PRIMARY KEY (id), m_b PRIMARY KEY (id), m_a PRIMARY KEY (id), m_o PRIMARY KEY (id))
-  RELATIONSHIPS (
-    b_t AS m_b (t_id) REFERENCES m_t,
-    a_t AS m_a (t_id) REFERENCES m_t,
-    a_b AS m_a (b_id) REFERENCES m_b,
-    o_a AS m_o (a_id) REFERENCES m_a
+INSERT INTO countries VALUES (1, 'Chile'), (2, 'Peru');
+
+statement ok
+CREATE TABLE cities (city_id INTEGER, country_id INTEGER);
+
+statement ok
+INSERT INTO cities VALUES (1, 1), (2, 2);
+
+statement ok
+CREATE TABLE stores (store_id INTEGER, country_id INTEGER, city_id INTEGER);
+
+statement ok
+INSERT INTO stores VALUES (1, 1, 2);
+
+statement ok
+CREATE TABLE visits (visit_id INTEGER, store_id INTEGER, amount INTEGER);
+
+statement ok
+INSERT INTO visits VALUES (1, 1, 10);
+
+statement ok
+CREATE SEMANTIC VIEW visits_sv
+  TABLES (
+    countries PRIMARY KEY (country_id),
+    cities PRIMARY KEY (city_id),
+    stores PRIMARY KEY (store_id),
+    visits PRIMARY KEY (visit_id)
   )
-  DIMENSIONS (m_t.label AS label)
-  METRICS (m_o.total AS SUM(amount));
+  RELATIONSHIPS (
+    city_country AS cities (country_id) REFERENCES countries,
+    store_country AS stores (country_id) REFERENCES countries,
+    store_city AS stores (city_id) REFERENCES cities,
+    visit_store AS visits (store_id) REFERENCES stores
+  )
+  DIMENSIONS (countries.country AS country_name)
+  METRICS (visits.total AS SUM(amount));
 
 query II
-SELECT * FROM SEMANTIC_VIEW(mid_sv DIMENSIONS m_t.label METRICS m_o.total);
+SELECT * FROM SEMANTIC_VIEW(visits_sv DIMENSIONS countries.country METRICS visits.total);
 ----
-T1	10
+Chile	10
 
-# TIME defaults settle a query before the direct-over-detour rule: the default route wins although it is longer
+# the TIME defaults are applied before this rule: the subscription's start, not the direct relationship on the payment date
 statement ok
-CREATE TABLE d_s (id INTEGER, ordered DATE, shipped DATE);
-INSERT INTO d_s VALUES (1, '2026-01-01', '2026-01-05');
-CREATE TABLE d_o (id INTEGER, s_id INTEGER, paid DATE, amount INTEGER);
-INSERT INTO d_o VALUES (1, 1, '2026-01-09', 7);
+CREATE TABLE subscriptions (subscription_id INTEGER, started_at DATE);
 
 statement ok
-CREATE SEMANTIC VIEW dflt_sv
-  TABLES (d_s PRIMARY KEY (id) TIME (ordered), d_o PRIMARY KEY (id))
-  RELATIONSHIPS (
-    d_o (s_id) REFERENCES d_s,
-    paid AS d_o (paid) REFERENCES metric_time
+INSERT INTO subscriptions VALUES (1, '2026-01-01');
+
+statement ok
+CREATE TABLE invoices (invoice_id INTEGER, subscription_id INTEGER, paid_at DATE, amount INTEGER);
+
+statement ok
+INSERT INTO invoices VALUES (1, 1, '2026-01-09', 7);
+
+statement ok
+CREATE SEMANTIC VIEW invoices_sv
+  TABLES (
+    subscriptions PRIMARY KEY (subscription_id) TIME (started_at),
+    invoices PRIMARY KEY (invoice_id)
   )
-  METRICS (d_o.total AS SUM(amount));
+  RELATIONSHIPS (
+    invoice_subscription AS invoices (subscription_id) REFERENCES subscriptions,
+    invoice_paid AS invoices (paid_at) REFERENCES metric_time
+  )
+  METRICS (invoices.total AS SUM(amount));
 
 query II
-SELECT * FROM SEMANTIC_VIEW(dflt_sv DIMENSIONS metric_time.day METRICS d_o.total);
+SELECT * FROM SEMANTIC_VIEW(invoices_sv DIMENSIONS metric_time.day METRICS invoices.total);
 ----
 2026-01-01	7
