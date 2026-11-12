@@ -318,13 +318,23 @@ In this form:
 
 - `GROUP BY` expressions become dimensions.
 - Metrics are wrapped in `AGG(...)`, which takes a metric or an expression over metrics and ad-hoc aggregates
-  (`AGG(lines.revenue + 1)`); other aggregate functions over dimensions or facts are ad-hoc metrics.
+  (`AGG(lines.revenue + 1)`); other aggregate functions over dimensions or facts are ad-hoc metrics. An ad-hoc metric
+  must read a column to know its logical table: `COUNT(lines.line_number)`, not `COUNT(*)`.
   `AGG(<metric>) FILTER (WHERE ...)` filters a metric at query time, like a [metric `FILTER`](#metric-filters-filter).
-- `WHERE` filters before aggregation, `HAVING` after.
+- `WHERE` filters before aggregation, so it cannot contain metrics or aggregates; `HAVING` filters after. As in
+  DuckDB, `HAVING` without `GROUP BY` aggregates the whole view into one row.
 - Without aggregation, the select list is evaluated as facts, row by row.
-- Names can be bare, qualified (`customers.segment`) or quoted as BI tools write them (`"customers.segment"`).
-- Joins with the semantic view, `SELECT *`, and multiple grouping sets (`ROLLUP`, `CUBE`, or `GROUPING SETS`) are not
-  supported in this form. For subtotals, use `UNION ALL` of separately grouped semantic queries so each metric is
+- Names can be bare, qualified (`customers.segment`) or quoted as BI tools write them (`"customers.segment"`). As in
+  DuckDB, `WHERE` and the later select items can read select aliases (`SELECT AGG(m) AS r, r * 2`), and a view name
+  takes precedence over an alias. Lambda parameters (`lambda x: ...`) take precedence over both.
+- Subqueries can read the view's columns, qualified by its name or alias, in the select list, `HAVING`, `QUALIFY`
+  and `ORDER BY` (`SELECT ..., (SELECT ... WHERE t.segment = s.segment) FROM sales s`); in an aggregated query, those
+  columns must be grouped. They cannot in `WHERE` and `GROUP BY`, which the semantic query evaluates.
+- `USING SAMPLE` samples the rows the semantic query returns, so it is only supported in row-level queries without
+  `WHERE`.
+- Joins with the semantic view, `SELECT *`, `TABLESAMPLE`, column aliases (`FROM sales AS s(a, b)`), `AT (...)` and
+  multiple grouping sets (`ROLLUP`, `CUBE`, or `GROUPING SETS`) are not supported in this form (`GROUPING(...)` of a
+  group is always 0). For subtotals, use `UNION ALL` of separately grouped semantic queries so each metric is
   evaluated at the appropriate grain.
 
 Window functions and `QUALIFY` work as in a hand-written `GROUP BY` query: a window reads the groups and metrics

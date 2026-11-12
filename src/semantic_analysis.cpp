@@ -116,9 +116,9 @@ idx_t SemanticAnalyzer::AggregateHome(const FunctionExpression &aggregate, idx_t
 	}
 	if (tables.empty()) {
 		throw SemanticDefinitionException(
-		    "%s: cannot determine the logical table of %s; define it as a metric of a logical "
-		    "table instead",
-		    what, aggregate.ToString());
+		    "%s: cannot determine the logical table of %s; reference a column of a logical table in it, or "
+		    "define it as a metric of a logical table instead",
+		    what, DisplayText(aggregate));
 	}
 	return FinestTable(tables, what);
 }

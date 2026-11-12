@@ -1,0 +1,270 @@
+# name: test/sql/semantic_layer/standard_sql_clauses.test
+# description: clauses and expressions of queries by name (HAVING, aliases, subqueries, lambdas, sampling)
+# group: [semantic_layer]
+
+require semantic_layer
+
+statement ok
+PRAGMA enable_verification
+
+statement ok
+CREATE TABLE accounts (account_id INTEGER, segment VARCHAR, country VARCHAR);
+
+statement ok
+INSERT INTO accounts VALUES (1, 'enterprise', 'FR'), (2, 'startup', 'US'), (3, 'enterprise', 'DE');
+
+statement ok
+CREATE TABLE invoices (invoice_id INTEGER, account_id INTEGER, invoiced_at DATE, amount INTEGER);
+
+# revenue: enterprise 490, startup 320
+statement ok
+INSERT INTO invoices VALUES (1, 1, '2024-02-01', 100), (2, 2, '2024-03-01', 200), (3, 3, '2024-06-01', 50),
+  (4, 1, '2025-01-15', 300), (5, 2, '2025-04-01', 120), (6, 3, '2025-09-01', 40);
+
+statement ok
+CREATE SEMANTIC VIEW sales
+  TABLES (account AS accounts PRIMARY KEY (account_id), invoices PRIMARY KEY (invoice_id) TIME (invoiced_at))
+  RELATIONSHIPS (invoices (account_id) REFERENCES account)
+  FACTS (invoices.invoice_amount AS amount)
+  DIMENSIONS (account.segment AS segment, account.country AS country)
+  METRICS (invoices.revenue AS SUM(amount), invoices.invoice_count AS COUNT(invoice_id));
+
+#===--------------------------------------------------------------------===#
+# HAVING makes a query aggregated, as in DuckDB
+#===--------------------------------------------------------------------===#
+
+statement error
+SELECT segment FROM sales HAVING segment = 'startup';
+----
+column "segment" must appear in the GROUP BY clause
+
+query I
+SELECT AGG(revenue) FROM sales HAVING AGG(revenue) > 100;
+----
+810
+
+query I
+SELECT AGG(revenue) FROM sales HAVING AGG(revenue) > 1000;
+----
+
+#===--------------------------------------------------------------------===#
+# Select aliases in WHERE and in later select items
+#===--------------------------------------------------------------------===#
+
+query I
+SELECT amount * 2 AS doubled FROM sales WHERE doubled > 300 ORDER BY doubled;
+----
+400
+600
+
+query TI
+SELECT segment AS seg, AGG(revenue) FROM sales WHERE seg = 'startup' GROUP BY seg;
+----
+startup	320
+
+query III
+SELECT amount AS a, a * 2 AS b, b + 1 FROM sales ORDER BY a LIMIT 2;
+----
+40	80	81
+50	100	101
+
+query TII
+SELECT segment, AGG(revenue) AS r, r * 2 AS r2 FROM sales GROUP BY segment ORDER BY r2;
+----
+startup	320	640
+enterprise	490	980
+
+query III
+SELECT amount, SUM(amount) OVER (ORDER BY amount) AS running, running + 1 FROM sales ORDER BY amount LIMIT 3;
+----
+40	40	41
+50	90	91
+100	190	191
+
+# an input name takes precedence over a select alias
+query TT
+SELECT segment AS country, country AS c FROM sales WHERE country = 'US' LIMIT 1;
+----
+startup	US
+
+statement error
+SELECT a * 2, amount AS a FROM sales;
+----
+cannot be referenced before it is defined
+
+#===--------------------------------------------------------------------===#
+# Aggregates in WHERE and GROUP BY
+#===--------------------------------------------------------------------===#
+
+statement error
+SELECT segment, AGG(revenue) AS r FROM sales WHERE r > 300 GROUP BY segment;
+----
+Aggregates are not allowed in WHERE when querying semantic view "sales" by name; use HAVING
+
+statement error
+SELECT segment FROM sales WHERE SUM(amount) > 1 GROUP BY segment;
+----
+Aggregates are not allowed in WHERE when querying semantic view "sales" by name; use HAVING
+
+statement error
+SELECT segment, AGG(revenue) AS r FROM sales GROUP BY segment, r;
+----
+Aggregates are not allowed in GROUP BY when querying semantic view "sales" by name
+
+statement error
+SELECT segment, AGG(revenue) AS r FROM sales GROUP BY 1, 2;
+----
+Aggregates are not allowed in GROUP BY when querying semantic view "sales" by name
+
+#===--------------------------------------------------------------------===#
+# Subqueries reading the view's columns (correlated)
+#===--------------------------------------------------------------------===#
+
+query TI
+SELECT segment, (SELECT count(*) FROM accounts a WHERE a.segment = s.segment) AS n
+FROM sales s GROUP BY segment ORDER BY segment;
+----
+enterprise	2
+startup	1
+
+query TI
+SELECT segment, AGG(revenue) FROM sales s GROUP BY segment
+HAVING EXISTS (SELECT 1 FROM accounts a WHERE a.segment = s.segment AND a.country = 'US');
+----
+startup	320
+
+# row-level: evaluated by the outer query over the fact columns, also when the column is not selected
+query IT
+SELECT amount, (SELECT max(a.country) FROM accounts a WHERE a.segment = sales.segment) AS c
+FROM sales ORDER BY amount LIMIT 3;
+----
+40	FR
+50	FR
+100	FR
+
+query I
+SELECT amount FROM sales s ORDER BY (SELECT s.amount * -1) LIMIT 2;
+----
+300
+200
+
+query TT
+SELECT segment, segment IN (SELECT 'startup') AS st FROM sales GROUP BY segment ORDER BY segment;
+----
+enterprise	false
+startup	true
+
+statement error
+SELECT segment, (SELECT count(*) FROM accounts a WHERE a.country = s.country) FROM sales s GROUP BY segment;
+----
+column "country" must appear in the GROUP BY clause
+
+statement error
+SELECT segment FROM sales s WHERE EXISTS (SELECT 1 FROM accounts a WHERE a.segment = s.segment) GROUP BY segment;
+----
+Subqueries in WHERE cannot reference semantic view "sales" when querying it by name
+
+statement error
+SELECT AGG(revenue) FROM sales s GROUP BY (SELECT s.segment);
+----
+Subqueries in GROUP BY cannot reference semantic view "sales" when querying it by name
+
+#===--------------------------------------------------------------------===#
+# Lambdas: their parameters are not view names
+#===--------------------------------------------------------------------===#
+
+query I
+SELECT list_transform([amount], lambda y: y + 1) FROM sales ORDER BY amount LIMIT 2;
+----
+[41]
+[51]
+
+query TT
+SELECT segment, list_filter(['startup', 'x'], lambda s: s = segment) FROM sales GROUP BY segment ORDER BY segment;
+----
+enterprise	[]
+startup	[startup]
+
+# parameters shadow dimensions, facts and metrics
+query TT
+SELECT segment, list_transform([AGG(revenue)], lambda revenue: revenue + 1) FROM sales GROUP BY segment
+ORDER BY segment;
+----
+enterprise	[491]
+startup	[321]
+
+query I
+SELECT list_transform([amount], lambda segment: segment + 1) FROM sales ORDER BY amount LIMIT 1;
+----
+[41]
+
+query I
+SELECT * FROM SEMANTIC_VIEW(sales FACTS list_transform([amount], lambda y: y * 10) AS t) ORDER BY ALL LIMIT 1;
+----
+[400]
+
+statement ok
+CREATE SEMANTIC VIEW lambdas TABLES (i AS invoices PRIMARY KEY (invoice_id))
+  DIMENSIONS (i.tens AS list_transform([amount], lambda x: x // 10))
+  METRICS (i.doubled AS SUM(list_sum(list_transform([amount], lambda amount: amount * 2))));
+
+query TI
+SELECT tens, AGG(doubled) FROM lambdas GROUP BY tens ORDER BY tens LIMIT 2;
+----
+[4]	80
+[5]	100
+
+#===--------------------------------------------------------------------===#
+# GROUPING() and COUNT(*)
+#===--------------------------------------------------------------------===#
+
+# a single grouping set
+query TI
+SELECT segment, GROUPING(segment) FROM sales GROUP BY segment ORDER BY segment;
+----
+enterprise	0
+startup	0
+
+statement error
+SELECT segment, GROUPING(country) FROM sales GROUP BY segment;
+----
+GROUPING() only accepts grouped dimensions when querying semantic view "sales" by name; "country" is not in the GROUP BY clause
+
+statement error
+SELECT COUNT(*) FROM sales;
+----
+cannot determine the logical table of count(*); reference a column of a logical table in it
+
+query I
+SELECT AGG(invoice_count) FROM sales;
+----
+6
+
+#===--------------------------------------------------------------------===#
+# Sampling and table modifiers
+#===--------------------------------------------------------------------===#
+
+query I
+SELECT count(*) FROM (SELECT amount FROM sales USING SAMPLE 2 ROWS);
+----
+2
+
+statement error
+SELECT segment, AGG(revenue) FROM sales GROUP BY segment USING SAMPLE 1 ROWS;
+----
+USING SAMPLE is only supported in row-level queries without WHERE when querying semantic view "sales" by name
+
+statement error
+SELECT amount FROM sales WHERE amount > 100 USING SAMPLE 1 ROWS;
+----
+USING SAMPLE is only supported in row-level queries without WHERE
+
+statement error
+SELECT segment FROM sales TABLESAMPLE 1 ROWS;
+----
+TABLESAMPLE is not supported when querying semantic view "sales" by name
+
+statement error
+SELECT x FROM sales AS s(x);
+----
+Column aliases on semantic view "sales" are not supported when querying it by name

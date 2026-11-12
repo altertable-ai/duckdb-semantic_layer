@@ -1,5 +1,6 @@
 #include "semantic_definition_exception.hpp"
 #include "semantic_model.hpp"
+#include "semantic_ast_helpers.hpp"
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
@@ -321,7 +322,11 @@ static unique_ptr<ParsedExpression> ResolveColumnRef(const SemanticModel &model,
 }
 
 static void ResolveRecursive(const SemanticModel &model, unique_ptr<ParsedExpression> &expr,
-                             const SemanticResolveContext &context) {
+                             const SemanticResolveContext &context, LambdaScopes &lambdas) {
+	if (lambdas.IsParameter(*expr)) {
+		return;
+	}
+	LambdaScopes::Guard lambda(lambdas, *expr);
 	if (expr->GetExpressionClass() == ExpressionClass::COLUMN_REF) {
 		auto &colref = expr->Cast<ColumnRefExpression>();
 		if (!SemanticMarkers::Classify(colref).Is(SemanticRefKind::NONE)) {
@@ -342,13 +347,14 @@ static void ResolveRecursive(const SemanticModel &model, unique_ptr<ParsedExpres
 	}
 	// subqueries are left untouched (they must be uncorrelated); their IN-operand is resolved
 	ParsedExpressionIterator::EnumerateChildren(
-	    *expr, [&](unique_ptr<ParsedExpression> &child) { ResolveRecursive(model, child, context); });
+	    *expr, [&](unique_ptr<ParsedExpression> &child) { ResolveRecursive(model, child, context, lambdas); });
 }
 
 unique_ptr<ParsedExpression> SemanticModel::Resolve(const ParsedExpression &expr,
                                                     const SemanticResolveContext &context) const {
 	auto result = expr.Copy();
-	ResolveRecursive(*this, result, context);
+	LambdaScopes lambdas;
+	ResolveRecursive(*this, result, context, lambdas);
 	return result;
 }
 
