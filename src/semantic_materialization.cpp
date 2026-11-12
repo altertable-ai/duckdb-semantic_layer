@@ -41,6 +41,7 @@ shared_ptr<SemanticMaterialization> PlanSemanticMaterialization(ClientContext &c
 	auto result = make_shared_ptr<SemanticMaterialization>();
 	result->name = parsed.name;
 	result->refresh_mode = parsed.refresh_mode;
+	result->spec.transforms = resolved.transforms;
 	// dimensions first: they are the first columns of every block table
 	for (auto kind : {SemanticMemberKind::DIMENSION, SemanticMemberKind::METRIC}) {
 		for (idx_t i = 0; i < resolved.items.size(); i++) {
@@ -56,6 +57,7 @@ shared_ptr<SemanticMaterialization> PlanSemanticMaterialization(ClientContext &c
 			(kind == SemanticMemberKind::DIMENSION ? result->dimension_names : result->metric_names).push_back(name);
 			result->spec.items.push_back(SemanticQueryItem {item.kind, std::move(item.resolved),
 			                                                "__sv_m" + to_string(result->spec.items.size())});
+			result->spec.items.back().display_name = item.Name();
 		}
 	}
 	result->dimension_count = result->dimension_names.size();
@@ -81,13 +83,13 @@ shared_ptr<SemanticMaterialization> PlanSemanticMaterialization(ClientContext &c
 			    model.MemberDisplayName(plan.key.non_additive_member));
 		}
 		if (!plan.key.offsets.empty()) {
-			auto &offset = model.offsets[plan.key.offsets[0]];
+			auto &offset = compiler.Analyzer().Transforms().Offset(plan.key.offsets[0]);
 			throw SemanticDefinitionException("%s: a metric uses OFFSET and cannot be materialized (OFFSET (%s BY %s))",
 			                                  what, model.MemberDisplayName(offset.dimension),
 			                                  offset.interval->ToString());
 		}
 		if (plan.key.cumulative != DConstants::INVALID_INDEX) {
-			auto &cumulative = model.cumulatives[plan.key.cumulative];
+			auto &cumulative = compiler.Analyzer().Transforms().Cumulative(plan.key.cumulative);
 			throw SemanticDefinitionException(
 			    "%s: a metric uses CUMULATIVE and cannot be materialized (CUMULATIVE (%s))", what,
 			    model.MemberDisplayName(cumulative.dimension));
@@ -328,11 +330,62 @@ SemanticMaterializationStatus GetMaterializationStatus(ClientContext &context, c
 //===--------------------------------------------------------------------===//
 static constexpr const char *MATERIALIZATION_ALIAS = "__sv_mat";
 
-//! `expr` computed from the materialization's dimension columns; nullptr when it reads anything else
+//! Whether row-level `expr` reads the time spine
+static bool ReadsTimeSpine(const SemanticModel &model, const ParsedExpression &expr) {
+	auto ref = SemanticMarkers::Classify(expr);
+	if (ref.Is(SemanticRefKind::COLUMN)) {
+		return model.IsTimeSpine(ref.index);
+	}
+	if (ref.Is(SemanticRefKind::MEMBER)) {
+		auto &member = model.members[ref.index];
+		return model.IsTimeSpine(member.table) || ReadsTimeSpine(model, *member.resolved);
+	}
+	bool found = false;
+	ParsedExpressionIterator::EnumerateChildren(
+	    expr, [&](const ParsedExpression &child) { found = found || ReadsTimeSpine(model, child); });
+	return found;
+}
+
+//! Whether the rows of `table` reach the time spine through the same TIME as the rows of `block`
+static bool SharesBlockTime(const SemanticModel &model, idx_t table, const SemanticBlockKey &block) {
+	if (!model.Reaches(block.home, model.time_spine.GetIndex())) {
+		return false;
+	}
+	auto own = model.TimeEdge(table);
+	auto rows = model.TimeEdge(block.home, block.using_relationships);
+	return own.relationship == rows.relationship && own.reversed == rows.reversed;
+}
+
+//! `expr` with its row-level members replaced by their definitions, so that a dimension computed from stored ones
+//! (o.yr AS YEAR(metric_time.day), metric_time.month) is recognized. A member reading another TIME than the rows of
+//! `block` (SemanticModel::TimeReader) stays a member.
+static unique_ptr<ParsedExpression> ExpandMembers(const SemanticModel &model, const ParsedExpression &expr,
+                                                  const SemanticBlockKey &block) {
+	auto ref = SemanticMarkers::Classify(expr);
+	if (ref.Is(SemanticRefKind::MEMBER)) {
+		auto &member = model.members[ref.index];
+		if (!member.IsRowLevel() || (!model.IsTimeSpine(member.table) && ReadsTimeSpine(model, *member.resolved) &&
+		                             !SharesBlockTime(model, member.table, block))) {
+			return expr.Copy();
+		}
+		auto result = ExpandMembers(model, *member.resolved, block);
+		result->SetAlias(expr.GetAlias());
+		return result;
+	}
+	if (!ref.Is(SemanticRefKind::NONE) || expr.GetExpressionClass() == ExpressionClass::SUBQUERY) {
+		return expr.Copy();
+	}
+	auto result = expr.Copy();
+	ParsedExpressionIterator::EnumerateChildren(
+	    *result, [&](unique_ptr<ParsedExpression> &child) { child = ExpandMembers(model, *child, block); });
+	return result;
+}
+
+//! `expr` (with expanded members) over the stored dimensions (expanded), or null when it reads anything else
 static unique_ptr<ParsedExpression> RewriteOverDimensions(const ParsedExpression &expr,
-                                                          const SemanticMaterialization &materialization) {
-	for (idx_t d = 0; d < materialization.dimension_count; d++) {
-		if (expr.Equals(*materialization.spec.items[d].resolved)) {
+                                                          const vector<unique_ptr<ParsedExpression>> &stored) {
+	for (idx_t d = 0; d < stored.size(); d++) {
+		if (expr.Equals(*stored[d])) {
 			return ColumnRef(SemanticDimensionColumn(d), MATERIALIZATION_ALIAS);
 		}
 	}
@@ -346,7 +399,7 @@ static unique_ptr<ParsedExpression> RewriteOverDimensions(const ParsedExpression
 		if (failed) {
 			return;
 		}
-		auto rewritten = RewriteOverDimensions(*child, materialization);
+		auto rewritten = RewriteOverDimensions(*child, stored);
 		if (!rewritten) {
 			failed = true;
 			return;
@@ -389,7 +442,16 @@ unique_ptr<SemanticMaterializedRead> SemanticMaterializationMatcher::Find(
 	                 [](const shared_ptr<SemanticMaterialization> &a, const shared_ptr<SemanticMaterialization> &b) {
 		                 return a->dimension_count < b->dimension_count;
 	                 });
+	vector<unique_ptr<ParsedExpression>> expanded_dimensions;
+	for (auto *dimension : dimensions) {
+		expanded_dimensions.push_back(ExpandMembers(model, *dimension, block));
+	}
+	auto expanded_where = where ? ExpandMembers(model, *where, block) : nullptr;
 	for (auto &materialization : candidates) {
+		vector<unique_ptr<ParsedExpression>> stored_dimensions;
+		for (idx_t d = 0; d < materialization->dimension_count; d++) {
+			stored_dimensions.push_back(ExpandMembers(model, *materialization->spec.items[d].resolved, block));
+		}
 		for (idx_t b = 0; b < materialization->blocks.size(); b++) {
 			auto &stored = materialization->blocks[b];
 			if (stored.home != block.home || stored.using_relationships != block.using_relationships) {
@@ -418,8 +480,8 @@ unique_ptr<SemanticMaterializedRead> SemanticMaterializationMatcher::Find(
 			auto read = make_uniq<SemanticMaterializedRead>();
 			set<idx_t> grouped;
 			bool computable = true;
-			for (auto *dimension : dimensions) {
-				auto rewritten = RewriteOverDimensions(*dimension, *materialization);
+			for (auto &dimension : expanded_dimensions) {
+				auto rewritten = RewriteOverDimensions(*dimension, stored_dimensions);
 				if (!rewritten) {
 					computable = false;
 					break;
@@ -431,8 +493,8 @@ unique_ptr<SemanticMaterializedRead> SemanticMaterializationMatcher::Find(
 				}
 				read->dimensions.push_back(std::move(rewritten));
 			}
-			if (computable && where) {
-				read->where = RewriteOverDimensions(*where, *materialization);
+			if (computable && expanded_where) {
+				read->where = RewriteOverDimensions(*expanded_where, stored_dimensions);
 				computable = read->where != nullptr;
 			}
 			if (!computable) {

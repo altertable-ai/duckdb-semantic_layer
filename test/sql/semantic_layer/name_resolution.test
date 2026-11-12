@@ -45,3 +45,98 @@ statement error
 SELECT * FROM SEMANTIC_VIEW(same_names DIMENSIONS value);
 ----
 Ambiguous name "value"
+
+#===--------------------------------------------------------------------===#
+# A bare name in a definition reads the owning table's column before members of other tables
+#===--------------------------------------------------------------------===#
+
+statement ok
+CREATE TABLE own_customers (id INTEGER, amount INTEGER);
+INSERT INTO own_customers VALUES (1, 1000);
+CREATE TABLE own_orders (id INTEGER, cust INTEGER, amount INTEGER);
+INSERT INTO own_orders VALUES (1, 1, 5), (2, 1, 7);
+
+statement ok
+CREATE SEMANTIC VIEW own_columns
+  TABLES (c AS own_customers PRIMARY KEY (id), o AS own_orders PRIMARY KEY (id))
+  RELATIONSHIPS (o (cust) REFERENCES c)
+  DIMENSIONS (c.amount AS amount)
+  METRICS (o.total AS SUM(amount), o.customer_total AS SUM(c.amount));
+
+query II
+SELECT * FROM SEMANTIC_VIEW(own_columns METRICS o.total, o.customer_total);
+----
+12	2000
+
+# the built-in time spine members do not hide a column of the same name either
+statement ok
+CREATE TABLE own_events (id INTEGER, ts DATE);
+INSERT INTO own_events VALUES (1, '2024-03-01');
+CREATE TABLE own_budgets (id INTEGER, year INTEGER, amount INTEGER);
+INSERT INTO own_budgets VALUES (1, 2024, 100), (2, 2025, 50);
+
+statement ok
+CREATE SEMANTIC VIEW own_time_columns
+  TABLES (e AS own_events PRIMARY KEY (id) TIME (ts), bu AS own_budgets PRIMARY KEY (id))
+  DIMENSIONS (bu.budget_year AS year)
+  METRICS (bu.total AS SUM(amount), e.n AS COUNT(*));
+
+query II
+SELECT * FROM SEMANTIC_VIEW(own_time_columns DIMENSIONS bu.budget_year METRICS bu.total) ORDER BY 1;
+----
+2024	100
+2025	50
+
+query TI
+SELECT * FROM SEMANTIC_VIEW(own_time_columns DIMENSIONS metric_time.year METRICS e.n);
+----
+2024-01-01	1
+
+#===--------------------------------------------------------------------===#
+# DuckDB's keyword functions (current_timestamp, current_schema, ...) are not names
+#===--------------------------------------------------------------------===#
+
+statement ok
+CREATE TABLE dated (id INTEGER, d TIMESTAMPTZ, x INTEGER);
+INSERT INTO dated VALUES (1, '2020-01-01 00:00:00+00', 1), (2, '2999-01-01 00:00:00+00', 2);
+
+statement ok
+CREATE SEMANTIC VIEW dated_view
+  TABLES (t AS dated PRIMARY KEY (id))
+  DIMENSIONS (t.d AS d, t.past AS d < current_timestamp, t.sch AS current_schema)
+  METRICS (t.s AS SUM(x));
+
+query I
+SELECT * FROM SEMANTIC_VIEW(dated_view METRICS t.s WHERE t.d < current_timestamp);
+----
+1
+
+query TI
+SELECT * FROM SEMANTIC_VIEW(dated_view DIMENSIONS t.d < current_timestamp AS past METRICS t.s) ORDER BY 1;
+----
+false	2
+true	1
+
+query TTI
+SELECT * FROM SEMANTIC_VIEW(dated_view DIMENSIONS t.past, t.sch METRICS t.s) ORDER BY 1;
+----
+false	main	2
+true	main	1
+
+query I
+SELECT AGG(s) FROM dated_view WHERE d < current_timestamp AND current_schema = 'main';
+----
+1
+
+# a member or column of that name still takes precedence
+statement ok
+CREATE TABLE dated2 (id INTEGER, current_schema DATE);
+INSERT INTO dated2 VALUES (1, '2999-01-01');
+
+statement ok
+CREATE SEMANTIC VIEW dated_view2 TABLES (t AS dated2 PRIMARY KEY (id)) DIMENSIONS (t.cd AS current_schema) METRICS (t.n AS COUNT(*));
+
+query TI
+SELECT * FROM SEMANTIC_VIEW(dated_view2 DIMENSIONS t.cd METRICS t.n);
+----
+2999-01-01	1

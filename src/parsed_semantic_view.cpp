@@ -306,6 +306,7 @@ ParsedSemanticMaterialization ParsedSemanticMaterialization::Copy() const {
 		copy.expression = item.expression ? item.expression->Copy() : nullptr;
 		copy.star_table = item.star_table;
 		copy.alias = item.alias;
+		copy.display_name = item.display_name;
 		result.items.push_back(std::move(copy));
 	}
 	return result;
@@ -338,6 +339,7 @@ void ParsedSemanticQueryItem::Serialize(Serializer &serializer) const {
 	serializer.WritePropertyWithDefault(101, "expression", expression);
 	serializer.WriteProperty(102, "star_table", star_table);
 	serializer.WriteProperty(103, "alias", alias);
+	serializer.WritePropertyWithDefault(104, "display_name", display_name);
 }
 
 ParsedSemanticQueryItem ParsedSemanticQueryItem::Deserialize(Deserializer &deserializer) {
@@ -346,6 +348,7 @@ ParsedSemanticQueryItem ParsedSemanticQueryItem::Deserialize(Deserializer &deser
 	result.expression = deserializer.ReadPropertyWithDefault<unique_ptr<ParsedExpression>>(101, "expression");
 	result.star_table = deserializer.ReadProperty<string>(102, "star_table");
 	result.alias = deserializer.ReadProperty<string>(103, "alias");
+	result.display_name = deserializer.ReadPropertyWithDefault<string>(104, "display_name");
 	return result;
 }
 

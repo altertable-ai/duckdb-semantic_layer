@@ -4,8 +4,9 @@
 // semantic_statement_visitor.hpp
 //
 // Walks every query node and table reference of a statement - CTEs, joins,
-// subqueries in FROM and in expressions, DESCRIBE / SHOW, EXPLAIN, PREPARE,
-// CREATE TABLE AS and INSERT ... SELECT - so that subclasses can rewrite them.
+// subqueries in FROM and in expressions, PIVOT, DESCRIBE / SHOW, EXPLAIN,
+// PREPARE, CREATE TABLE AS / MACRO / TYPE, INSERT, UPDATE, DELETE, MERGE,
+// COPY and SET VARIABLE - so that subclasses can rewrite them.
 //
 //===----------------------------------------------------------------------===//
 
@@ -13,6 +14,9 @@
 
 #include "duckdb/common/case_insensitive_map.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
+#include "duckdb/parser/parsed_data/copy_info.hpp"
+#include "duckdb/parser/parsed_data/create_info.hpp"
+#include "duckdb/parser/statement/update_statement.hpp"
 #include "duckdb/parser/sql_statement.hpp"
 #include "duckdb/parser/tableref/showref.hpp"
 
@@ -28,6 +32,9 @@ protected:
 	//! Every table reference, after its children; may replace `ref`
 	virtual void VisitTableRef(unique_ptr<TableRef> &ref, bool in_join) {
 	}
+	//! Every SELECT node, before its children
+	virtual void EnterSelect(SelectNode &node) {
+	}
 	//! Every SELECT node, after its children
 	virtual void VisitSelect(SelectNode &node) {
 	}
@@ -39,10 +46,15 @@ protected:
 	//! Whether `name` is a CTE visible from the node being visited
 	bool IsCTEName(const string &name) const;
 
-private:
 	void VisitNode(QueryNode &node);
-	void VisitRef(unique_ptr<TableRef> &ref, bool in_join);
 	void VisitExpression(unique_ptr<ParsedExpression> &expr);
+
+private:
+	void VisitCreateInfo(CreateInfo &info);
+	void VisitCopyInfo(CopyInfo &info);
+	void VisitSetInfo(unique_ptr<UpdateSetInfo> &info);
+	void VisitRef(unique_ptr<TableRef> &ref, bool in_join);
+	void VisitExpressions(vector<unique_ptr<ParsedExpression>> &expressions);
 
 	vector<case_insensitive_set_t> cte_scopes;
 };

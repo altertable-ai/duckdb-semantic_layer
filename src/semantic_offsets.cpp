@@ -16,7 +16,7 @@ unique_ptr<ParsedExpression> SemanticShiftColumn(unique_ptr<ParsedExpression> co
 unique_ptr<ParsedExpression> SemanticOffsetMap::Column(idx_t table, const string &column,
                                                        unique_ptr<ParsedExpression> compiled) {
 	for (auto o : offsets) {
-		auto &offset = model.offsets[o];
+		auto &offset = transforms.Offset(o);
 		if (offset.table == table && StringUtil::CIEquals(offset.column, column)) {
 			compiled = SemanticShiftColumn(std::move(compiled), offset);
 		}

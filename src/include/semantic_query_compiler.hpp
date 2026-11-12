@@ -29,6 +29,8 @@ struct SemanticQueryItem {
 	//! Resolved expression (marker references)
 	unique_ptr<ParsedExpression> resolved;
 	string output_name;
+	//! The name of the item in error messages, when not its output name (ParsedSemanticQueryItem::display_name)
+	string display_name;
 
 	SemanticQueryItem() = default;
 	SemanticQueryItem(SemanticMemberKind kind, unique_ptr<ParsedExpression> resolved, string output_name)
@@ -38,15 +40,24 @@ struct SemanticQueryItem {
 	SemanticQueryItem &operator=(const SemanticQueryItem &) = delete;
 	SemanticQueryItem(SemanticQueryItem &&) noexcept = default;
 	SemanticQueryItem &operator=(SemanticQueryItem &&) noexcept = default;
+
+	//! The name of the item in error messages
+	const string &Name() const {
+		return display_name.empty() ? output_name : display_name;
+	}
 };
 
-//! Error message prefix for item `item`: Invalid <kind> "<output name>"
+//! Error message prefix for an item: Invalid <kind> "<name>"
+string SemanticItemWhat(SemanticMemberKind kind, const string &name);
 string SemanticItemWhat(const SemanticQueryItem &item);
 
 struct SemanticQuerySpec {
 	vector<SemanticQueryItem> items;
 	//! Resolved filter, may be null
 	unique_ptr<ParsedExpression> where;
+	//! The query-time transforms and filters the markers of the items and filter address (shared: the compilers of the
+	//! spec read them, see SemanticTransforms::Bind)
+	shared_ptr<SemanticQueryTransforms> transforms = make_shared_ptr<SemanticQueryTransforms>();
 };
 
 //! Columns of materialized block tables: one per dimension, the number of home rows of each group, then atom states
@@ -111,6 +122,7 @@ class SemanticQueryCompiler {
 public:
 	SemanticQueryCompiler(const SemanticModel &model, ClientContext &context);
 
+	//! Reads the query-time transforms of the spec last resolved or compiled (BindQuery)
 	SemanticAnalyzer &Analyzer() {
 		return analyzer;
 	}
@@ -131,6 +143,10 @@ public:
 	unique_ptr<SelectStatement> CompileMemberProbe(idx_t member, idx_t &column);
 
 private:
+	//! The analyzer reads (and resolution adds) the query-time transforms of `spec`: called by every entry point
+	void BindQuery(const SemanticQuerySpec &spec) {
+		analyzer.Transforms().Bind(spec.transforms);
+	}
 	unique_ptr<SelectStatement> CompileRowQuery(SemanticExpressionCompiler &compiler, SemanticAliasGenerator &aliases,
 	                                            const SemanticQuerySpec &spec, bool has_dimensions, bool has_facts,
 	                                            const set<idx_t> &row_tables, const SemanticCompileOptions &options);

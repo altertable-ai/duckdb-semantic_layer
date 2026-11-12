@@ -201,6 +201,14 @@ struct SemanticMember {
 	bool IsRowLevel() const {
 		return Kind() != SemanticMemberKind::METRIC;
 	}
+	//! "OFFSET", "CUMULATIVE" or "NON ADDITIVE BY" when the metric uses that clause, or nullptr: CUMULATIVE metrics
+	//! and cumulative() calls build on metrics without them
+	const char *TimeClause() const {
+		return offset.IsValid()        ? "OFFSET"
+		       : cumulative.IsValid()  ? "CUMULATIVE"
+		       : !non_additive.empty() ? "NON ADDITIVE BY"
+		                               : nullptr;
+	}
 };
 
 //! Name-resolution context of an expression
@@ -211,6 +219,8 @@ struct SemanticResolveContext {
 	idx_t self_member = DConstants::INVALID_INDEX;
 	//! Whether hidden (PRIVATE) members may be referenced
 	bool allow_private = true;
+	//! Whether the expression belongs to a semantic query (which cannot read the columns of an outer query)
+	bool in_query = false;
 	//! Prefix for error messages
 	string what;
 };
@@ -271,6 +281,14 @@ public:
 	//! several paths or none. `using_relationships` (USING on metrics) restricts
 	//! how the tables they reference are reached.
 	vector<SemanticEdge> Path(idx_t from, idx_t to, const vector<idx_t> &using_relationships = {}) const;
+	//! The relationship through which the rows of `from` reach the time spine: their TIME
+	SemanticEdge TimeEdge(idx_t from, const vector<idx_t> &using_relationships = {}) const;
+	//! Whose TIME a row-level expression evaluated for `context` reads from the time spine: `context`'s own (its
+	//! TimeEdge, whatever the metric), or, for the spine itself and view-level expressions (INVALID_INDEX), the
+	//! time of the rows aggregated
+	idx_t TimeReader(idx_t context) const {
+		return context == DConstants::INVALID_INDEX || IsTimeSpine(context) ? DConstants::INVALID_INDEX : context;
+	}
 
 	//! Looks up a (possibly qualified) name: a member or a column; NONE with
 	//! `error` set when unknown or ambiguous
@@ -284,8 +302,10 @@ public:
 
 private:
 	//! Up to two simple paths from -> to through the edges `allowed` accepts
-	vector<vector<SemanticEdge>> FindPaths(idx_t from, idx_t to,
-	                                       const std::function<bool(const SemanticEdge &)> &allowed) const;
+	//! Up to two paths from `from` to `to` through `allowed` edges, among those `accept` accepts (all when null)
+	vector<vector<SemanticEdge>>
+	FindPaths(idx_t from, idx_t to, const std::function<bool(const SemanticEdge &)> &allowed,
+	          const std::function<bool(const vector<SemanticEdge> &)> &accept = nullptr) const;
 };
 
 //! Builds and validates a model from a parsed definition (catalog lookups through `context`)

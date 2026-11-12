@@ -9,12 +9,16 @@
 
 #pragma once
 
+#include "duckdb/common/case_insensitive_map.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/expression/comparison_expression.hpp"
 #include "duckdb/parser/expression/conjunction_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
+#include "duckdb/parser/expression/lambda_expression.hpp"
 #include "duckdb/parser/expression/subquery_expression.hpp"
+#include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
@@ -64,6 +68,17 @@ inline unique_ptr<ParsedExpression> AndAll(vector<unique_ptr<ParsedExpression>> 
 	return result;
 }
 
+//! Disjunction of `conditions`; nullptr when empty
+inline unique_ptr<ParsedExpression> OrAll(vector<unique_ptr<ParsedExpression>> conditions) {
+	unique_ptr<ParsedExpression> result;
+	for (auto &condition : conditions) {
+		result = result ? make_uniq<ConjunctionExpression>(ExpressionType::CONJUNCTION_OR, std::move(result),
+		                                                   std::move(condition))
+		                : std::move(condition);
+	}
+	return result;
+}
+
 //! Top-level AND conjuncts of `expr` (pointers into it)
 inline void SplitConjuncts(const ParsedExpression &expr, vector<const ParsedExpression *> &conjuncts) {
 	if (expr.GetExpressionType() == ExpressionType::CONJUNCTION_AND) {
@@ -103,5 +118,64 @@ inline void GroupByAll(SelectNode &node) {
 	}
 	node.groups.grouping_sets.push_back(std::move(set));
 }
+
+//! `expr` as SQL, for messages: COUNT(*) as written rather than as the parser's count_star()
+inline string DisplayText(const ParsedExpression &expr) {
+	return StringUtil::Replace(expr.ToString(), "count_star()", "count(*)");
+}
+
+//! The lambda parameters in scope while walking an expression (`lambda x: ...`; the deprecated `x -> ...` is read
+//! as columns, like the JSON arrow operator it is ambiguous with)
+class LambdaScopes {
+public:
+	//! Brings the parameters of `expr` (when it is a lambda) into scope until destroyed
+	class Guard {
+	public:
+		Guard(LambdaScopes &scopes, const ParsedExpression &expr) : scopes(scopes) {
+			if (expr.GetExpressionClass() != ExpressionClass::LAMBDA ||
+			    expr.Cast<LambdaExpression>().GetLambdaSyntaxType() != LambdaSyntaxType::LAMBDA_KEYWORD) {
+				return;
+			}
+			string error;
+			case_insensitive_set_t parameters;
+			for (auto &parameter : expr.Cast<LambdaExpression>().ExtractColumnRefExpressions(error)) {
+				parameters.insert(parameter.get().Cast<ColumnRefExpression>().GetColumnName().GetIdentifierName());
+			}
+			scopes.scopes.push_back(std::move(parameters));
+			pushed = true;
+		}
+		~Guard() {
+			if (pushed) {
+				scopes.scopes.pop_back();
+			}
+		}
+		Guard(const Guard &) = delete;
+		Guard &operator=(const Guard &) = delete;
+
+	private:
+		LambdaScopes &scopes;
+		bool pushed = false;
+	};
+
+	//! Whether `expr` is a reference to a lambda parameter in scope
+	bool IsParameter(const ParsedExpression &expr) const {
+		if (scopes.empty() || expr.GetExpressionClass() != ExpressionClass::COLUMN_REF) {
+			return false;
+		}
+		auto &colref = expr.Cast<ColumnRefExpression>();
+		if (colref.IsQualified()) {
+			return false;
+		}
+		for (auto &scope : scopes) {
+			if (scope.count(colref.GetColumnName().GetIdentifierName())) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+private:
+	vector<case_insensitive_set_t> scopes;
+};
 
 } // namespace duckdb

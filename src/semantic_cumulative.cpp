@@ -85,9 +85,9 @@ static string LeafColumn(idx_t index) {
 	return "__sv_i" + to_string(index);
 }
 
-SemanticAnchorMap::SemanticAnchorMap(const SemanticModel &model, const SemanticCumulative &cumulative,
+SemanticAnchorMap::SemanticAnchorMap(const SemanticTransforms &transforms, const SemanticCumulative &cumulative,
                                      const vector<idx_t> &offsets)
-    : cumulative(cumulative), offsets(model, offsets) {
+    : cumulative(cumulative), offsets(transforms, offsets) {
 }
 
 unique_ptr<ParsedExpression> SemanticAnchorMap::Column(idx_t table, const string &column,

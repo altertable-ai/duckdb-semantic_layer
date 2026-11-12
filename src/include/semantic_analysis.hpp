@@ -16,6 +16,7 @@
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "semantic_markers.hpp"
 #include "semantic_model.hpp"
+#include "semantic_transforms.hpp"
 
 namespace duckdb {
 
@@ -27,8 +28,8 @@ struct SemanticMetricContext {
 	vector<idx_t> using_relationships;
 	//! Metric whose NON ADDITIVE BY applies, or INVALID_INDEX
 	idx_t non_additive_member = DConstants::INVALID_INDEX;
-	//! While decomposing: metrics whose FILTER applies (outer metrics first). Applied, then cleared, when an atom is
-	//! created (SemanticAnalyzer::ApplyMetricContext).
+	//! While decomposing: FILTERs (SemanticTransforms::Filter: metrics' or query-local) that apply, outer ones first.
+	//! Applied, then cleared, when an atom is created (SemanticAnalyzer::ApplyMetricContext).
 	vector<idx_t> filters;
 	//! Offsets (SemanticModel::offsets) that apply, in the order the shifts are applied (innermost metric first)
 	vector<idx_t> offsets;
@@ -50,7 +51,8 @@ struct SemanticBlockKey {
 	vector<idx_t> using_relationships;
 	//! Metric whose NON ADDITIVE BY picks the last snapshot, or INVALID_INDEX
 	idx_t non_additive_member;
-	//! Metrics whose FILTER filters the rows (semi-additive atoms only, see SemanticAtom::row_filters)
+	//! FILTERs (SemanticTransforms::Filter) filtering the rows (semi-additive atoms only, see
+	//! SemanticAtom::row_filters)
 	vector<idx_t> row_filters;
 	//! Offsets (SemanticModel::offsets) shifting the query's dimensions and WHERE, in application order
 	vector<idx_t> offsets;
@@ -71,8 +73,8 @@ struct SemanticAtom {
 	//! The aggregate expression (resolved; marker references), metric FILTERs included
 	unique_ptr<ParsedExpression> aggregate;
 	SemanticMetricContext context;
-	//! Metrics whose FILTER filters the rows of the atom's block instead of its aggregate: semi-additive atoms pick
-	//! their last snapshot among the filtered rows
+	//! FILTERs (SemanticTransforms::Filter) filtering the rows of the atom's block instead of its aggregate:
+	//! semi-additive atoms pick their last snapshot among the filtered rows
 	vector<idx_t> row_filters;
 
 	SemanticAtom() = default;
@@ -111,12 +113,26 @@ public:
 	ClientContext &Context() const {
 		return context;
 	}
+	const SemanticModel &Model() const {
+		return model;
+	}
+	//! The OFFSETs, CUMULATIVEs and FILTERs of the query: the model's, plus those the query adds
+	SemanticTransforms &Transforms() {
+		return transforms;
+	}
+	const SemanticTransforms &Transforms() const {
+		return transforms;
+	}
 
-	//! Whether `expr` is a call to an aggregate function
+	//! Whether `expr` is a call to an aggregate function, or to a macro whose body aggregates
 	bool IsAggregate(const ParsedExpression &expr);
+	//! Whether `expr` is a call to a (replaceable) SQL macro whose body aggregates
+	bool IsAggregateMacro(const ParsedExpression &expr);
 	//! Whether `expr` contains an aggregate or a metric reference (not looking into subqueries)
 	bool ContainsAggregateOrMetric(const ParsedExpression &expr);
 	static bool ContainsWindow(const ParsedExpression &expr);
+	//! Whether `member` is a metric computed with a window function (directly or through the metrics it reads)
+	bool IsWindowMetric(idx_t member) const;
 
 	//! Logical tables a row-level expression reads, evaluated in the row context of `context_table`
 	//! (INVALID_INDEX for view-level expressions). Child aggregations count as `context_table`.
@@ -125,6 +141,11 @@ public:
 	idx_t FinestTable(const set<idx_t> &tables, const string &what);
 	//! Home table of an aggregate call evaluated in `context_table` (INVALID_INDEX = view level)
 	idx_t AggregateHome(const FunctionExpression &aggregate, idx_t context_table, const string &what);
+	//! Rejects a row-level `expr` (`describe`d in the error) of `aggregate` reading a table its rows, of `home`, do
+	//! not reference
+	void CheckReadableFrom(idx_t home, const ParsedExpression &expr, idx_t context_table,
+	                       const FunctionExpression &aggregate, const std::function<string()> &describe,
+	                       const string &what);
 
 	//! Splits a metric-level expression into a post-aggregation expression over atom markers. Metric references
 	//! are inlined recursively (with their own USING / NON ADDITIVE BY); window functions are kept, with their
@@ -145,7 +166,9 @@ private:
 
 	const SemanticModel &model;
 	ClientContext &context;
+	SemanticTransforms transforms;
 	case_insensitive_map_t<bool> aggregate_cache;
+	case_insensitive_map_t<bool> aggregate_macro_cache;
 };
 
 } // namespace duckdb

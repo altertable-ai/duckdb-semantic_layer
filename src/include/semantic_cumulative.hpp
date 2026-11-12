@@ -42,7 +42,8 @@ bool SemanticIsTruncationPart(const string &part);
 //! becomes a leaf, a column `__sv_i<n>` of the block's rows
 class SemanticAnchorMap : public SemanticColumnMap {
 public:
-	SemanticAnchorMap(const SemanticModel &model, const SemanticCumulative &cumulative, const vector<idx_t> &offsets);
+	SemanticAnchorMap(const SemanticTransforms &transforms, const SemanticCumulative &cumulative,
+	                  const vector<idx_t> &offsets);
 
 	unique_ptr<ParsedExpression> Column(idx_t table, const string &column,
 	                                    unique_ptr<ParsedExpression> compiled) override;

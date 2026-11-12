@@ -29,6 +29,22 @@
 
 namespace duckdb {
 
+//! Whether an aggregate argument is a constant (QUANTILE_CONT(x, 0.5), STRING_AGG(x, ',')) that must stay one. Like
+//! ParsedExpression::IsScalar, but a qualified call is not constant: `amount.scale()` calls scale(amount).
+static bool IsConstantArgument(const ParsedExpression &expr) {
+	if (!expr.IsScalar()) {
+		return false;
+	}
+	if (expr.GetExpressionClass() == ExpressionClass::FUNCTION &&
+	    expr.Cast<FunctionExpression>().GetQualifiedName().Path().size() > 1) {
+		return false;
+	}
+	bool constant = true;
+	ParsedExpressionIterator::EnumerateChildren(
+	    expr, [&](const ParsedExpression &child) { constant = constant && IsConstantArgument(child); });
+	return constant;
+}
+
 namespace {
 
 string DimensionColumn(idx_t index) {
@@ -43,15 +59,19 @@ constexpr const char *BLOCK_COLUMN = "__sv_block";
 
 } // namespace
 
-string SemanticItemWhat(const SemanticQueryItem &item) {
-	switch (item.kind) {
+string SemanticItemWhat(SemanticMemberKind kind, const string &name) {
+	switch (kind) {
 	case SemanticMemberKind::DIMENSION:
-		return "Invalid dimension \"" + item.output_name + "\"";
+		return "Invalid dimension \"" + name + "\"";
 	case SemanticMemberKind::FACT:
-		return "Invalid fact \"" + item.output_name + "\"";
+		return "Invalid fact \"" + name + "\"";
 	default:
-		return "Invalid metric \"" + item.output_name + "\"";
+		return "Invalid metric \"" + name + "\"";
 	}
+}
+
+string SemanticItemWhat(const SemanticQueryItem &item) {
+	return SemanticItemWhat(item.kind, item.Name());
 }
 
 string SemanticDimensionColumn(idx_t dimension) {
@@ -417,6 +437,10 @@ private:
 		// the aggregates read their arguments, FILTERs and ORDER BYs from the rows, as __sv_x<n>
 		idx_t argument_count = 0;
 		auto extract = [&](unique_ptr<ParsedExpression> &argument) {
+			if (IsConstantArgument(*argument)) {
+				// constant parameters (QUANTILE_CONT(x, 0.5), STRING_AGG(x, ',')) must stay constants
+				return;
+			}
 			auto name = "__sv_x" + to_string(argument_count++);
 			argument->SetAlias(Identifier(name));
 			rows.select_list.push_back(std::move(argument));
@@ -449,9 +473,9 @@ private:
 			conditions.push_back(
 			    compiler.ShiftedRow(*AndAll(std::move(local_conjuncts)), scope, WHERE_WHAT, block.key.offsets));
 		}
-		for (auto metric : block.key.row_filters) {
+		for (auto filter : block.key.row_filters) {
 			conditions.push_back(
-			    compiler.Row(*model.members[metric].filter, scope, DConstants::INVALID_INDEX, "Invalid metric"));
+			    compiler.Row(analyzer.Transforms().Filter(filter), scope, DConstants::INVALID_INDEX, "Invalid metric"));
 		}
 		if (options.row_filter) {
 			auto filter = options.row_filter(scope, result.dimensions);
@@ -466,7 +490,7 @@ private:
 	//! The rows of a block that groups them by the query's dimensions: those shifted by the block's OFFSETs, and
 	//! read by the rows as __sv_d<i>
 	BlockRows BuildDimensionRows(const Block &block, SemanticJoinScope &scope, BlockBridges &bridges) {
-		SemanticOffsetMap map(model, block.key.offsets);
+		SemanticOffsetMap map(analyzer.Transforms(), block.key.offsets);
 		auto result = BuildRows(block, scope, bridges, map, WhereConjuncts());
 		vector<unique_ptr<ParsedExpression>> select_list;
 		for (idx_t d = 0; d < result.dimensions.size(); d++) {
@@ -551,11 +575,11 @@ private:
 	//! A block of CUMULATIVE aggregates (semantic_cumulative.hpp): its rows read the stored date, the query's
 	//! dimensions and WHERE conditions on the date read the anchor
 	unique_ptr<SelectNode> BuildCumulativeBlock(const Block &block, optional_idx tag) {
-		auto &cumulative = model.cumulatives[block.key.cumulative];
+		auto &cumulative = analyzer.Transforms().Cumulative(block.key.cumulative);
 		SemanticJoinScope scope(model, aliases, block.key.home, block.key.using_relationships, string(),
 		                        options.sources);
 		BlockBridges bridges(model, analyzer, compiler, aliases, block.key, options.sources);
-		SemanticAnchorMap anchor_map(model, cumulative, block.key.offsets);
+		SemanticAnchorMap anchor_map(analyzer.Transforms(), cumulative, block.key.offsets);
 		// the WHERE conjuncts reading the date filter the anchors, the others the rows
 		SemanticCumulativeParts parts;
 		vector<const ParsedExpression *> row_where;
@@ -716,8 +740,10 @@ SemanticQueryCompiler::SemanticQueryCompiler(const SemanticModel &model, ClientC
 SemanticQuerySpec SemanticQueryCompiler::Resolve(const vector<ParsedSemanticQueryItem> &items,
                                                  optional_ptr<ParsedExpression> where) {
 	SemanticQuerySpec spec;
+	BindQuery(spec);
 	SemanticResolveContext resolve_context;
 	resolve_context.allow_private = false;
+	resolve_context.in_query = true;
 	for (auto &item : items) {
 		if (!item.expression) {
 			auto table = model.FindTable(item.star_table);
@@ -733,8 +759,14 @@ SemanticQuerySpec SemanticQueryCompiler::Resolve(const vector<ParsedSemanticQuer
 			}
 			continue;
 		}
-		resolve_context.what = "Invalid " + StringUtil::Lower(SemanticMemberKindToString(item.kind)) + " \"" +
-		                       item.expression->ToString() + "\"";
+		// errors name the item as written (its alias, before resolution gives it an output name)
+		auto what = SemanticItemWhat(item.kind, !item.display_name.empty() ? item.display_name
+		                                        : !item.alias.empty()      ? item.alias
+		                                                                   : item.expression->ToString());
+		if (item.kind == SemanticMemberKind::METRIC) {
+			SemanticCheckUnresolvedTransforms(*item.expression, what);
+		}
+		resolve_context.what = what;
 		auto resolved = model.Resolve(*item.expression, resolve_context);
 		auto output_name = item.alias;
 		if (output_name.empty()) {
@@ -743,11 +775,14 @@ SemanticQuerySpec SemanticQueryCompiler::Resolve(const vector<ParsedSemanticQuer
 			              : ref.Is(SemanticRefKind::COLUMN) ? ref.column
 			                                                : item.expression->ToString();
 		}
+		resolved = SemanticResolveTransforms(analyzer, std::move(resolved), item.kind, what);
 		spec.items.push_back(SemanticQueryItem {item.kind, std::move(resolved), output_name});
+		spec.items.back().display_name = item.display_name;
 	}
 	if (where) {
 		resolve_context.what = "Invalid WHERE clause";
-		spec.where = model.Resolve(*where, resolve_context);
+		spec.where = SemanticResolveTransforms(analyzer, model.Resolve(*where, resolve_context),
+		                                       SemanticMemberKind::DIMENSION, resolve_context.what);
 	}
 	return spec;
 }
@@ -796,6 +831,7 @@ void SemanticQueryCompiler::SplitItems(const SemanticQuerySpec &spec, vector<con
 
 unique_ptr<SelectStatement> SemanticQueryCompiler::Compile(const SemanticQuerySpec &spec,
                                                            const SemanticCompileOptions &options) {
+	BindQuery(spec);
 	vector<const SemanticQueryItem *> dimensions;
 	vector<const SemanticQueryItem *> facts;
 	vector<const SemanticQueryItem *> metrics;
@@ -838,6 +874,7 @@ static void VerifyBoundSources(const SemanticModel &model, LogicalOperator &op, 
 }
 
 vector<SemanticBlockPlan> SemanticQueryCompiler::PlanBlocks(const SemanticQuerySpec &spec) {
+	BindQuery(spec);
 	vector<const SemanticQueryItem *> dimensions;
 	vector<const SemanticQueryItem *> facts;
 	vector<const SemanticQueryItem *> metrics;
@@ -874,6 +911,7 @@ vector<SemanticBlockPlan> SemanticQueryCompiler::PlanBlocks(const SemanticQueryS
 unique_ptr<SelectStatement> SemanticQueryCompiler::CompileStates(const SemanticQuerySpec &spec, idx_t block,
                                                                  const SemanticStateBuilder &states,
                                                                  const SemanticCompileOptions &options) {
+	BindQuery(spec);
 	vector<const SemanticQueryItem *> dimensions;
 	vector<const SemanticQueryItem *> facts;
 	vector<const SemanticQueryItem *> metrics;
