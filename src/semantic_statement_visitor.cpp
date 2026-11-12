@@ -5,7 +5,22 @@
 #include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/query_node/recursive_cte_node.hpp"
 #include "duckdb/parser/query_node/set_operation_node.hpp"
+#include "duckdb/function/scalar_macro_function.hpp"
+#include "duckdb/function/table_macro_function.hpp"
+#include "duckdb/parser/parsed_data/copy_info.hpp"
+#include "duckdb/parser/parsed_data/create_macro_info.hpp"
+#include "duckdb/parser/parsed_data/create_type_info.hpp"
+#include "duckdb/parser/query_node/copy_query_node.hpp"
+#include "duckdb/parser/query_node/delete_query_node.hpp"
+#include "duckdb/parser/query_node/insert_query_node.hpp"
+#include "duckdb/parser/query_node/update_query_node.hpp"
+#include "duckdb/parser/statement/copy_statement.hpp"
 #include "duckdb/parser/statement/create_statement.hpp"
+#include "duckdb/parser/statement/delete_statement.hpp"
+#include "duckdb/parser/statement/multi_statement.hpp"
+#include "duckdb/parser/statement/set_statement.hpp"
+#include "duckdb/parser/statement/update_statement.hpp"
+#include "duckdb/parser/tableref/pivotref.hpp"
 #include "duckdb/parser/statement/explain_statement.hpp"
 #include "duckdb/parser/statement/insert_statement.hpp"
 #include "duckdb/parser/statement/prepare_statement.hpp"
@@ -31,18 +46,82 @@ void SemanticStatementVisitor::VisitStatement(SQLStatement &statement) {
 		break;
 	case StatementType::CREATE_STATEMENT: {
 		auto &create = statement.Cast<CreateStatement>();
-		if (create.info && create.info->type == CatalogType::TABLE_ENTRY) {
-			auto &info = create.info->Cast<CreateTableInfo>();
-			if (info.query) {
-				VisitNode(*info.query->node);
-			}
+		if (create.info) {
+			VisitCreateInfo(*create.info);
 		}
 		break;
 	}
 	case StatementType::INSERT_STATEMENT: {
 		auto &insert = statement.Cast<InsertStatement>();
-		if (insert.node && insert.node->select_statement) {
-			VisitNode(*insert.node->select_statement->node);
+		if (insert.node) {
+			VisitNode(*insert.node);
+		}
+		break;
+	}
+	case StatementType::DELETE_STATEMENT: {
+		auto &del = statement.Cast<DeleteStatement>();
+		if (del.node) {
+			VisitNode(*del.node);
+		}
+		break;
+	}
+	case StatementType::UPDATE_STATEMENT: {
+		auto &update = statement.Cast<UpdateStatement>();
+		if (update.node) {
+			VisitNode(*update.node);
+		}
+		break;
+	}
+	case StatementType::COPY_STATEMENT: {
+		auto &copy = statement.Cast<CopyStatement>();
+		if (copy.info && copy.info->select_statement) {
+			VisitNode(*copy.info->select_statement);
+		}
+		break;
+	}
+	case StatementType::SET_STATEMENT: {
+		auto &set = statement.Cast<SetStatement>();
+		if (set.set_type == SetType::SET) {
+			auto &variable = set.Cast<SetVariableStatement>();
+			if (variable.value) {
+				VisitExpression(variable.value);
+			}
+		}
+		break;
+	}
+	case StatementType::MULTI_STATEMENT:
+		for (auto &child : statement.Cast<MultiStatement>().statements) {
+			VisitStatement(*child);
+		}
+		break;
+	default:
+		break;
+	}
+}
+
+void SemanticStatementVisitor::VisitCreateInfo(CreateInfo &info) {
+	switch (info.type) {
+	case CatalogType::TABLE_ENTRY: {
+		auto &table = info.Cast<CreateTableInfo>();
+		if (table.query) {
+			VisitNode(*table.query->node);
+		}
+		break;
+	}
+	case CatalogType::MACRO_ENTRY:
+	case CatalogType::TABLE_MACRO_ENTRY:
+		for (auto &macro : info.Cast<CreateMacroInfo>().macros) {
+			if (macro->type == MacroType::TABLE_MACRO) {
+				VisitNode(*macro->Cast<TableMacroFunction>().query_node);
+			} else if (macro->type == MacroType::SCALAR_MACRO) {
+				VisitExpression(macro->Cast<ScalarMacroFunction>().expression);
+			}
+		}
+		break;
+	case CatalogType::TYPE_ENTRY: {
+		auto &type = info.Cast<CreateTypeInfo>();
+		if (type.query) {
+			VisitStatement(*type.query);
 		}
 		break;
 	}
@@ -61,19 +140,23 @@ bool SemanticStatementVisitor::IsCTEName(const string &name) const {
 }
 
 void SemanticStatementVisitor::VisitNode(QueryNode &node) {
-	case_insensitive_set_t ctes;
+	// a CTE sees the CTEs defined before it (and itself, when recursive), as in DuckDB
+	cte_scopes.emplace_back();
 	for (auto &cte : node.cte_map.map) {
-		ctes.insert(cte.first.GetIdentifierName());
-	}
-	cte_scopes.push_back(std::move(ctes));
-	for (auto &cte : node.cte_map.map) {
-		VisitNode(*cte.second->query_node);
+		auto name = cte.first.GetIdentifierName();
+		auto &query = *cte.second->query_node;
+		if (query.type == QueryNodeType::RECURSIVE_CTE_NODE) {
+			cte_scopes.back().insert(name);
+		}
+		VisitNode(query);
+		cte_scopes.back().insert(name);
 	}
 	ParsedExpressionIterator::EnumerateQueryNodeModifiers(
 	    node, [&](unique_ptr<ParsedExpression> &expr) { VisitExpression(expr); });
 	switch (node.type) {
 	case QueryNodeType::SELECT_NODE: {
 		auto &select = node.Cast<SelectNode>();
+		EnterSelect(select);
 		if (select.from_table) {
 			VisitRef(select.from_table, false);
 		}
@@ -96,6 +179,46 @@ void SemanticStatementVisitor::VisitNode(QueryNode &node) {
 			VisitNode(*child);
 		}
 		break;
+	case QueryNodeType::INSERT_QUERY_NODE: {
+		auto &insert = node.Cast<InsertQueryNode>();
+		if (insert.select_statement) {
+			VisitNode(*insert.select_statement->node);
+		}
+		VisitExpressions(insert.returning_list);
+		break;
+	}
+	case QueryNodeType::DELETE_QUERY_NODE: {
+		auto &del = node.Cast<DeleteQueryNode>();
+		for (auto &using_clause : del.using_clauses) {
+			VisitRef(using_clause, true);
+		}
+		if (del.condition) {
+			VisitExpression(del.condition);
+		}
+		VisitExpressions(del.returning_list);
+		break;
+	}
+	case QueryNodeType::UPDATE_QUERY_NODE: {
+		auto &update = node.Cast<UpdateQueryNode>();
+		if (update.from_table) {
+			VisitRef(update.from_table, true);
+		}
+		if (update.set_info) {
+			if (update.set_info->condition) {
+				VisitExpression(update.set_info->condition);
+			}
+			VisitExpressions(update.set_info->expressions);
+		}
+		VisitExpressions(update.returning_list);
+		break;
+	}
+	case QueryNodeType::COPY_QUERY_NODE: {
+		auto &copy = node.Cast<CopyQueryNode>();
+		if (copy.info && copy.info->select_statement) {
+			VisitNode(*copy.info->select_statement);
+		}
+		break;
+	}
 	case QueryNodeType::RECURSIVE_CTE_NODE: {
 		auto &recursive = node.Cast<RecursiveCTENode>();
 		VisitNode(*recursive.left);
@@ -135,6 +258,20 @@ void SemanticStatementVisitor::VisitRef(unique_ptr<TableRef> &ref, bool in_join)
 			}
 		}
 		break;
+	case TableReferenceType::PIVOT: {
+		auto &pivot = ref->Cast<PivotRef>();
+		if (pivot.source) {
+			VisitRef(pivot.source, false);
+		}
+		VisitExpressions(pivot.aggregates);
+		for (auto &column : pivot.pivots) {
+			VisitExpressions(column.pivot_expressions);
+			if (column.subquery) {
+				VisitNode(*column.subquery);
+			}
+		}
+		break;
+	}
 	case TableReferenceType::SHOW_REF: {
 		auto &show = ref->Cast<ShowRef>();
 		if (show.query && !VisitShowQuery(show)) {
@@ -146,6 +283,12 @@ void SemanticStatementVisitor::VisitRef(unique_ptr<TableRef> &ref, bool in_join)
 		break;
 	}
 	VisitTableRef(ref, in_join);
+}
+
+void SemanticStatementVisitor::VisitExpressions(vector<unique_ptr<ParsedExpression>> &expressions) {
+	for (auto &expr : expressions) {
+		VisitExpression(expr);
+	}
 }
 
 void SemanticStatementVisitor::VisitExpression(unique_ptr<ParsedExpression> &expr) {

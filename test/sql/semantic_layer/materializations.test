@@ -299,3 +299,76 @@ query I
 SELECT count(*) FROM __semantic_materializations.__sv_materializations;
 ----
 0
+
+#===--------------------------------------------------------------------===#
+# Named and built-in dimensions computed from stored dimensions read the materialization
+#===--------------------------------------------------------------------===#
+
+statement ok
+CREATE TABLE daily_orders (id INTEGER, amount INTEGER, day DATE, status VARCHAR);
+INSERT INTO daily_orders VALUES (1, 10, '2024-01-01', 'ok'), (2, 20, '2024-02-01', 'ko'), (3, 5, '2024-02-03', 'ok');
+
+statement ok
+CREATE SEMANTIC VIEW daily TABLES (o AS daily_orders PRIMARY KEY (id) TIME (day))
+  DIMENSIONS (o.d AS day, o.yr AS YEAR(metric_time.day), o.st AS status, o.st_upper AS UPPER(status), o.mo AS metric_time.month, o.amt AS amount)
+  METRICS (o.rev AS SUM(amount));
+
+statement ok
+ALTER SEMANTIC VIEW daily SET MAX_STALENESS = 100000;
+
+statement ok
+ALTER SEMANTIC VIEW daily ADD MATERIALIZATION by_day AS DIMENSIONS metric_time.day, o.st METRICS o.rev;
+
+query I
+SELECT sql ILIKE '%__semantic_materializations%' FROM semantic_view_sql('SELECT * FROM SEMANTIC_VIEW(daily DIMENSIONS YEAR(metric_time.day) AS y METRICS o.rev)');
+----
+true
+
+query I
+SELECT sql ILIKE '%__semantic_materializations%' FROM semantic_view_sql('SELECT * FROM SEMANTIC_VIEW(daily DIMENSIONS metric_time.month METRICS o.rev)');
+----
+true
+
+query I
+SELECT sql ILIKE '%__semantic_materializations%' FROM semantic_view_sql('SELECT * FROM SEMANTIC_VIEW(daily METRICS o.rev WHERE metric_time.year = DATE ''2024-01-01'')');
+----
+true
+
+query I
+SELECT sql ILIKE '%__semantic_materializations%' FROM semantic_view_sql('SELECT * FROM SEMANTIC_VIEW(daily DIMENSIONS o.yr METRICS o.rev)');
+----
+true
+
+query I
+SELECT sql ILIKE '%__semantic_materializations%' FROM semantic_view_sql('SELECT * FROM SEMANTIC_VIEW(daily DIMENSIONS o.st_upper METRICS o.rev)');
+----
+true
+
+query I
+SELECT sql ILIKE '%__semantic_materializations%' FROM semantic_view_sql('SELECT * FROM SEMANTIC_VIEW(daily DIMENSIONS o.mo, o.st METRICS o.rev)');
+----
+true
+
+query TI
+SELECT * FROM SEMANTIC_VIEW(daily DIMENSIONS metric_time.month METRICS o.rev) ORDER BY 1;
+----
+2024-01-01	10
+2024-02-01	25
+
+query TTI
+SELECT * FROM SEMANTIC_VIEW(daily DIMENSIONS o.mo, o.st_upper METRICS o.rev) ORDER BY ALL;
+----
+2024-01-01	OK	10
+2024-02-01	KO	20
+2024-02-01	OK	5
+
+query I
+SELECT * FROM SEMANTIC_VIEW(daily METRICS o.rev WHERE o.yr = 2024 AND metric_time.month = DATE '2024-02-01');
+----
+25
+
+# a dimension of an unstored column still reads the sources
+query I
+SELECT sql ILIKE '%__semantic_materializations%' FROM semantic_view_sql('SELECT * FROM SEMANTIC_VIEW(daily DIMENSIONS o.amt METRICS o.rev)');
+----
+false

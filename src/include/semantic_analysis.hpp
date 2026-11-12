@@ -124,8 +124,10 @@ public:
 		return transforms;
 	}
 
-	//! Whether `expr` is a call to an aggregate function
+	//! Whether `expr` is a call to an aggregate function, or to a macro whose body aggregates
 	bool IsAggregate(const ParsedExpression &expr);
+	//! Whether `expr` is a call to a (replaceable) SQL macro whose body aggregates
+	bool IsAggregateMacro(const ParsedExpression &expr);
 	//! Whether `expr` contains an aggregate or a metric reference (not looking into subqueries)
 	bool ContainsAggregateOrMetric(const ParsedExpression &expr);
 	static bool ContainsWindow(const ParsedExpression &expr);
@@ -159,6 +161,7 @@ private:
 	ClientContext &context;
 	SemanticTransforms transforms;
 	case_insensitive_map_t<bool> aggregate_cache;
+	case_insensitive_map_t<bool> aggregate_macro_cache;
 };
 
 } // namespace duckdb

@@ -68,13 +68,13 @@ string SemanticJoinScope::Ensure(idx_t table) {
 	return AliasOf(table);
 }
 
-unique_ptr<ParsedExpression> SemanticJoinScope::ColumnReference(idx_t table, const string &column) {
+unique_ptr<ParsedExpression> SemanticJoinScope::ColumnReference(idx_t table, const string &column, idx_t reader) {
 	if (BelongsToOuter(table)) {
 		reads_outer = true;
-		return outer->ColumnReference(table, column);
+		return outer->ColumnReference(table, column, reader);
 	}
 	if (model.IsTimeSpine(table) && table != base) {
-		return TimeColumn(table);
+		return TimeColumn(table, reader);
 	}
 	auto path = model.Path(base, table, using_relationships);
 	for (idx_t i = 0; i < path.size(); i++) {
@@ -85,8 +85,14 @@ unique_ptr<ParsedExpression> SemanticJoinScope::ColumnReference(idx_t table, con
 	return ColumnRef(column, Ensure(table));
 }
 
-unique_ptr<ParsedExpression> SemanticJoinScope::TimeColumn(idx_t spine) {
-	auto edge = model.Path(base, spine, using_relationships).back();
+unique_ptr<ParsedExpression> SemanticJoinScope::TimeColumn(idx_t spine, idx_t reader) {
+	vector<SemanticEdge> path;
+	if (reader == DConstants::INVALID_INDEX || reader == base || model.IsTimeSpine(reader) ||
+	    model.TryPath(reader, spine, vector<idx_t>(), path) != SemanticPathResult::FOUND) {
+		// the spine itself (metric_time.day): the time of the rows aggregated, along the metric's USING
+		path = model.Path(base, spine, using_relationships);
+	}
+	auto edge = path.back();
 	auto &rel = model.relationships[edge.relationship];
 	auto &from = model.tables[rel.from_table];
 	auto &column = rel.from_columns[0];

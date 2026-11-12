@@ -4,6 +4,7 @@
 #include "duckdb/catalog/entry_lookup_info.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/sql_identifier.hpp"
 #include "duckdb/common/to_string.hpp"
 #include "duckdb/parser/expression/cast_expression.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
@@ -16,6 +17,7 @@
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/result_modifier.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
+#include "duckdb/parser/tableref/table_function_ref.hpp"
 #include "semantic_analysis.hpp"
 #include "semantic_ast_helpers.hpp"
 #include "semantic_catalog.hpp"
@@ -39,6 +41,7 @@ public:
 
 	void Rewrite(SelectNode &node) {
 		CheckSupported(node);
+		auto qualify_reads_window_metric = false;
 		auto orders = ModifierExpressions(node);
 		vector<bool> modifier_aliases;
 		for (auto order : orders) {
@@ -46,6 +49,7 @@ public:
 			                           !(*order)->Cast<ColumnRefExpression>().IsQualified());
 		}
 		NormalizeClauses(node, orders);
+		qualify_reads_window_metric = qualify && ReadsWindowMetric(*qualify);
 		CollectGroups(node);
 		auto aggregated = HasAggregation(orders);
 		CheckSample(node, aggregated);
@@ -59,6 +63,16 @@ public:
 		for (idx_t i = 0; i < orders.size(); i++) {
 			auto &order = *orders[i];
 			order = aggregated ? Replace(*order, true, modifier_aliases[i]) : MapToFacts(*order, modifier_aliases[i]);
+		}
+		if (node.qualify && qualify_reads_window_metric && !HasOuterWindow(node, orders)) {
+			// it only reads window metrics, computed by the semantic query: without windows to evaluate first, the
+			// outer query filters with WHERE (DuckDB rejects a QUALIFY without window functions)
+			vector<unique_ptr<ParsedExpression>> conditions;
+			if (node.where_clause) {
+				conditions.push_back(std::move(node.where_clause));
+			}
+			conditions.push_back(std::move(node.qualify));
+			node.where_clause = AndAll(std::move(conditions));
 		}
 		node.having = nullptr;
 		node.groups = GroupByNode();
@@ -78,6 +92,8 @@ private:
 		string alias;
 		//! As written
 		string text;
+		//! The name of a column reference as written
+		string column_name;
 		//! Whether it contains a window function (evaluated by the outer query)
 		bool has_window = false;
 		//! Whether it contains an aggregate: AGG(...), a time_shift / cumulative call or an aggregate function
@@ -129,6 +145,61 @@ private:
 		}
 	}
 
+	//! Whether `expr` reads a window function metric (directly, through another metric or through a select alias)
+	bool ReadsWindowMetric(const ParsedExpression &expr) {
+		if (expr.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+			auto &colref = expr.Cast<ColumnRefExpression>();
+			if (!colref.IsQualified() && !HasInputName(colref.GetColumnName().GetIdentifierName())) {
+				auto alias = OutputAlias(expr);
+				if (alias.IsValid()) {
+					return ReadsWindowMetric(*select[alias.GetIndex()].expr);
+				}
+			}
+			auto ref = NameRef(expr);
+			return ref.Is(SemanticRefKind::MEMBER) && MetricHasWindow(ref.index);
+		}
+		bool found = false;
+		ParsedExpressionIterator::EnumerateChildren(
+		    expr, [&](const ParsedExpression &child) { found = found || ReadsWindowMetric(child); });
+		return found;
+	}
+
+	bool MetricHasWindow(idx_t member) const {
+		auto &entry = model.members[member];
+		if (entry.Kind() != SemanticMemberKind::METRIC) {
+			return false;
+		}
+		std::function<bool(const ParsedExpression &)> visit = [&](const ParsedExpression &node) {
+			if (node.GetExpressionClass() == ExpressionClass::WINDOW) {
+				return true;
+			}
+			auto ref = SemanticMarkers::Classify(node);
+			if (ref.Is(SemanticRefKind::MEMBER)) {
+				return ref.index != member && MetricHasWindow(ref.index);
+			}
+			bool found = false;
+			ParsedExpressionIterator::EnumerateChildren(
+			    node, [&](const ParsedExpression &child) { found = found || visit(child); });
+			return found;
+		};
+		return visit(*entry.resolved);
+	}
+
+	//! Whether the outer query evaluates window functions
+	static bool HasOuterWindow(const SelectNode &node, const vector<unique_ptr<ParsedExpression> *> &orders) {
+		for (auto &expr : node.select_list) {
+			if (SemanticAnalyzer::ContainsWindow(*expr)) {
+				return true;
+			}
+		}
+		for (auto order : orders) {
+			if (SemanticAnalyzer::ContainsWindow(**order)) {
+				return true;
+			}
+		}
+		return node.qualify && SemanticAnalyzer::ContainsWindow(*node.qualify);
+	}
+
 	//! USING SAMPLE samples the rows of the semantic query, which are the input rows only when it neither aggregates
 	//! nor filters them
 	void CheckSample(const SelectNode &node, bool aggregated) const {
@@ -166,6 +237,10 @@ private:
 			item.expr->SetAlias(expr->GetAlias());
 			item.alias = expr->GetAlias().GetIdentifierName();
 			item.text = expr->ToString();
+			if (expr->GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+				// as DuckDB names it: its last name, "a.name" when quoted as such
+				item.column_name = expr->Cast<ColumnRefExpression>().GetColumnName().GetIdentifierName();
+			}
 			item.has_window = SemanticAnalyzer::ContainsWindow(*item.expr);
 			item.has_aggregate = ContainsAggregate(*item.expr);
 			item.correlated = HasOuterReferences(*item.expr);
@@ -200,6 +275,7 @@ private:
 			for (auto &item : select) {
 				if (!item.has_window && !ContainsAggregate(*item.expr)) {
 					groups.push_back(WithoutAlias(*item.expr));
+					CheckNoOuterReferences(*groups.back(), "GROUP BY");
 				}
 			}
 			return;
@@ -291,6 +367,26 @@ private:
 		return StringUtil::CIEquals(qualifier, (ref.alias.empty() ? ref.Table() : ref.alias).GetIdentifierName());
 	}
 
+	//! The number of leading names qualifying a column with the view: `sales`, `main.sales` or `db.main.sales` (the
+	//! latter two only when the view is not aliased, as in DuckDB)
+	idx_t ViewQualifiers(const vector<string> &names) const {
+		if (names.size() >= 2 && IsViewQualifier(names[0])) {
+			return 1;
+		}
+		if (!ref.alias.empty() || model.FindTable(names[0]).IsValid()) {
+			return 0;
+		}
+		auto &name = model.Name();
+		if (names.size() >= 3 && IsViewQualifier(names[1]) && StringUtil::CIEquals(names[0], name.schema)) {
+			return 2;
+		}
+		if (names.size() >= 4 && IsViewQualifier(names[2]) && StringUtil::CIEquals(names[0], name.catalog) &&
+		    StringUtil::CIEquals(names[1], name.schema)) {
+			return 3;
+		}
+		return 0;
+	}
+
 	//! Strips qualifiers naming the semantic view itself and splits quoted "entity.name" identifiers
 	unique_ptr<ParsedExpression> Normalize(const ParsedExpression &expr) {
 		auto result = expr.Copy();
@@ -298,10 +394,9 @@ private:
 			if (node->GetExpressionClass() == ExpressionClass::COLUMN_REF) {
 				auto &colref = node->Cast<ColumnRefExpression>();
 				auto names = IdentifiersToStrings(colref.ColumnNames());
-				auto view_qualified = names.size() >= 2 && IsViewQualifier(names[0]);
-				if (view_qualified) {
-					names.erase(names.begin());
-				}
+				auto qualifiers = ViewQualifiers(names);
+				auto view_qualified = qualifiers > 0;
+				names.erase(names.begin(), names.begin() + NumericCast<int64_t>(qualifiers));
 				if (names.size() == 1 && StringUtil::Contains(names[0], ".")) {
 					auto dot = names[0].find('.');
 					auto table = names[0].substr(0, dot);
@@ -345,7 +440,7 @@ private:
 
 	//! The semantic query evaluates WHERE and GROUP BY, where the view's columns are not visible to subqueries
 	void CheckNoOuterReferences(const ParsedExpression &expr, const string &clause) {
-		if (HasOuterReferences(expr)) {
+		if (HasOuterReferences(expr) || ReadsAlias(expr, &SelectItem::correlated)) {
 			throw BinderException("Subqueries in %s cannot reference semantic view \"%s\" when querying it by name",
 			                      clause, model.Name().name);
 		}
@@ -574,16 +669,10 @@ private:
 		return expr.Copy();
 	}
 
+	//! Whether `name` is a column of the view (a member): it takes precedence over select aliases. Physical columns
+	//! of the logical tables are not columns of the view.
 	bool HasInputName(const string &name) const {
-		if (!model.FindMembersByName(name).empty()) {
-			return true;
-		}
-		for (auto &table : model.tables) {
-			if (table.columns.count(name)) {
-				return true;
-			}
-		}
-		return false;
+		return !model.FindMembersByName(name).empty();
 	}
 
 	//! The (last) select item among the first `count` that `expr` names by its alias
@@ -684,10 +773,9 @@ private:
 		if (expr.GetExpressionType() == ExpressionType::GROUPING_FUNCTION) {
 			return Grouping(expr.Cast<OperatorExpression>());
 		}
-		for (idx_t g = 0; g < groups.size(); g++) {
-			if (groups[g]->Equals(expr)) {
-				return make_uniq<ColumnRefExpression>(Identifier(GroupColumn(g)));
-			}
+		auto group = FindGroup(expr);
+		if (group.IsValid()) {
+			return make_uniq<ColumnRefExpression>(Identifier(GroupColumn(group.GetIndex())));
 		}
 		if (IsAggregateCall(expr)) {
 			return make_uniq<ColumnRefExpression>(Identifier(MetricFor(expr)));
@@ -782,6 +870,9 @@ private:
 		if (!item.alias.empty()) {
 			return item.alias;
 		}
+		if (!item.column_name.empty()) {
+			return item.column_name;
+		}
 		if (item.expr->GetExpressionClass() == ExpressionClass::COLUMN_REF) {
 			return item.expr->Cast<ColumnRefExpression>().GetColumnName().GetIdentifierName();
 		}
@@ -804,6 +895,72 @@ private:
 	ParsedSemanticQuery query;
 };
 
+//! SEMANTIC_VIEW(...) as written (the parser lowers it to a table function with an encoded argument)
+string SemanticQueryText(const ParsedSemanticQuery &query) {
+	auto &view = query.view;
+	string result = "SEMANTIC_VIEW(";
+	for (auto *part : {&view.catalog, &view.schema}) {
+		if (!part->empty()) {
+			result += SQLIdentifier::ToString(*part) + ".";
+		}
+	}
+	result += SQLIdentifier::ToString(view.name);
+	for (auto kind : {SemanticMemberKind::DIMENSION, SemanticMemberKind::METRIC, SemanticMemberKind::FACT}) {
+		string clause;
+		for (auto &item : query.items) {
+			if (item.kind != kind) {
+				continue;
+			}
+			clause += clause.empty() ? " " + SemanticMemberKindToString(kind) + "S " : ", ";
+			clause += item.expression ? item.expression->ToString() : item.star_table + ".*";
+			if (!item.alias.empty()) {
+				clause += " AS " + SQLIdentifier::ToString(item.alias);
+			}
+		}
+		result += clause;
+	}
+	if (query.where) {
+		result += " WHERE " + query.where->ToString();
+	}
+	return result + ")";
+}
+
+//! The SEMANTIC_VIEW(...) calls of an expression's subqueries, as lowered and as written
+class SemanticQueryTextCollector : public SemanticStatementVisitor {
+public:
+	vector<pair<string, string>> replacements;
+
+	void Collect(unique_ptr<ParsedExpression> &expr) {
+		VisitExpression(expr);
+	}
+
+protected:
+	void VisitTableRef(unique_ptr<TableRef> &ref, bool) override {
+		if (ref->type != TableReferenceType::TABLE_FUNCTION) {
+			return;
+		}
+		auto &function = ref->Cast<TableFunctionRef>().function->Cast<FunctionExpression>();
+		if (!StringUtil::CIEquals(function.FunctionName().GetIdentifierName(), SEMANTIC_VIEW_QUERY_FUNCTION) ||
+		    function.GetArguments().size() != 1 ||
+		    function.GetArguments()[0].GetExpression().GetExpressionClass() != ExpressionClass::CONSTANT) {
+			return;
+		}
+		auto query =
+		    SemanticLowering::Decode<ParsedSemanticQuery>(ConstantValue(function.GetArguments()[0].GetExpression()));
+		replacements.emplace_back(function.ToString(), SemanticQueryText(*query));
+	}
+};
+
+bool ContainsSubquery(const ParsedExpression &expr) {
+	if (expr.GetExpressionClass() == ExpressionClass::SUBQUERY) {
+		return true;
+	}
+	bool found = false;
+	ParsedExpressionIterator::EnumerateChildren(
+	    expr, [&](const ParsedExpression &child) { found = found || ContainsSubquery(child); });
+	return found;
+}
+
 //! Rewrites the query nodes that read from a semantic view by name
 class SemanticReferenceRewriter : public SemanticStatementVisitor {
 public:
@@ -814,6 +971,9 @@ public:
 
 protected:
 	void VisitTableRef(unique_ptr<TableRef> &ref, bool in_join) override {
+		if (ref->type == TableReferenceType::TABLE_FUNCTION) {
+			VisitSemanticQuery(ref->Cast<TableFunctionRef>());
+		}
 		if (in_join && ref->type == TableReferenceType::BASE_TABLE && SemanticViewFor(ref->Cast<BaseTableRef>())) {
 			throw BinderException("Semantic view \"%s\" cannot be joined in the FROM "
 			                      "clause; use SEMANTIC_VIEW(...) "
@@ -841,6 +1001,25 @@ protected:
 		return true;
 	}
 
+	//! Before its subqueries are rewritten, names an unaliased select item reading a subquery as written, as DuckDB
+	//! would
+	void EnterSelect(SelectNode &select) override {
+		for (auto &expr : select.select_list) {
+			if (!expr->GetAlias().empty() || expr->GetExpressionClass() == ExpressionClass::COLUMN_REF ||
+			    !ContainsSubquery(*expr)) {
+				continue;
+			}
+			auto name = expr->ToString();
+			auto copy = expr->Copy();
+			SemanticQueryTextCollector collector;
+			collector.Collect(copy);
+			for (auto &replacement : collector.replacements) {
+				name = StringUtil::Replace(name, replacement.first, replacement.second);
+			}
+			expr->SetAlias(Identifier(name));
+		}
+	}
+
 	void VisitSelect(SelectNode &select) override {
 		if (!select.from_table || select.from_table->type != TableReferenceType::BASE_TABLE) {
 			return;
@@ -854,6 +1033,33 @@ protected:
 	}
 
 private:
+	//! SEMANTIC_VIEW(...), lowered by the parser: rewrites the queries by name in its expressions (subqueries of its
+	//! WHERE clause)
+	void VisitSemanticQuery(TableFunctionRef &function_ref) {
+		auto &function = function_ref.function->Cast<FunctionExpression>();
+		if (!StringUtil::CIEquals(function.FunctionName().GetIdentifierName(), SEMANTIC_VIEW_QUERY_FUNCTION) ||
+		    function.GetArguments().size() != 1 ||
+		    function.GetArguments()[0].GetExpression().GetExpressionClass() != ExpressionClass::CONSTANT) {
+			return;
+		}
+		auto &blob = function.GetArgumentsMutable()[0].GetExpressionMutable();
+		auto query = SemanticLowering::Decode<ParsedSemanticQuery>(ConstantValue(*blob));
+		auto was_rewritten = rewritten;
+		rewritten = false;
+		if (query->where) {
+			VisitExpression(query->where);
+		}
+		for (auto &item : query->items) {
+			if (item.expression) {
+				VisitExpression(item.expression);
+			}
+		}
+		if (rewritten) {
+			blob = ConstantExpression::FromValue(SemanticLowering::Encode(*query));
+		}
+		rewritten = rewritten || was_rewritten;
+	}
+
 	shared_ptr<SemanticModel> SemanticViewFor(const BaseTableRef &ref) {
 		auto &qualified_name = ref.GetQualifiedName();
 		if (qualified_name.Path().size() > 3) {

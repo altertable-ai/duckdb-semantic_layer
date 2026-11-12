@@ -18,6 +18,7 @@
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/expression/lambda_expression.hpp"
 #include "duckdb/parser/expression/subquery_expression.hpp"
+#include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
@@ -67,6 +68,17 @@ inline unique_ptr<ParsedExpression> AndAll(vector<unique_ptr<ParsedExpression>> 
 	return result;
 }
 
+//! Disjunction of `conditions`; nullptr when empty
+inline unique_ptr<ParsedExpression> OrAll(vector<unique_ptr<ParsedExpression>> conditions) {
+	unique_ptr<ParsedExpression> result;
+	for (auto &condition : conditions) {
+		result = result ? make_uniq<ConjunctionExpression>(ExpressionType::CONJUNCTION_OR, std::move(result),
+		                                                   std::move(condition))
+		                : std::move(condition);
+	}
+	return result;
+}
+
 //! Top-level AND conjuncts of `expr` (pointers into it)
 inline void SplitConjuncts(const ParsedExpression &expr, vector<const ParsedExpression *> &conjuncts) {
 	if (expr.GetExpressionType() == ExpressionType::CONJUNCTION_AND) {
@@ -105,6 +117,18 @@ inline void GroupByAll(SelectNode &node) {
 		set.insert(ProjectionIndex(i));
 	}
 	node.groups.grouping_sets.push_back(std::move(set));
+}
+
+//! Whether `expr` reads the rows it is evaluated over (a column or a subquery), as opposed to a constant
+inline bool ReadsRows(const ParsedExpression &expr) {
+	if (expr.GetExpressionClass() == ExpressionClass::COLUMN_REF ||
+	    expr.GetExpressionClass() == ExpressionClass::SUBQUERY) {
+		return true;
+	}
+	bool found = false;
+	ParsedExpressionIterator::EnumerateChildren(
+	    expr, [&](const ParsedExpression &child) { found = found || ReadsRows(child); });
+	return found;
 }
 
 //! `expr` as SQL, for messages: COUNT(*) as written rather than as the parser's count_star()

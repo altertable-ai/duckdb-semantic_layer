@@ -57,7 +57,9 @@ public:
 	//! Reference to `column` of `table`. Tables reached through a range relationship are read with a correlated
 	//! scalar subquery: DuckDB decorrelates it on the distinct values of the referencing column, so the lookup is a
 	//! small join of those values with the range table instead of a range join over every row.
-	unique_ptr<ParsedExpression> ColumnReference(idx_t table, const string &column);
+	//! A column of the time spine read by a row-level expression of `reader` is the day of `reader`'s own TIME.
+	unique_ptr<ParsedExpression> ColumnReference(idx_t table, const string &column,
+	                                             idx_t reader = DConstants::INVALID_INDEX);
 	unique_ptr<TableRef> BuildFrom() const;
 
 	optional_ptr<SemanticBlockDependencies> Dependencies() const {
@@ -82,7 +84,7 @@ private:
 	bool BelongsToOuter(idx_t table) const;
 	//! metric_time.day: the TIME column of the table whose relationship enters the spine (joined like any of its
 	//! columns), cast to DATE. The spine itself is never joined.
-	unique_ptr<ParsedExpression> TimeColumn(idx_t spine);
+	unique_ptr<ParsedExpression> TimeColumn(idx_t spine, idx_t reader);
 	unique_ptr<ParsedExpression> RangeLookup(const vector<SemanticEdge> &path, idx_t range_at, idx_t table,
 	                                         const string &column);
 

@@ -110,8 +110,9 @@ optional_idx SemanticModel::FinestTable(const set<idx_t> &tables) const {
 	return optional_idx();
 }
 
-vector<vector<SemanticEdge>> SemanticModel::FindPaths(idx_t from, idx_t to,
-                                                      const std::function<bool(const SemanticEdge &)> &allowed) const {
+vector<vector<SemanticEdge>>
+SemanticModel::FindPaths(idx_t from, idx_t to, const std::function<bool(const SemanticEdge &)> &allowed,
+                         const std::function<bool(const vector<SemanticEdge> &)> &accept) const {
 	vector<vector<SemanticEdge>> found;
 	vector<SemanticEdge> path;
 	vector<bool> visited(tables.size(), false);
@@ -120,7 +121,9 @@ vector<vector<SemanticEdge>> SemanticModel::FindPaths(idx_t from, idx_t to,
 			return;
 		}
 		if (node == to) {
-			found.push_back(path);
+			if (!accept || accept(path)) {
+				found.push_back(path);
+			}
 			return;
 		}
 		visited[node] = true;
@@ -162,6 +165,22 @@ SemanticPathResult SemanticModel::TryPath(idx_t from, idx_t to, const vector<idx
 	auto found = FindPaths(from, to, allowed);
 	if (found.empty()) {
 		return SemanticPathResult::EXCLUDED_BY_USING;
+	}
+	if (found.size() > 1 && !using_relationships.empty()) {
+		// the paths through a USING relationship: USING (fa) picks the TIME reached through fa
+		auto through_using = FindPaths(from, to, allowed, [&](const vector<SemanticEdge> &path) {
+			for (auto &edge : path) {
+				for (auto rel : using_relationships) {
+					if (edge.relationship == rel) {
+						return true;
+					}
+				}
+			}
+			return false;
+		});
+		if (through_using.size() == 1) {
+			found = std::move(through_using);
+		}
 	}
 	if (found.size() > 1) {
 		// Default relationships (TIME) settle it: the table's own wins, then the only path entering `to` through one
@@ -242,16 +261,14 @@ SemanticRef SemanticModel::Lookup(const vector<string> &names, const SemanticRes
 			if (member.IsValid() && member.GetIndex() != context.self_member) {
 				return member_ref(member.GetIndex());
 			}
-			// A self-named definition refers to its own physical column, even when another table defines
-			// a member of the same name (e.g. a.value AS value, b.value AS value).
-			if (member.IsValid() && member.GetIndex() == context.self_member) {
-				auto entry = tables[context.owner_table].columns.find(name);
-				if (entry != tables[context.owner_table].columns.end()) {
-					return column_ref(context.owner_table, entry->second);
-				}
+			// 2. a physical column of the owning table, even when another table defines a member of the same name
+			// (a self-named definition such as a.value AS value, or o.total AS SUM(amount) next to c.amount)
+			auto entry = tables[context.owner_table].columns.find(name);
+			if (entry != tables[context.owner_table].columns.end()) {
+				return column_ref(context.owner_table, entry->second);
 			}
 		}
-		// 2. a unique member name in the view
+		// 3. a unique member name in the view
 		vector<idx_t> candidates;
 		for (auto member : FindMembersByName(name)) {
 			if (member != context.self_member) {
@@ -264,7 +281,7 @@ SemanticRef SemanticModel::Lookup(const vector<string> &names, const SemanticRes
 		if (candidates.size() == 1) {
 			return member_ref(candidates[0]);
 		}
-		// 3. a column of the owning table, or (view-level expressions) of exactly one logical table
+		// 4. (view-level expressions) a column of exactly one logical table
 		for (idx_t t = 0; t < tables.size(); t++) {
 			if (context.owner_table != DConstants::INVALID_INDEX && t != context.owner_table) {
 				continue;
@@ -287,7 +304,13 @@ SemanticRef SemanticModel::Lookup(const vector<string> &names, const SemanticRes
 	if (names.size() == 2) {
 		auto table = FindTable(names[0]);
 		if (!table.IsValid()) {
-			return fail(StringUtil::Format("Unknown logical table \"%s\" in \"%s.%s\"", names[0], names[0], names[1]));
+			auto message =
+			    StringUtil::Format("Unknown logical table \"%s\" in \"%s.%s\"", names[0], names[0], names[1]);
+			if (context.in_query) {
+				message += " (a semantic query cannot reference the outer query: correlated subqueries over a "
+				           "semantic view are not supported)";
+			}
+			return fail(message);
 		}
 		auto member = FindMember(table.GetIndex(), names[1]);
 		if (member.IsValid() && member.GetIndex() != context.self_member) {
@@ -303,10 +326,52 @@ SemanticRef SemanticModel::Lookup(const vector<string> &names, const SemanticRes
 	    StringUtil::Format("Unsupported reference \"%s\": use <logical table>.<name>", StringUtil::Join(names, ".")));
 }
 
+//! DuckDB's keyword functions written without parentheses (Binder::GetSQLValueFunction)
+static string SQLValueFunctionName(const string &name) {
+	static const case_insensitive_map_t<string> FUNCTIONS = {{"current_catalog", "current_catalog"},
+	                                                         {"current_date", "current_date"},
+	                                                         {"current_schema", "current_schema"},
+	                                                         {"current_role", "current_role"},
+	                                                         {"current_time", "get_current_time"},
+	                                                         {"current_timestamp", "get_current_timestamp"},
+	                                                         {"current_user", "current_user"},
+	                                                         {"localtime", "current_localtime"},
+	                                                         {"localtimestamp", "current_localtimestamp"},
+	                                                         {"session_user", "session_user"},
+	                                                         {"user", "user"}};
+	auto entry = FUNCTIONS.find(name);
+	return entry == FUNCTIONS.end() ? string() : entry->second;
+}
+
 static unique_ptr<ParsedExpression> ResolveColumnRef(const SemanticModel &model, const ColumnRefExpression &colref,
                                                      const SemanticResolveContext &context) {
 	string error;
-	auto ref = model.Lookup(IdentifiersToStrings(colref.ColumnNames()), context, error);
+	auto names = IdentifiersToStrings(colref.ColumnNames());
+	auto ref = model.Lookup(names, context, error);
+	if (ref.Is(SemanticRefKind::NONE) && names.size() == 1) {
+		auto function = SQLValueFunctionName(names[0]);
+		if (!function.empty()) {
+			return make_uniq<FunctionExpression>(Identifier(function), vector<unique_ptr<ParsedExpression>>());
+		}
+	}
+	if (ref.Is(SemanticRefKind::NONE) && names.size() >= 2) {
+		// as in DuckDB, a name that is not a column may be a struct field of a shorter one (info.s, c.info.s)
+		for (idx_t length = names.size() - 1; length >= 1; length--) {
+			string prefix_error;
+			vector<string> prefix(names.begin(), names.begin() + NumericCast<int64_t>(length));
+			if (model.Lookup(prefix, context, prefix_error).Is(SemanticRefKind::NONE)) {
+				continue;
+			}
+			auto result = ResolveColumnRef(model, ColumnRefExpression(StringsToIdentifiers(prefix)), context);
+			for (idx_t field = length; field < names.size(); field++) {
+				vector<unique_ptr<ParsedExpression>> arguments;
+				arguments.push_back(std::move(result));
+				arguments.push_back(make_uniq<ConstantExpression>(Literal::String(names[field])));
+				result = make_uniq<FunctionExpression>(Identifier("struct_extract"), std::move(arguments));
+			}
+			return result;
+		}
+	}
 	switch (ref.kind) {
 	case SemanticRefKind::MEMBER:
 		if (!context.allow_private && model.members[ref.index].IsPrivate()) {

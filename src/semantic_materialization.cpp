@@ -331,10 +331,52 @@ SemanticMaterializationStatus GetMaterializationStatus(ClientContext &context, c
 static constexpr const char *MATERIALIZATION_ALIAS = "__sv_mat";
 
 //! `expr` computed from the materialization's dimension columns; nullptr when it reads anything else
+//! Whether row-level `expr` reads the time spine
+static bool ReadsTimeSpine(const SemanticModel &model, const ParsedExpression &expr) {
+	auto ref = SemanticMarkers::Classify(expr);
+	if (ref.Is(SemanticRefKind::COLUMN)) {
+		return model.IsTimeSpine(ref.index);
+	}
+	if (ref.Is(SemanticRefKind::MEMBER)) {
+		auto &member = model.members[ref.index];
+		return model.IsTimeSpine(member.table) || ReadsTimeSpine(model, *member.resolved);
+	}
+	bool found = false;
+	ParsedExpressionIterator::EnumerateChildren(
+	    expr, [&](const ParsedExpression &child) { found = found || ReadsTimeSpine(model, child); });
+	return found;
+}
+
+//! `expr` with its row-level members replaced by their definitions, so that a dimension computed from stored ones
+//! (o.yr AS YEAR(metric_time.day), metric_time.month) is recognized. A member of another table than `home` reading
+//! the time spine reads that table's TIME (SemanticJoinScope::TimeColumn): it stays a member.
+static unique_ptr<ParsedExpression> ExpandMembers(const SemanticModel &model, const ParsedExpression &expr,
+                                                  idx_t home) {
+	auto ref = SemanticMarkers::Classify(expr);
+	if (ref.Is(SemanticRefKind::MEMBER)) {
+		auto &member = model.members[ref.index];
+		if (!member.IsRowLevel() ||
+		    (!model.IsTimeSpine(member.table) && member.table != home && ReadsTimeSpine(model, *member.resolved))) {
+			return expr.Copy();
+		}
+		auto result = ExpandMembers(model, *member.resolved, home);
+		result->SetAlias(expr.GetAlias());
+		return result;
+	}
+	if (!ref.Is(SemanticRefKind::NONE) || expr.GetExpressionClass() == ExpressionClass::SUBQUERY) {
+		return expr.Copy();
+	}
+	auto result = expr.Copy();
+	ParsedExpressionIterator::EnumerateChildren(
+	    *result, [&](unique_ptr<ParsedExpression> &child) { child = ExpandMembers(model, *child, home); });
+	return result;
+}
+
+//! `expr` (with expanded members) over the stored dimensions (expanded), or null when it reads anything else
 static unique_ptr<ParsedExpression> RewriteOverDimensions(const ParsedExpression &expr,
-                                                          const SemanticMaterialization &materialization) {
-	for (idx_t d = 0; d < materialization.dimension_count; d++) {
-		if (expr.Equals(*materialization.spec.items[d].resolved)) {
+                                                          const vector<unique_ptr<ParsedExpression>> &stored) {
+	for (idx_t d = 0; d < stored.size(); d++) {
+		if (expr.Equals(*stored[d])) {
 			return ColumnRef(SemanticDimensionColumn(d), MATERIALIZATION_ALIAS);
 		}
 	}
@@ -348,7 +390,7 @@ static unique_ptr<ParsedExpression> RewriteOverDimensions(const ParsedExpression
 		if (failed) {
 			return;
 		}
-		auto rewritten = RewriteOverDimensions(*child, materialization);
+		auto rewritten = RewriteOverDimensions(*child, stored);
 		if (!rewritten) {
 			failed = true;
 			return;
@@ -418,10 +460,15 @@ unique_ptr<SemanticMaterializedRead> SemanticMaterializationMatcher::Find(
 			}
 			// the query's dimensions and filter must be computable from the stored dimensions
 			auto read = make_uniq<SemanticMaterializedRead>();
+			vector<unique_ptr<ParsedExpression>> stored_dimensions;
+			for (idx_t d = 0; d < materialization->dimension_count; d++) {
+				stored_dimensions.push_back(ExpandMembers(model, *materialization->spec.items[d].resolved, block.home));
+			}
 			set<idx_t> grouped;
 			bool computable = true;
 			for (auto *dimension : dimensions) {
-				auto rewritten = RewriteOverDimensions(*dimension, *materialization);
+				auto rewritten =
+				    RewriteOverDimensions(*ExpandMembers(model, *dimension, block.home), stored_dimensions);
 				if (!rewritten) {
 					computable = false;
 					break;
@@ -434,7 +481,7 @@ unique_ptr<SemanticMaterializedRead> SemanticMaterializationMatcher::Find(
 				read->dimensions.push_back(std::move(rewritten));
 			}
 			if (computable && where) {
-				read->where = RewriteOverDimensions(*where, *materialization);
+				read->where = RewriteOverDimensions(*ExpandMembers(model, *where, block.home), stored_dimensions);
 				computable = read->where != nullptr;
 			}
 			if (!computable) {

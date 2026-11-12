@@ -219,6 +219,8 @@ struct SemanticResolveContext {
 	idx_t self_member = DConstants::INVALID_INDEX;
 	//! Whether hidden (PRIVATE) members may be referenced
 	bool allow_private = true;
+	//! Whether the expression belongs to a semantic query (which cannot read the columns of an outer query)
+	bool in_query = false;
 	//! Prefix for error messages
 	string what;
 };
@@ -292,8 +294,10 @@ public:
 
 private:
 	//! Up to two simple paths from -> to through the edges `allowed` accepts
-	vector<vector<SemanticEdge>> FindPaths(idx_t from, idx_t to,
-	                                       const std::function<bool(const SemanticEdge &)> &allowed) const;
+	//! Up to two paths from `from` to `to` through `allowed` edges, among those `accept` accepts (all when null)
+	vector<vector<SemanticEdge>>
+	FindPaths(idx_t from, idx_t to, const std::function<bool(const SemanticEdge &)> &allowed,
+	          const std::function<bool(const vector<SemanticEdge> &)> &accept = nullptr) const;
 };
 
 //! Builds and validates a model from a parsed definition (catalog lookups through `context`)

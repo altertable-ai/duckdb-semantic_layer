@@ -421,6 +421,10 @@ private:
 		// the aggregates read their arguments, FILTERs and ORDER BYs from the rows, as __sv_x<n>
 		idx_t argument_count = 0;
 		auto extract = [&](unique_ptr<ParsedExpression> &argument) {
+			if (!ReadsRows(*argument)) {
+				// constant parameters (QUANTILE_CONT(x, 0.5), STRING_AGG(x, ',')) must stay constants
+				return;
+			}
 			auto name = "__sv_x" + to_string(argument_count++);
 			argument->SetAlias(Identifier(name));
 			rows.select_list.push_back(std::move(argument));
@@ -723,6 +727,7 @@ SemanticQuerySpec SemanticQueryCompiler::Resolve(const vector<ParsedSemanticQuer
 	BindQuery(spec);
 	SemanticResolveContext resolve_context;
 	resolve_context.allow_private = false;
+	resolve_context.in_query = true;
 	for (auto &item : items) {
 		if (!item.expression) {
 			auto table = model.FindTable(item.star_table);

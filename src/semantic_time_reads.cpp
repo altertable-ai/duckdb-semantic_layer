@@ -49,12 +49,16 @@ void CollectReads(const SemanticModel &model, SemanticAnalyzer &analyzer, const 
 }
 
 //! Whether `read` moves with column `column` of table `table` in a block over `home`: it is that column, or it reads
-//! neither that table (other than through the column) nor a table reached through it
+//! neither that table (other than through the column) nor a table reached through it. A column of `home` itself
+//! shifts its rows, whose other values (and those of the tables they reference) move with them.
 bool MovesWith(const SemanticModel &model, const Read &read, idx_t table, const string &column, idx_t home) {
-	if (read.table == table) {
-		return table == home || read.IsColumn(table, column);
+	if (table == home || read.table == home) {
+		return true;
 	}
-	return read.table == home || !model.Reaches(table, read.table);
+	if (read.table == table) {
+		return read.IsColumn(table, column);
+	}
+	return !model.Reaches(table, read.table);
 }
 
 } // namespace

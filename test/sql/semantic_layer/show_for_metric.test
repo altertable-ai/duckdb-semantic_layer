@@ -91,3 +91,29 @@ statement error
 SHOW SEMANTIC DIMENSIONS IN shop FOR METRIC nope;
 ----
 Unknown metric "nope"
+
+#===--------------------------------------------------------------------===#
+# Dimensions behind several relationship paths need USING
+#===--------------------------------------------------------------------===#
+
+statement ok
+CREATE TABLE airports (code VARCHAR, city VARCHAR);
+CREATE TABLE flights (id INTEGER, dep VARCHAR, arr VARCHAR);
+
+statement ok
+CREATE SEMANTIC VIEW flights_view
+  TABLES (airports PRIMARY KEY (code), flights PRIMARY KEY (id))
+  RELATIONSHIPS (departure AS flights (dep) REFERENCES airports, arrival AS flights (arr) REFERENCES airports)
+  DIMENSIONS (airports.city AS city, flights.dep_code AS dep)
+  METRICS (flights.n AS COUNT(*), flights.departures USING (departure) AS COUNT(*));
+
+query TT
+SELECT table_name, name FROM (SHOW SEMANTIC DIMENSIONS IN flights_view FOR METRIC flights.n) ORDER BY ALL;
+----
+flights	dep_code
+
+query TT
+SELECT table_name, name FROM (SHOW SEMANTIC DIMENSIONS IN flights_view FOR METRIC flights.departures) ORDER BY ALL;
+----
+airports	city
+flights	dep_code

@@ -264,14 +264,21 @@ table's primary key, or to its only unique key. Unnamed relationships get a gene
 
 - **Facts and dimensions** are row-level expressions of their table. They can use the table's columns and other
   facts and dimensions of the same table or of tables it references (many-to-one). They can also aggregate the rows of
-  a table that references them (`orders.line_count AS COUNT(lines.l_linenumber)` counts the lines of each order).
-- **Table metrics** (`<table>.<metric>`) aggregate the rows of their table: `SUM(lines.net_price)`, `COUNT(*)`.
+  a table that references them (`orders.line_count AS COUNT(lines.l_linenumber)` counts the lines of each order);
+  such an aggregation is NULL for a line without an order.
+- **Table metrics** (`<table>.<metric>`) aggregate the rows of their table: `SUM(lines.net_price)`, `COUNT(*)`. The
+  arguments of an aggregate choose the rows it aggregates; its `FILTER` and `ORDER BY` can read those rows and the
+  tables they reference, not finer ones.
   Aggregates may be nested to aggregate a finer table first (`customers.avg_orders AS AVG(SUM(orders.o_totalprice))`),
   and metrics may combine other metrics of the same or referenced tables.
 - **Derived metrics** (no table prefix) combine metrics of different tables:
   `revenue_per_customer AS lines.revenue / customers.customers`.
 - **`PRIVATE`** facts and metrics can be used in other definitions but not queried.
-- Names are referenced as `<table>.<name>`, or by bare name when it is unique in the view.
+- Names are referenced as `<table>.<name>`, or by bare name: a member of the expression's own table, then a column
+  of that table, then a name unique in the view (so `o.total AS SUM(amount)` reads `o`'s own `amount` even when another
+  table defines a member `amount`). DuckDB's keyword functions (`current_timestamp`, `current_schema`, ...) can be
+  used without parentheses, and struct fields as `<name>.<field>`.
+- Aggregate SQL macros (`CREATE MACRO total(x) AS sum(x)`) are aggregates: in metrics, and as ad-hoc metrics.
 
 ## Querying
 
@@ -324,9 +331,13 @@ In this form:
 - `WHERE` filters before aggregation, so it cannot contain metrics or aggregates; `HAVING` filters after. As in
   DuckDB, `HAVING` without `GROUP BY` aggregates the whole view into one row.
 - Without aggregation, the select list is evaluated as facts, row by row.
-- Names can be bare, qualified (`customers.segment`) or quoted as BI tools write them (`"customers.segment"`). As in
-  DuckDB, `WHERE` and the later select items can read select aliases (`SELECT AGG(m) AS r, r * 2`), and a view name
-  takes precedence over an alias. Lambda parameters (`lambda x: ...`) take precedence over both.
+- Names can be bare, qualified (`customers.segment`, `sales.segment`, `main.sales.segment`) or quoted as BI tools
+  write them (`"customers.segment"`, which also names the result column); every spelling of a name is the same group.
+  As in DuckDB, `WHERE` and the later select items can read select aliases (`SELECT AGG(m) AS r, r * 2`), and a view
+  name takes precedence over an alias (physical columns of the logical tables are not view names). Lambda parameters
+  (`lambda x: ...`) take precedence over both.
+- Queries by name can be used wherever a query can: subqueries and CTEs, `CREATE TABLE AS`, `INSERT`, `COPY`,
+  `PIVOT`, `UPDATE` / `DELETE` conditions, `SET VARIABLE`, table macros, and the `WHERE` of `SEMANTIC_VIEW(...)`.
 - Subqueries can read the view's columns, qualified by its name or alias, in the select list, `HAVING`, `QUALIFY`
   and `ORDER BY` (`SELECT ..., (SELECT ... WHERE t.segment = s.segment) FROM sales s`); in an aggregated query, those
   columns must be grouped. They cannot in `WHERE` and `GROUP BY`, which the semantic query evaluates.
@@ -352,8 +363,9 @@ QUALIFY rnk <= 3;
 ```
 
 Without aggregation, windows are evaluated over the fact rows. Those rows are at the grain of the finest table among
-all the facts the query reads (in the select list, `ORDER BY`, `QUALIFY`, and the windows' keys and arguments), so a
-window key on a finer fact changes the row count: `SELECT customers.segment FROM sales` returns one row per customer,
+all the facts the query reads (in the select list, `WHERE`, `ORDER BY`, `QUALIFY`, and the windows' keys and
+arguments), so a window key or filter on a finer fact changes the row count: `SELECT customers.segment FROM sales`
+returns one row per customer, `SELECT customers.segment FROM sales WHERE lines.net_price > 0` and
 `SELECT customers.segment, ROW_NUMBER() OVER (ORDER BY lines.net_price) FROM sales` one row per line, and
 `SELECT customers.segment, COUNT(*) OVER (PARTITION BY customers.segment) FROM sales` counts customers, not lines.
 
@@ -407,8 +419,8 @@ GROUP BY metric_time.month;
   `cumulative()` cannot wrap another transform or a metric that uses `OFFSET`, `CUMULATIVE` or `NON ADDITIVE BY`, and
   `period := 'average'` needs a metric computed from a single aggregate. A window function can wrap a transform but
   not appear inside its metric argument. Only unqualified calls are transforms (`main.time_shift(...)` is not).
-- **Arguments** are checked as in the DDL: `trailing_window` takes what `OVER` takes for the dimension's type (an
-  interval, or a number for a numeric column). `FILTER`, `DISTINCT` and `ORDER BY` go on the aggregate inside the call
+- **Arguments** are checked as in the DDL: `trailing_window` takes what `OVER` takes for the dimension's type (a
+  positive interval, or a positive number for a numeric column). `FILTER`, `DISTINCT` and `ORDER BY` go on the aggregate inside the call
   (`time_shift(SUM(x) FILTER (WHERE ...), ...)`, or a [metric filter](#metric-filters-filter):
   `time_shift(AGG(m) FILTER (WHERE ...), ...)`), not on the call itself.
 - Query-time transforms cannot be [materialized](#materializations); in a query that mixes them with plain metrics, the
@@ -554,14 +566,15 @@ Monday). Further dimensions, such as a fiscal quarter, can be defined on `metric
 cannot.
 
 `metric_time` is never joined or scanned. A query reads the time column of the table that owns it, joining only up to
-that table, so a line item inherits its invoice's time through an ordinary relationship. It is not a source for
+that table, so a line item inherits its invoice's time through an ordinary relationship. A dimension of a table defined
+from `metric_time` (`orders.order_day AS metric_time.day`) reads that table's own time, whatever the metric. It is not a source for
 freshness checks or incremental refresh, and a query that would read only the spine (no metric and no fact) is
 rejected: the spine has no rows of its own. Days with no facts are absent from ordinary aggregates.
 
 Each `TIME` is that table's default path to `metric_time`. Another date is an ordinary relationship
 (`shipped AS shipments (shipped_at) REFERENCES metric_time`), chosen with `USING (shipped)`; without `USING`, `TIME`
 wins. A table that reaches two different `TIME` columns and does not choose one is ambiguous, as any other
-relationship is. The name `metric_time` is reserved only in a view that uses `TIME`.
+relationship is: `USING` the relationship leading to one of them picks its `TIME`. The name `metric_time` is reserved only in a view that uses `TIME`.
 
 ### Time offsets (`OFFSET`)
 
@@ -580,8 +593,11 @@ every dimension computed from that column moves with it, so the offset works at 
 `metric_time.year`, ...), and a `WHERE` on time selects the previous period's rows. Only that column is shifted, so a
 query with an offset metric must have a dimension or `WHERE` condition computed from it, and cannot read other columns
 of a date table (a stored `d_year` would not move with the date: define `metric_time.year`, or `dates.year AS year(day)`,
-instead). The metric's own definition (its aggregates and filters) reads the stored values. Offsets of nested metrics
-add up. Offset metrics cannot be materialized (the other metrics of a query still read materializations) or referenced
+instead). A date column of the metric's own table shifts its rows, so the other columns of those rows, and of the
+tables they reference, can be read. The interval cannot be NULL, and a `DATE` only moves by whole days. The metric's
+own definition (its aggregates and filters) reads the stored values. Offsets of nested metrics are applied one after
+the other (innermost first): a month-end date moved twice by one month can land before the same date moved once by
+two months. Offset metrics cannot be materialized (the other metrics of a query still read materializations) or referenced
 by facts and dimensions.
 
 ### Cumulative metrics (`CUMULATIVE`)
@@ -598,7 +614,7 @@ METRICS (
 ```
 
 For a group dated *t* (the *anchor*), a cumulative metric aggregates the rows dated up to *t*: all of them, those of
-the last `OVER` interval (*t − interval < date ≤ t*), or those since the start of *t*'s `TO` period (`week`, `month`,
+the last `OVER` interval (*t − interval < date ≤ t*, a positive interval), or those since the start of *t*'s `TO` period (`week`, `month`,
 `quarter`, `year`, ...). It is computed from the rows themselves, so distinct counts are exact and days without data
 do not shorten a window. As with `OFFSET`, the dimension must be defined as a column (typically `metric_time.day`),
 dimensions and `WHERE` conditions computed from it read the anchor (`WHERE metric_time.day >= '2024-01-01'` selects
@@ -814,6 +830,10 @@ relationships are about 9x faster than a hand-written range join. See [docs/benc
 - `time_shift()` and `cumulative()` are extensions: they are not allowed in definitions, cannot be materialized, and
   a user function of the same name in the default schema may conflict with their catalog entries.
 - A DuckDB view cannot be defined over the query-by-name form; use `SEMANTIC_VIEW(...)` in view definitions.
+- Semantic queries cannot reference the columns of an outer query (correlated subqueries over a semantic view).
+- Member types are recorded when the view is created: after the type of a source column changes, the catalog
+  (`DESCRIBE`, `information_schema`) shows the old type until the view is re-created.
+- An unaliased select item containing a `SEMANTIC_VIEW(...)` subquery is named after its internal form; alias it.
 - The semantic view syntax is a grammar extension that `LOAD semantic_layer` turns on for every connection. A
   connection that was already open switches once its current (or, when the extension is loaded through an API rather
   than a `LOAD` statement, next) query ends, so `LOAD semantic_layer; SHOW SEMANTIC VIEWS;` sent as a single query

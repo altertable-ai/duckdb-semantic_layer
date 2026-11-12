@@ -3,6 +3,8 @@
 #include "semantic_ast_helpers.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/macro_catalog_entry.hpp"
+#include "duckdb/function/scalar_macro_function.hpp"
 #include "duckdb/catalog/entry_lookup_info.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
@@ -12,6 +14,7 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/parser/expression/window_expression.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
+#include "duckdb/parser/result_modifier.hpp"
 
 namespace duckdb {
 
@@ -37,7 +40,49 @@ bool SemanticAnalyzer::IsAggregate(const ParsedExpression &expr) {
 	    context, EntryLookupInfo(CatalogType::AGGREGATE_FUNCTION_ENTRY, function_name), OnEntryNotFound::RETURN_NULL);
 	bool is_aggregate = catalog_entry && catalog_entry->type == CatalogType::AGGREGATE_FUNCTION_ENTRY;
 	aggregate_cache[key] = is_aggregate;
+	if (!is_aggregate && IsAggregateMacro(expr)) {
+		aggregate_cache[key] = is_aggregate = true;
+	}
 	return is_aggregate;
+}
+
+bool SemanticAnalyzer::IsAggregateMacro(const ParsedExpression &expr) {
+	if (expr.GetExpressionClass() != ExpressionClass::FUNCTION || expr.Cast<FunctionExpression>().IsOperator()) {
+		return false;
+	}
+	auto &function_name = expr.Cast<FunctionExpression>().GetQualifiedName();
+	auto key = function_name.ToString();
+	auto cached = aggregate_macro_cache.find(key);
+	if (cached != aggregate_macro_cache.end()) {
+		return cached->second;
+	}
+	aggregate_macro_cache[key] = false;
+	auto entry = Catalog::GetEntry(context, EntryLookupInfo(CatalogType::MACRO_ENTRY, function_name),
+	                               OnEntryNotFound::RETURN_NULL);
+	bool result = false;
+	if (entry && entry->type == CatalogType::MACRO_ENTRY) {
+		// a scalar macro whose body aggregates, such as CREATE MACRO total(x) AS sum(x), is an aggregate
+		std::function<bool(const ParsedExpression &)> aggregates = [&](const ParsedExpression &node) {
+			if (IsAggregate(node)) {
+				return true;
+			}
+			if (node.GetExpressionClass() == ExpressionClass::WINDOW ||
+			    node.GetExpressionClass() == ExpressionClass::SUBQUERY) {
+				return false;
+			}
+			bool found = false;
+			ParsedExpressionIterator::EnumerateChildren(
+			    node, [&](const ParsedExpression &child) { found = found || aggregates(child); });
+			return found;
+		};
+		for (auto &macro : entry->Cast<MacroCatalogEntry>().macros) {
+			if (macro->type == MacroType::SCALAR_MACRO) {
+				result = result || aggregates(*macro->Cast<ScalarMacroFunction>().expression);
+			}
+		}
+	}
+	aggregate_macro_cache[key] = result;
+	return result;
 }
 
 bool SemanticAnalyzer::ContainsAggregateOrMetric(const ParsedExpression &expr) {
@@ -108,11 +153,33 @@ idx_t SemanticAnalyzer::FinestTable(const set<idx_t> &tables, const string &what
 }
 
 idx_t SemanticAnalyzer::AggregateHome(const FunctionExpression &aggregate, idx_t context_table, const string &what) {
+	// the arguments choose the rows aggregated; FILTER and ORDER BY read those rows (and the tables they reference)
 	set<idx_t> tables;
-	ParsedExpressionIterator::EnumerateChildren(
-	    aggregate, [&](const ParsedExpression &child) { RowTables(child, context_table, tables, what); });
+	for (auto &argument : aggregate.GetArguments()) {
+		RowTables(argument.GetExpression(), context_table, tables, what);
+	}
+	auto display = [&](const ParsedExpression &expr) {
+		return DisplayText(*SemanticDisplayExpression(model, expr));
+	};
+	vector<pair<string, set<idx_t>>> clauses;
+	if (aggregate.Filter()) {
+		clauses.emplace_back("FILTER (WHERE " + display(*aggregate.Filter()) + ")", set<idx_t>());
+		RowTables(*aggregate.Filter(), context_table, clauses.back().second, what);
+	}
+	if (aggregate.OrderBy()) {
+		for (auto &order : aggregate.OrderBy()->orders) {
+			clauses.emplace_back("ORDER BY " + display(*order.expression), set<idx_t>());
+			RowTables(*order.expression, context_table, clauses.back().second, what);
+		}
+	}
 	if (context_table != DConstants::INVALID_INDEX) {
 		tables.insert(context_table);
+	}
+	if (tables.empty()) {
+		// an ad-hoc COUNT(*) FILTER (WHERE ...) aggregates the rows its clauses read
+		for (auto &clause : clauses) {
+			tables.insert(clause.second.begin(), clause.second.end());
+		}
 	}
 	if (tables.empty()) {
 		throw SemanticDefinitionException(
@@ -120,7 +187,17 @@ idx_t SemanticAnalyzer::AggregateHome(const FunctionExpression &aggregate, idx_t
 		    "define it as a metric of a logical table instead",
 		    what, DisplayText(aggregate));
 	}
-	return FinestTable(tables, what);
+	auto home = FinestTable(tables, what);
+	for (auto &clause : clauses) {
+		for (auto table : clause.second) {
+			if (!model.Reaches(home, table)) {
+				throw SemanticDefinitionException(
+				    "%s: %s references logical table \"%s\", which is not reachable from \"%s\" (aggregated by %s)",
+				    what, clause.first, model.tables[table].name, model.tables[home].name, display(aggregate));
+			}
+		}
+	}
+	return home;
 }
 
 bool SemanticAnalyzer::ContainsWindow(const ParsedExpression &expr) {

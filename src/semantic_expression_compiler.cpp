@@ -4,9 +4,12 @@
 #include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/entry_lookup_info.hpp"
+#include "duckdb/parser/expression/case_expression.hpp"
+#include "duckdb/parser/expression/operator_expression.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "semantic_ast_helpers.hpp"
 #include "semantic_offsets.hpp"
+#include "semantic_transforms.hpp"
 
 namespace duckdb {
 
@@ -59,10 +62,15 @@ unique_ptr<ParsedExpression> SemanticExpressionCompiler::CompileRow(const Parsed
 	auto ref = SemanticMarkers::Classify(expr);
 	unique_ptr<ParsedExpression> result;
 	if (ref.Is(SemanticRefKind::COLUMN)) {
-		result = map.Column(ref.index, ref.column, scope.ColumnReference(ref.index, ref.column));
+		result = map.Column(ref.index, ref.column, scope.ColumnReference(ref.index, ref.column, context_table));
 	} else if (ref.Is(SemanticRefKind::MEMBER) && model.members[ref.index].IsRowLevel()) {
 		auto &member = model.members[ref.index];
-		result = CompileRow(*member.resolved, scope, member.table, what, map);
+		// a time spine dimension read by a row-level expression of another table is that table's time
+		auto table = member.table;
+		if (model.IsTimeSpine(table) && context_table != DConstants::INVALID_INDEX) {
+			table = context_table;
+		}
+		result = CompileRow(*member.resolved, scope, table, what, map);
 	} else if (ref.Is(SemanticRefKind::MEMBER)) {
 		// a metric in a row-level expression: aggregate the finer rows belonging to the current row
 		vector<SemanticAtom> atoms;
@@ -70,6 +78,7 @@ unique_ptr<ParsedExpression> SemanticExpressionCompiler::CompileRow(const Parsed
 		result = map.Opaque(
 		    ReplaceAtoms(*post, [&](idx_t atom) { return ChildAggregate(atoms[atom], context_table, scope, what); }));
 	} else if (analyzer.IsAggregate(expr)) {
+		CheckNoMetricArgument(expr.Cast<FunctionExpression>(), what);
 		SemanticAtom atom;
 		atom.home = analyzer.AggregateHome(expr.Cast<FunctionExpression>(), context_table, what);
 		atom.aggregate = expr.Copy();
@@ -87,9 +96,35 @@ unique_ptr<ParsedExpression> SemanticExpressionCompiler::CompileRow(const Parsed
 	return result;
 }
 
+//! A row-level aggregate (of finer rows) cannot aggregate a metric, which is already aggregated
+void SemanticExpressionCompiler::CheckNoMetricArgument(const FunctionExpression &aggregate, const string &what) {
+	std::function<void(const ParsedExpression &)> check = [&](const ParsedExpression &node) {
+		auto ref = SemanticMarkers::Classify(node);
+		if (ref.Is(SemanticRefKind::MEMBER) && model.members[ref.index].Kind() == SemanticMemberKind::METRIC) {
+			auto name = model.MemberDisplayName(ref.index);
+			throw SemanticDefinitionException(
+			    "%s: \"%s\" is a metric, which cannot be aggregated again in %s; aggregate the column instead "
+			    "(qualify it with its logical table if a member has its name)",
+			    what, name, DisplayText(*SemanticDisplayExpression(model, aggregate)));
+		}
+		if (node.GetExpressionClass() != ExpressionClass::SUBQUERY) {
+			ParsedExpressionIterator::EnumerateChildren(node, check);
+		}
+	};
+	for (auto &argument : aggregate.GetArguments()) {
+		check(argument.GetExpression());
+	}
+}
+
 //! An aggregate atom over the rows of `scope`'s base
 unique_ptr<ParsedExpression> SemanticExpressionCompiler::Aggregate(const SemanticAtom &atom, SemanticJoinScope &scope,
                                                                    const string &what) {
+	auto dependencies = scope.Dependencies();
+	if (dependencies && analyzer.IsAggregateMacro(*atom.aggregate)) {
+		// A user macro can be replaced without advancing any source table's snapshot.
+		dependencies->complete = false;
+		dependencies->Unsupported("a metric uses a replaceable SQL macro");
+	}
 	auto result = atom.aggregate->Copy();
 	ParsedExpressionIterator::EnumerateChildren(
 	    *result, [&](unique_ptr<ParsedExpression> &child) { child = Row(*child, scope, atom.home, what); });
@@ -122,9 +157,12 @@ unique_ptr<ParsedExpression> SemanticExpressionCompiler::ChildAggregate(const Se
 	auto inner_alias = inner.Ensure(source);
 	auto outer_alias = outer.Ensure(context);
 	vector<unique_ptr<ParsedExpression>> conditions;
+	vector<unique_ptr<ParsedExpression>> missing;
 	for (idx_t c = 0; c < inner_columns.size(); c++) {
 		conditions.push_back(Compare(ExpressionType::COMPARE_EQUAL, ColumnRef(inner_columns[c], inner_alias),
 		                             ColumnRef(outer_columns[c], outer_alias)));
+		missing.push_back(
+		    make_uniq<OperatorExpression>(ExpressionType::OPERATOR_IS_NULL, ColumnRef(outer_columns[c], outer_alias)));
 	}
 	node->where_clause = AndAll(std::move(conditions));
 	node->from_table = inner.BuildFrom();
@@ -145,7 +183,14 @@ unique_ptr<ParsedExpression> SemanticExpressionCompiler::ChildAggregate(const Se
 			}
 		}
 	}
-	return MakeScalarSubquery(std::move(node));
+	// a row without a `context` row (an orphan, through a LEFT JOIN) has no aggregation, rather than an empty one
+	auto result = make_uniq<CaseExpression>();
+	CaseCheck check;
+	check.when_expr = OrAll(std::move(missing));
+	check.then_expr = make_uniq<ConstantExpression>(Literal::Null());
+	result->CaseChecksMutable().push_back(std::move(check));
+	result->ElseMutable() = MakeScalarSubquery(std::move(node));
+	return std::move(result);
 }
 
 } // namespace duckdb

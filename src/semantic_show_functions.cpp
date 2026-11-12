@@ -152,9 +152,13 @@ static unique_ptr<FunctionData> ShowForMetricBind(ClientContext &context, TableF
 		}
 		bool valid = true;
 		for (auto &atom : atoms) {
+			// through one path (several, without USING, are ambiguous), or one many-to-many bridge
+			vector<SemanticEdge> path;
 			valid = valid &&
-			        (model->Reaches(atom.home, dimension.table) ||
-			         resolver.Candidates(atom.home, {dimension.table}, atom.context.using_relationships).size() == 1);
+			        (model->TryPath(atom.home, dimension.table, atom.context.using_relationships, path) ==
+			             SemanticPathResult::FOUND ||
+			         (!model->Reaches(atom.home, dimension.table) &&
+			          resolver.Candidates(atom.home, {dimension.table}, atom.context.using_relationships).size() == 1));
 		}
 		if (valid) {
 			result->rows.push_back({TableName(*model, dimension), Value(dimension.Name()), TypeName(dimension),

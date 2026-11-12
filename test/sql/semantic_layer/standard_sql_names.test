@@ -1,0 +1,199 @@
+# name: test/sql/semantic_layer/standard_sql_names.test
+# description: spellings of view columns in queries by name: bare, qualified, quoted, aliases named like columns
+# group: [semantic_layer]
+
+require semantic_layer
+
+statement ok
+PRAGMA enable_verification
+
+statement ok
+CREATE TABLE customers (id INTEGER, name VARCHAR, info STRUCT(s VARCHAR));
+INSERT INTO customers VALUES (1, 'Alice', {'s': 'x'}), (2, 'Bob', {'s': 'y'});
+CREATE TABLE orders (id INTEGER, customer_id INTEGER, amount DECIMAL(10, 2), status VARCHAR, day DATE);
+INSERT INTO orders VALUES (1, 1, 100, 'open', '2024-01-05'), (2, 1, 50, 'closed', '2024-02-05'),
+  (3, 2, 200, 'open', '2024-02-10');
+
+statement ok
+CREATE SEMANTIC VIEW shop
+  TABLES (c AS customers PRIMARY KEY (id), o AS orders PRIMARY KEY (id) TIME (day))
+  RELATIONSHIPS (o (customer_id) REFERENCES c)
+  DIMENSIONS (c.customer_name AS c.name, c.info AS info, o.status AS status)
+  METRICS (o.revenue AS SUM(amount));
+
+#===--------------------------------------------------------------------===#
+# A bare name and its qualified spelling are the same group
+#===--------------------------------------------------------------------===#
+
+query TR
+SELECT status, AGG(revenue) FROM shop GROUP BY o.status ORDER BY 1;
+----
+closed	50.00
+open	300.00
+
+query TR
+SELECT o.status, AGG(revenue) FROM shop GROUP BY status ORDER BY 1;
+----
+closed	50.00
+open	300.00
+
+query TR
+SELECT "o.status", AGG(revenue) FROM shop GROUP BY status ORDER BY 1;
+----
+closed	50.00
+open	300.00
+
+query TR
+SELECT o.status, AGG(revenue) FROM shop GROUP BY 1 ORDER BY status;
+----
+closed	50.00
+open	300.00
+
+query R
+SELECT AGG(revenue) FROM shop GROUP BY o.status HAVING status = 'open';
+----
+300.00
+
+query TR
+SELECT shop.status, AGG(revenue) FROM shop GROUP BY o.status HAVING upper(status) = 'OPEN';
+----
+open	300.00
+
+query TRR
+SELECT metric_time.month, AGG(revenue), LAG(AGG(revenue)) OVER (ORDER BY month) FROM shop GROUP BY 1 ORDER BY 1;
+----
+2024-01-01	100.00	NULL
+2024-02-01	250.00	100.00
+
+query TI
+SELECT metric_time.month, ROW_NUMBER() OVER (ORDER BY AGG(revenue)) AS rn FROM shop GROUP BY ALL QUALIFY month = DATE '2024-02-01';
+----
+2024-02-01	2
+
+query TT
+SELECT customer_name, upper(c.customer_name) FROM shop GROUP BY c.customer_name ORDER BY 1;
+----
+Alice	ALICE
+Bob	BOB
+
+query TI
+SELECT o.status, (SELECT count(*) FROM orders x WHERE x.status = shop.status) FROM shop GROUP BY o.status ORDER BY 1;
+----
+closed	1
+open	2
+
+#===--------------------------------------------------------------------===#
+# Select aliases named like a physical column (that is not a view column)
+#===--------------------------------------------------------------------===#
+
+query TR
+SELECT upper(customer_name) AS name, AGG(revenue) FROM shop GROUP BY name ORDER BY 1;
+----
+ALICE	150.00
+BOB	200.00
+
+query TR
+SELECT upper(customer_name) AS name, AGG(revenue) FROM shop GROUP BY 1 HAVING name <> 'BOB';
+----
+ALICE	150.00
+
+query TR
+SELECT upper(customer_name) AS amount, AGG(revenue) FROM shop GROUP BY 1 ORDER BY amount;
+----
+ALICE	150.00
+BOB	200.00
+
+#===--------------------------------------------------------------------===#
+# Catalog-qualified columns and struct fields
+#===--------------------------------------------------------------------===#
+
+query TR
+SELECT main.shop.status, AGG(revenue) FROM main.shop GROUP BY 1 ORDER BY 1;
+----
+closed	50.00
+open	300.00
+
+query TR
+SELECT info.s, AGG(revenue) FROM shop GROUP BY 1 ORDER BY 1;
+----
+x	150.00
+y	200.00
+
+query TR
+SELECT c.info.s, AGG(revenue) FROM shop GROUP BY 1 ORDER BY 1;
+----
+x	150.00
+y	200.00
+
+query T
+SELECT info.s FROM shop ORDER BY 1;
+----
+x
+y
+
+#===--------------------------------------------------------------------===#
+# Quoted qualified names keep their name in the result, as the catalog lists them
+#===--------------------------------------------------------------------===#
+
+statement ok
+CREATE TABLE na (id INTEGER, name VARCHAR);
+INSERT INTO na VALUES (1, 'A');
+CREATE TABLE nb (id INTEGER, name VARCHAR, a_id INTEGER);
+INSERT INTO nb VALUES (1, 'B', 1);
+
+statement ok
+CREATE SEMANTIC VIEW collide TABLES (a AS na PRIMARY KEY (id), b AS nb PRIMARY KEY (id))
+  RELATIONSHIPS (b (a_id) REFERENCES a)
+  DIMENSIONS (a.name AS name, b.name AS name) METRICS (b.n AS COUNT(*));
+
+query T
+SELECT column_name FROM information_schema.columns WHERE table_name = 'collide' ORDER BY ordinal_position;
+----
+a.name
+b.name
+n
+
+statement ok
+CREATE TABLE collide_result AS SELECT "a.name", "b.name", AGG(n) FROM collide GROUP BY ALL;
+
+query T
+SELECT column_name FROM information_schema.columns WHERE table_name = 'collide_result' ORDER BY ordinal_position;
+----
+a.name
+b.name
+agg(n)
+
+query TTI
+SELECT * FROM collide_result;
+----
+A	B	1
+
+#===--------------------------------------------------------------------===#
+# Row-level queries: the WHERE clause's facts are part of the row grain
+#===--------------------------------------------------------------------===#
+
+statement ok
+CREATE TABLE gc (id INTEGER, name VARCHAR);
+INSERT INTO gc VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Dan');
+CREATE TABLE go (id INTEGER, customer_id INTEGER, amount DECIMAL(10, 2));
+INSERT INTO go VALUES (1, 1, 100), (2, 1, 50), (3, 2, 200), (4, 99, 7);
+
+statement ok
+CREATE SEMANTIC VIEW grain TABLES (c AS gc PRIMARY KEY (id), o AS go PRIMARY KEY (id))
+  RELATIONSHIPS (o (customer_id) REFERENCES c) DIMENSIONS (c.customer_name AS c.name);
+
+query T
+SELECT customer_name FROM grain ORDER BY 1;
+----
+Alice
+Bob
+Dan
+
+# one row per order: the rows the WHERE clause reads (an order without a customer has no name)
+query T
+SELECT customer_name FROM grain WHERE amount > 0 ORDER BY 1;
+----
+Alice
+Alice
+Bob
+NULL

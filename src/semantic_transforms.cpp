@@ -16,6 +16,9 @@
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/tableref/emptytableref.hpp"
 #include "duckdb/planner/binder.hpp"
+#include "duckdb/planner/expression_binder/constant_binder.hpp"
+#include "duckdb/execution/expression_executor.hpp"
+#include "duckdb/common/types/interval.hpp"
 #include "semantic_analysis.hpp"
 #include "semantic_cumulative.hpp"
 #include "semantic_definition_exception.hpp"
@@ -175,6 +178,21 @@ static string BindError(ClientContext &context, unique_ptr<ParsedExpression> exp
 	return string();
 }
 
+//! The value of a constant expression (IsConstant)
+static Value EvaluateConstant(ClientContext &context, const ParsedExpression &expr) {
+	auto binder = Binder::CreateBinder(context);
+	ConstantBinder constant_binder(*binder, context, "semantic view");
+	auto copy = expr.Copy();
+	auto bound = constant_binder.Bind(copy);
+	return ExpressionExecutor::EvaluateScalar(context, *bound, true);
+}
+
+//! The first line of a binder error (without DuckDB's list of candidate functions)
+static string FirstLine(const string &error) {
+	auto newline = error.find('\n');
+	return newline == string::npos ? error : error.substr(0, newline);
+}
+
 static SemanticQueryForm QueryFormOfName(const QualifiedName &qualified_name, const string &name) {
 	if (qualified_name.Path().size() != 1) {
 		return SemanticQueryForm::NONE;
@@ -271,14 +289,47 @@ SemanticOffset SemanticMakeOffset(SemanticAnalyzer &analyzer, idx_t dimension, c
 	offset.type = table.column_types[table.columns.at(column.column)];
 	offset.interval = interval.Copy();
 	// binds SELECT CAST(CAST(NULL AS <type>) + <interval> AS <type>)
+	if (!offset.type.IsTemporal() && !offset.type.IsNumeric()) {
+		throw SemanticDefinitionException("%s: cannot shift column \"%s.%s\" (%s): OFFSET and time_shift() move a "
+		                                  "DATE, TIMESTAMP or numeric column",
+		                                  what, table.name, offset.column, offset.type.ToString());
+	}
 	auto error = BindError(
 	    analyzer.Context(),
 	    SemanticShiftColumn(make_uniq<CastExpression>(offset.type, ConstantExpression::FromValue(Value())), offset));
 	if (!error.empty()) {
 		throw SemanticDefinitionException("%s: cannot shift column \"%s.%s\" (%s) by %s: %s", what, table.name,
-		                                  offset.column, offset.type.ToString(), offset.interval->ToString(), error);
+		                                  offset.column, offset.type.ToString(), offset.interval->ToString(),
+		                                  FirstLine(error));
+	}
+	auto value = EvaluateConstant(analyzer.Context(), *offset.interval);
+	if (value.IsNull()) {
+		throw SemanticDefinitionException("%s: the interval cannot be NULL", what);
+	}
+	if (offset.type.id() == LogicalTypeId::DATE && value.type().id() == LogicalTypeId::INTERVAL &&
+	    value.GetValue<interval_t>().micros != 0) {
+		throw SemanticDefinitionException(
+		    "%s: column \"%s.%s\" is a DATE, which only moves by a whole number of days, not by %s", what, table.name,
+		    offset.column, value.ToString());
 	}
 	return offset;
+}
+
+//! A trailing window holds the rows of a positive interval (or number) before each anchor
+static void CheckWindowSize(SemanticAnalyzer &analyzer, const ParsedExpression &window, const string &what) {
+	auto value = EvaluateConstant(analyzer.Context(), window);
+	if (value.IsNull()) {
+		throw SemanticDefinitionException("%s: the window cannot be NULL", what);
+	}
+	bool positive;
+	if (value.type().id() == LogicalTypeId::INTERVAL) {
+		positive = Interval::GreaterThan(value.GetValue<interval_t>(), interval_t());
+	} else {
+		positive = value.DefaultCastAs(LogicalType::DOUBLE).GetValue<double>() > 0;
+	}
+	if (!positive) {
+		throw SemanticDefinitionException("%s: the window must be positive, not %s", what, value.ToString());
+	}
 }
 
 SemanticCumulative SemanticMakeCumulative(SemanticAnalyzer &analyzer, idx_t dimension, const ParsedExpression *window,
@@ -311,8 +362,12 @@ SemanticCumulative SemanticMakeCumulative(SemanticAnalyzer &analyzer, idx_t dime
 	};
 	auto error = BindError(analyzer.Context(), SemanticCumulativeWindow(cumulative, null(), null()));
 	if (error.empty()) {
+		if (cumulative.kind == SemanticCumulativeKind::WINDOW) {
+			CheckWindowSize(analyzer, *cumulative.window, what);
+		}
 		return cumulative;
 	}
+	error = FirstLine(error);
 	auto description = "column \"" + table.name + "." + cumulative.column + "\" (" + cumulative.type.ToString() + ")";
 	switch (cumulative.kind) {
 	case SemanticCumulativeKind::WINDOW:
