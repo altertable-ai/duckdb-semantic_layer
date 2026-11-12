@@ -112,7 +112,7 @@ optional_idx SemanticModel::FinestTable(const set<idx_t> &tables) const {
 
 vector<vector<SemanticEdge>>
 SemanticModel::FindPaths(idx_t from, idx_t to, const std::function<bool(const SemanticEdge &)> &allowed,
-                         const std::function<bool(const vector<SemanticEdge> &)> &accept) const {
+                         const std::function<bool(const vector<SemanticEdge> &)> &accept, bool skip_detours) const {
 	vector<vector<SemanticEdge>> found;
 	vector<SemanticEdge> path;
 	vector<bool> visited(tables.size(), false);
@@ -127,8 +127,22 @@ SemanticModel::FindPaths(idx_t from, idx_t to, const std::function<bool(const Se
 			return;
 		}
 		visited[node] = true;
+		// a detour reaches a table that an earlier table of the path (the visited ones) references directly
+		auto is_detour = [&](idx_t target) {
+			for (idx_t earlier = 0; earlier < tables.size(); earlier++) {
+				if (!visited[earlier] || earlier == node) {
+					continue;
+				}
+				for (auto &direct : edges[earlier]) {
+					if (direct.target == target && allowed(direct)) {
+						return true;
+					}
+				}
+			}
+			return false;
+		};
 		for (auto &edge : edges[node]) {
-			if (visited[edge.target] || !allowed(edge)) {
+			if (visited[edge.target] || !allowed(edge) || (skip_detours && is_detour(edge.target))) {
 				continue;
 			}
 			path.push_back(edge);
@@ -197,7 +211,11 @@ SemanticPathResult SemanticModel::TryPath(idx_t from, idx_t to, const vector<idx
 			return allowed(edge) && (edge.target != to || is_default(edge));
 		});
 		if (found.size() != 1) {
-			return SemanticPathResult::AMBIGUOUS;
+			// still ambiguous: a relationship that references the target directly wins over a detour
+			found = FindPaths(from, to, allowed, nullptr, true);
+			if (found.size() != 1) {
+				return SemanticPathResult::AMBIGUOUS;
+			}
 		}
 	}
 	result = std::move(found[0]);

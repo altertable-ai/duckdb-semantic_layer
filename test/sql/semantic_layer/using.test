@@ -78,3 +78,204 @@ statement error
 CREATE SEMANTIC VIEW bad TABLES (airports PRIMARY KEY (airport_code), flights PRIMARY KEY (flight_id)) RELATIONSHIPS (r1 AS flights (departure_airport) REFERENCES airports) METRICS (flights.m USING (nope) AS COUNT(*));
 ----
 Unknown relationship "nope"
+
+# without USING the shortest path wins when it is the only one of its length
+statement ok
+CREATE TABLE regions (region_id INTEGER, region_name VARCHAR);
+
+statement ok
+INSERT INTO regions VALUES (1, 'North'), (2, 'South');
+
+statement ok
+CREATE TABLE customers (customer_id INTEGER, customer_name VARCHAR, region_id INTEGER);
+
+statement ok
+INSERT INTO customers VALUES (1, 'Ann', 1), (2, 'Bob', 2);
+
+statement ok
+CREATE TABLE shipments (shipment_id INTEGER, recipient_id INTEGER);
+
+statement ok
+INSERT INTO shipments VALUES (1, 2), (2, 2), (3, 1);
+
+statement ok
+CREATE TABLE orders (order_id INTEGER, buyer_id INTEGER, shipment_id INTEGER, amount INTEGER);
+
+statement ok
+INSERT INTO orders VALUES (1, 1, 1, 10), (2, 1, 2, 20), (3, 2, 3, 40);
+
+statement ok
+CREATE SEMANTIC VIEW orders_sv
+  TABLES (
+    regions PRIMARY KEY (region_id),
+    customers PRIMARY KEY (customer_id),
+    shipments PRIMARY KEY (shipment_id),
+    orders PRIMARY KEY (order_id)
+  )
+  RELATIONSHIPS (
+    customer_region AS customers (region_id) REFERENCES regions,
+    shipment_recipient AS shipments (recipient_id) REFERENCES customers,
+    order_buyer AS orders (buyer_id) REFERENCES customers,
+    order_shipment AS orders (shipment_id) REFERENCES shipments
+  )
+  DIMENSIONS (
+    customers.customer AS customer_name,
+    regions.region AS region_name
+  )
+  METRICS (
+    orders.total AS SUM(amount),
+    orders.total_to_recipient USING (shipment_recipient) AS SUM(amount)
+  );
+
+# direct relationship (1 edge) over the detour through shipments (2 edges)
+query II
+SELECT * FROM SEMANTIC_VIEW(orders_sv DIMENSIONS customers.customer METRICS orders.total) ORDER BY 1;
+----
+Ann	30
+Bob	40
+
+# further target: 2 edges through the buyer over 3 edges through the recipient
+query II
+SELECT * FROM SEMANTIC_VIEW(orders_sv DIMENSIONS regions.region METRICS orders.total) ORDER BY 1;
+----
+North	30
+South	40
+
+# USING still selects the detour
+query II
+SELECT * FROM SEMANTIC_VIEW(orders_sv DIMENSIONS customers.customer METRICS orders.total_to_recipient) ORDER BY 1;
+----
+Ann	40
+Bob	30
+
+query II
+SELECT * FROM SEMANTIC_VIEW(orders_sv DIMENSIONS regions.region METRICS orders.total_to_recipient) ORDER BY 1;
+----
+North	40
+South	30
+
+# two unrelated routes of different lengths stay ambiguous: only a direct relationship beats a detour
+statement ok
+CREATE TABLE p_t (id INTEGER, label VARCHAR);
+
+statement ok
+CREATE TABLE p_x (id INTEGER, t_id INTEGER);
+
+statement ok
+CREATE TABLE p_c (id INTEGER, x_id INTEGER);
+
+statement ok
+CREATE TABLE p_s (id INTEGER, t_id INTEGER);
+
+statement ok
+CREATE TABLE p_o (id INTEGER, c_id INTEGER, s_id INTEGER);
+
+statement ok
+CREATE SEMANTIC VIEW routes_sv
+  TABLES (p_t PRIMARY KEY (id), p_x PRIMARY KEY (id), p_c PRIMARY KEY (id), p_s PRIMARY KEY (id), p_o PRIMARY KEY (id))
+  RELATIONSHIPS (
+    x_t AS p_x (t_id) REFERENCES p_t,
+    c_x AS p_c (x_id) REFERENCES p_x,
+    s_t AS p_s (t_id) REFERENCES p_t,
+    o_c AS p_o (c_id) REFERENCES p_c,
+    o_s AS p_o (s_id) REFERENCES p_s
+  )
+  DIMENSIONS (p_t.label AS label)
+  METRICS (p_o.n AS COUNT(*));
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(routes_sv DIMENSIONS p_t.label METRICS p_o.n);
+----
+multiple relationship paths
+
+# the direct relationship that makes a path a detour must itself be allowed by USING
+statement ok
+CREATE TABLE q_c (id INTEGER, name VARCHAR);
+
+statement ok
+INSERT INTO q_c VALUES (1, 'A'), (2, 'B');
+
+statement ok
+CREATE TABLE q_w (id INTEGER, c_id INTEGER);
+
+statement ok
+INSERT INTO q_w VALUES (1, 1), (2, 2);
+
+statement ok
+CREATE TABLE q_s (id INTEGER, w_id INTEGER);
+
+statement ok
+INSERT INTO q_s VALUES (1, 1), (2, 2);
+
+statement ok
+CREATE TABLE q_o (id INTEGER, c_id INTEGER, w_id INTEGER, s_id INTEGER, amount INTEGER);
+
+statement ok
+INSERT INTO q_o VALUES (1, 1, 2, 1, 10);
+
+statement ok
+CREATE SEMANTIC VIEW pinned_sv
+  TABLES (q_c PRIMARY KEY (id), q_w PRIMARY KEY (id), q_s PRIMARY KEY (id), q_o PRIMARY KEY (id))
+  RELATIONSHIPS (
+    w_c AS q_w (c_id) REFERENCES q_c,
+    s_w AS q_s (w_id) REFERENCES q_w,
+    o_c AS q_o (c_id) REFERENCES q_c,
+    o_w AS q_o (w_id) REFERENCES q_w,
+    o_s AS q_o (s_id) REFERENCES q_s
+  )
+  DIMENSIONS (q_c.customer AS name)
+  METRICS (q_o.total USING (w_c) AS SUM(amount));
+
+query II
+SELECT * FROM SEMANTIC_VIEW(pinned_sv DIMENSIONS q_c.customer METRICS q_o.total);
+----
+B	10
+
+# an intermediate table's direct relationship makes a longer route a detour (not only the starting table's)
+statement ok
+CREATE TABLE m_t (id INTEGER, label VARCHAR);
+INSERT INTO m_t VALUES (1, 'T1'), (2, 'T2');
+CREATE TABLE m_b (id INTEGER, t_id INTEGER);
+INSERT INTO m_b VALUES (1, 1), (2, 2);
+CREATE TABLE m_a (id INTEGER, t_id INTEGER, b_id INTEGER);
+INSERT INTO m_a VALUES (1, 1, 2);
+CREATE TABLE m_o (id INTEGER, a_id INTEGER, amount INTEGER);
+INSERT INTO m_o VALUES (1, 1, 10);
+
+statement ok
+CREATE SEMANTIC VIEW mid_sv
+  TABLES (m_t PRIMARY KEY (id), m_b PRIMARY KEY (id), m_a PRIMARY KEY (id), m_o PRIMARY KEY (id))
+  RELATIONSHIPS (
+    b_t AS m_b (t_id) REFERENCES m_t,
+    a_t AS m_a (t_id) REFERENCES m_t,
+    a_b AS m_a (b_id) REFERENCES m_b,
+    o_a AS m_o (a_id) REFERENCES m_a
+  )
+  DIMENSIONS (m_t.label AS label)
+  METRICS (m_o.total AS SUM(amount));
+
+query II
+SELECT * FROM SEMANTIC_VIEW(mid_sv DIMENSIONS m_t.label METRICS m_o.total);
+----
+T1	10
+
+# TIME defaults settle a query before the direct-over-detour rule: the default route wins although it is longer
+statement ok
+CREATE TABLE d_s (id INTEGER, ordered DATE, shipped DATE);
+INSERT INTO d_s VALUES (1, '2026-01-01', '2026-01-05');
+CREATE TABLE d_o (id INTEGER, s_id INTEGER, paid DATE, amount INTEGER);
+INSERT INTO d_o VALUES (1, 1, '2026-01-09', 7);
+
+statement ok
+CREATE SEMANTIC VIEW dflt_sv
+  TABLES (d_s PRIMARY KEY (id) TIME (ordered), d_o PRIMARY KEY (id))
+  RELATIONSHIPS (
+    d_o (s_id) REFERENCES d_s,
+    paid AS d_o (paid) REFERENCES metric_time
+  )
+  METRICS (d_o.total AS SUM(amount));
+
+query II
+SELECT * FROM SEMANTIC_VIEW(dflt_sv DIMENSIONS metric_time.day METRICS d_o.total);
+----
+2026-01-01	7

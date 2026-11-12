@@ -301,11 +301,11 @@ public:
 	static string KindDisplayName(SemanticMemberKind kind);
 
 private:
-	//! Up to two simple paths from -> to through the edges `allowed` accepts
-	//! Up to two paths from `from` to `to` through `allowed` edges, among those `accept` accepts (all when null)
+	//! Up to two paths through `allowed` edges that `accept` accepts (all when null), optionally without detours
 	vector<vector<SemanticEdge>>
 	FindPaths(idx_t from, idx_t to, const std::function<bool(const SemanticEdge &)> &allowed,
-	          const std::function<bool(const vector<SemanticEdge> &)> &accept = nullptr) const;
+	          const std::function<bool(const vector<SemanticEdge> &)> &accept = nullptr,
+	          bool skip_detours = false) const;
 };
 
 //! Builds and validates a model from a parsed definition (catalog lookups through `context`)

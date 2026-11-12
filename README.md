@@ -442,7 +442,8 @@ SELECT sql FROM semantic_view_sql('SELECT * FROM SEMANTIC_VIEW(sales DIMENSIONS 
 ### Role-playing relationships (`USING`)
 
 When several relationships connect the same tables (a flight's departure and arrival airports), `USING` on a metric
-chooses the path. Without it such queries are rejected as ambiguous.
+chooses the path. Without it, a relationship that references the table directly wins over a detour through other
+tables; anything else, such as the two airports here, is rejected as ambiguous.
 
 ```sql
 RELATIONSHIPS (
