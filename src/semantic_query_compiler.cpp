@@ -29,6 +29,22 @@
 
 namespace duckdb {
 
+//! Whether an aggregate argument is a constant (QUANTILE_CONT(x, 0.5), STRING_AGG(x, ',')) that must stay one. Like
+//! ParsedExpression::IsScalar, but a qualified call is not constant: `amount.scale()` calls scale(amount).
+static bool IsConstantArgument(const ParsedExpression &expr) {
+	if (!expr.IsScalar()) {
+		return false;
+	}
+	if (expr.GetExpressionClass() == ExpressionClass::FUNCTION &&
+	    expr.Cast<FunctionExpression>().GetQualifiedName().Path().size() > 1) {
+		return false;
+	}
+	bool constant = true;
+	ParsedExpressionIterator::EnumerateChildren(
+	    expr, [&](const ParsedExpression &child) { constant = constant && IsConstantArgument(child); });
+	return constant;
+}
+
 namespace {
 
 string DimensionColumn(idx_t index) {
@@ -421,7 +437,7 @@ private:
 		// the aggregates read their arguments, FILTERs and ORDER BYs from the rows, as __sv_x<n>
 		idx_t argument_count = 0;
 		auto extract = [&](unique_ptr<ParsedExpression> &argument) {
-			if (argument->IsScalar()) {
+			if (IsConstantArgument(*argument)) {
 				// constant parameters (QUANTILE_CONT(x, 0.5), STRING_AGG(x, ',')) must stay constants
 				return;
 			}

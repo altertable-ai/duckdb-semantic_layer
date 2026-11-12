@@ -61,6 +61,18 @@ SELECT QUANTILE_CONT(x, 0.5) FROM constants;
 ----
 3.0
 
+# a receiver-style call reads its receiver: amount.doubled_arg() is doubled_arg(amount), not a constant
+statement ok
+CREATE MACRO doubled_arg(x) AS x * 2;
+
+statement ok
+CREATE SEMANTIC VIEW receivers TABLES (t PRIMARY KEY (id)) METRICS (t.doubled AS SUM(x.doubled_arg()));
+
+query R
+SELECT * FROM SEMANTIC_VIEW(receivers METRICS t.doubled);
+----
+18.0
+
 # a constant argument is not a column of the rows: a non-constant one is still rejected by DuckDB
 statement error
 SELECT * FROM SEMANTIC_VIEW(constants METRICS QUANTILE_CONT(t.x, t.x) AS p);
