@@ -109,7 +109,19 @@ vector<SemanticBridge> SemanticBridgeResolver::Candidates(idx_t home, const set<
 			return pinned;
 		}
 	}
-	return candidates;
+	// A referencing fact table can omit pairs present in the bridge.
+	vector<SemanticBridge> preferred;
+	for (auto &candidate : candidates) {
+		bool has_coarser_bridge = false;
+		for (auto &other : candidates) {
+			has_coarser_bridge |=
+			    model.Reaches(candidate.bridge, other.bridge) && !model.Reaches(other.bridge, candidate.bridge);
+		}
+		if (!has_coarser_bridge) {
+			preferred.push_back(candidate);
+		}
+	}
+	return preferred;
 }
 
 BinderException SemanticBridgeResolver::AmbiguityError(idx_t home, const vector<idx_t> &far_tables,
@@ -191,15 +203,25 @@ idx_t SemanticBridgeResolver::CommonBase(const set<idx_t> &tables) const {
 			candidates.push_back(base);
 		}
 	}
-	if (candidates.empty()) {
+	vector<idx_t> preferred;
+	for (auto candidate : candidates) {
+		bool has_coarser_bridge = false;
+		for (auto other : candidates) {
+			has_coarser_bridge |= model.Reaches(candidate, other) && !model.Reaches(other, candidate);
+		}
+		if (!has_coarser_bridge) {
+			preferred.push_back(candidate);
+		}
+	}
+	if (preferred.empty()) {
 		return DConstants::INVALID_INDEX;
 	}
-	if (candidates.size() > 1) {
+	if (preferred.size() > 1) {
 		vector<idx_t> table_list(tables.begin(), tables.end());
 		throw SemanticDefinitionException("Ambiguous many-to-many path between %s: bridge tables %s both qualify",
-		                                  TableList(table_list), TableList(candidates));
+		                                  TableList(table_list), TableList(preferred));
 	}
-	return candidates[0];
+	return preferred[0];
 }
 
 } // namespace duckdb

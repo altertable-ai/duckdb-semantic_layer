@@ -441,8 +441,9 @@ SELECT sql FROM semantic_view_sql('SELECT * FROM SEMANTIC_VIEW(sales DIMENSIONS 
 
 ### Role-playing relationships (`USING`)
 
-When several relationships connect the same tables (a flight's departure and arrival airports), `USING` on a metric
-chooses the path. Without it such queries are rejected as ambiguous.
+Choose a metric's path with `USING`. Otherwise, `TIME` defaults take priority and direct relationships beat detours
+at any hop. Multiple remaining paths are rejected, including departure and arrival airports.
+Pin an intended detour with `USING`; adding a direct relationship can otherwise change the selected path.
 
 ```sql
 RELATIONSHIPS (
@@ -468,8 +469,8 @@ RELATIONSHIPS (book_authors (author_id) REFERENCES authors, book_authors (book_i
 with two French authors counts once for `FR`. Totals without bridged dimensions are unchanged. Any table with
 relationships to both sides acts as a bridge, fact tables included: `customers.customer_count` by
 `products.category` through `sales` counts the customers who bought in each category. A dimension stored on the
-bridge itself is still rejected. When several bridges connect the same tables, `USING (<relationship>)` on the metric
-picks one.
+bridge itself is still rejected. Prefer a bridge over finer tables that reference it. `USING (<relationship>)` on
+the metric selects a bridge explicitly; unrelated or equal-grain alternatives remain ambiguous.
 
 Rows without any bridge row (a book without authors) get NULL bridged dimensions. A `WHERE` condition on bridged
 tables keeps only the rows with a matching bridge row.
@@ -571,10 +572,11 @@ from `metric_time` (`orders.order_day AS metric_time.day`) reads that table's ow
 freshness checks or incremental refresh, and a query that would read only the spine (no metric and no fact) is
 rejected: the spine has no rows of its own. Days with no facts are absent from ordinary aggregates.
 
-Each `TIME` is that table's default path to `metric_time`. Another date is an ordinary relationship
-(`shipped AS shipments (shipped_at) REFERENCES metric_time`), chosen with `USING (shipped)`; without `USING`, `TIME`
-wins. A table that reaches two different `TIME` columns and does not choose one is ambiguous, as any other
-relationship is: `USING` the relationship leading to one of them picks its `TIME`. The name `metric_time` is reserved only in a view that uses `TIME`.
+`TIME` defines a table's default path to `metric_time`. To use another date, declare a relationship such as
+`shipped AS shipments (shipped_at) REFERENCES metric_time` and select it with `USING (shipped)`.
+Use `USING` on a relationship leading to a table to select its `TIME`.
+Without `USING`, default-time paths take priority. Direct paths beat detours; remaining ambiguity is rejected.
+`metric_time` is reserved only in views that declare `TIME`.
 
 ### Time offsets (`OFFSET`)
 
