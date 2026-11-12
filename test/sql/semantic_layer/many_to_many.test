@@ -211,6 +211,78 @@ SELECT p.category, COUNT(DISTINCT s.customer_id) FROM sales s JOIN products p US
 books	1
 toys	2
 
+# A fact table can reach both sides directly while also referencing their offer bridge.
+statement ok
+CREATE TABLE part (p_id INTEGER, brand VARCHAR);
+INSERT INTO part VALUES (1, 'A'), (2, 'B');
+CREATE TABLE supplier (s_id INTEGER, s_name VARCHAR);
+INSERT INTO supplier VALUES (1, 'Ann'), (2, 'Bob');
+CREATE TABLE partsupp (p_id INTEGER, s_id INTEGER);
+INSERT INTO partsupp VALUES (1, 1), (1, 2), (2, 2);
+CREATE TABLE lineitem (l_id INTEGER, p_id INTEGER, s_id INTEGER);
+INSERT INTO lineitem VALUES (1, 1, 1), (2, 1, 1);
+
+statement ok
+CREATE SEMANTIC VIEW tpch_paths
+  TABLES (part PRIMARY KEY (p_id), supplier PRIMARY KEY (s_id),
+          partsupp PRIMARY KEY (p_id, s_id), lineitem PRIMARY KEY (l_id))
+  RELATIONSHIPS (
+    partsupp (p_id) REFERENCES part,
+    partsupp (s_id) REFERENCES supplier,
+    lineitem (p_id) REFERENCES part,
+    lineitem_supplier AS lineitem (s_id) REFERENCES supplier,
+    lineitem (p_id, s_id) REFERENCES partsupp
+  )
+  DIMENSIONS (part.brand AS brand, supplier.s_name AS s_name)
+  METRICS (
+    supplier.supplier_count AS COUNT(*),
+    supplier.sold_count USING (lineitem_supplier) AS COUNT(*)
+  );
+
+# The offer bridge includes suppliers with no sales; the finer lineitem bridge must not hide it.
+query II
+SELECT * FROM SEMANTIC_VIEW(tpch_paths DIMENSIONS part.brand METRICS supplier.supplier_count) ORDER BY 1;
+----
+A	2
+B	1
+
+query II
+SELECT * FROM SEMANTIC_VIEW(tpch_paths DIMENSIONS part.brand, supplier.s_name) ORDER BY 1, 2;
+----
+A	Ann
+A	Bob
+B	Bob
+
+# An explicit bridge selection still wins, and repeated sales do not multiply suppliers.
+query II
+SELECT * FROM SEMANTIC_VIEW(tpch_paths DIMENSIONS part.brand METRICS supplier.sold_count) ORDER BY 1 NULLS LAST;
+----
+A	1
+NULL	1
+
+# One-to-one bridge copies have equal grain; neither should silently replace the other.
+statement ok
+CREATE SEMANTIC VIEW equivalent_offers
+  TABLES (part PRIMARY KEY (p_id), supplier PRIMARY KEY (s_id),
+          partsupp PRIMARY KEY (p_id, s_id), offers_copy AS partsupp PRIMARY KEY (p_id, s_id))
+  RELATIONSHIPS (
+    partsupp (p_id) REFERENCES part, partsupp (s_id) REFERENCES supplier,
+    offers_copy (p_id) REFERENCES part, offers_copy (s_id) REFERENCES supplier,
+    offers_copy (p_id, s_id) REFERENCES partsupp
+  )
+  DIMENSIONS (part.brand AS brand, supplier.s_name AS s_name)
+  METRICS (supplier.supplier_count AS COUNT(*));
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(equivalent_offers DIMENSIONS part.brand METRICS supplier.supplier_count);
+----
+Ambiguous many-to-many path
+
+statement error
+SELECT * FROM SEMANTIC_VIEW(equivalent_offers DIMENSIONS part.brand, supplier.s_name);
+----
+Ambiguous many-to-many path
+
 # several bridges between the same tables are ambiguous; USING on the metric picks one
 statement ok
 CREATE TABLE reviews (book_id INTEGER, author_id INTEGER);
