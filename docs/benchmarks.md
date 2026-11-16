@@ -48,6 +48,38 @@ python3 scripts/bench_semantic_layer.py --db /tmp/semantic_layer_bench.duckdb --
 
 The database is generated on the first run (about 3 GB on disk).
 
+## Basket analysis with SQL composition
+
+`scripts/bench_basket_analysis.py` compares two formulations of manufacturer-pair counts and lift, based on
+[MotleyAI B70](https://github.com/MotleyAI/semantic-layer-bench/blob/ded4b33/questions_blind/questions.yaml).
+Both read the same semantic view. The list formulation repeatedly scans lists of basket memberships; the CTE
+formulation groups each order/manufacturer once and joins those memberships. The model contains only the three
+tables and five members needed from the original definition.
+
+```bash
+python3 scripts/bench_basket_analysis.py --dir /tmp/basket_bench --runs 9
+./build/release/test/unittest test/sql/semantic_layer/basket_analysis.test
+```
+
+The benchmark generates TPC-H SF1 on first use, checks both formulations against physical SQL, and saves the
+result CSVs, timing SQL, raw CLI log and samples in the output directory. Timings use four threads and one warm-up
+per formulation in the timing connection, alternating execution order. They include parsing, binding and execution.
+
+Local run on 2026-11-16, DuckDB 2.0.0, semantic_layer `2b2a186cfb`, Apple M4 Pro, nine warm runs:
+
+| Formulation | Median | Result |
+|---|---:|---|
+| List | 2,128 ms | 10 rows, identical to physical SQL |
+| CTE | 81 ms | 10 rows, identical to physical SQL |
+
+The measured gain is 26.3x on this dataset. The small SQL test separately checks a hand-calculated answer with
+repeated manufacturers, an order without lines, a manufacturer without any pair, and orders on either side of the
+date window. It expects one A/B pair with lift `1 * 5 / (2 * 2) = 1.25`.
+
+This measures query formulation, with no engine change. Outer SQL composition falls outside the upstream
+benchmark's native-only rules, so this does not increase its strict score. Larger datasets, peak memory and the
+deployed Altertable runtime were not measured. No timing threshold is used as a correctness assertion.
+
 ## Materialization queries
 
 This compares the same query result on three paths: handwritten SQL over DuckLake source tables,
