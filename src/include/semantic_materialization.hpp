@@ -157,8 +157,11 @@ struct SemanticStoredMaterialization {
 };
 //! Adds to `model` (being created) the materializations stored for its view in the attached databases that it does not
 //! define yet: reattached as they are when their definition did not change, else to be rebuilt by the next refresh.
-//! Returns those that no longer apply to the view (their tables are dropped once the view is created).
-vector<SemanticStoredMaterialization> RestoreSemanticMaterializations(ClientContext &context, SemanticModel &model);
+//! Searched databases: the view's own (the default storage), those its logical tables read, and those storing the
+//! materializations of `existing` (the view being replaced). Returns those that no longer apply to the view (their
+//! tables are dropped once the view is created).
+vector<SemanticStoredMaterialization> RestoreSemanticMaterializations(ClientContext &context, SemanticModel &model,
+                                                                      optional_ptr<const SemanticModel> existing);
 //! Stages storage changes before publishing a DDL registry transition. The placeholder is changed after all
 //! storage operations have succeeded, and before their transactions commit.
 void ApplySemanticMaterializationChange(ClientContext &context, const shared_ptr<SemanticModel> &before,

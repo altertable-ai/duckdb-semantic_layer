@@ -1,6 +1,7 @@
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
+#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/catalog/entry_lookup_info.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
@@ -15,6 +16,7 @@
 #include "duckdb/parser/tableref/basetableref.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckdb/planner/binder.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
 #include "semantic_analysis.hpp"
 #include "semantic_model.hpp"
 #include "semantic_materialization.hpp"
@@ -123,6 +125,18 @@ private:
 		return result;
 	}
 
+	static void CollectCatalogs(const LogicalOperator &op, case_insensitive_set_t &result) {
+		if (op.type == LogicalOperatorType::LOGICAL_GET) {
+			auto table = op.Cast<LogicalGet>().GetTable();
+			if (table) {
+				result.insert(table->ParentCatalog().GetName().GetIdentifierName());
+			}
+		}
+		for (auto &child : op.children) {
+			CollectCatalogs(*child, result);
+		}
+	}
+
 	void BindColumns(SemanticTable &table) {
 		auto node = make_uniq<SelectNode>();
 		node->select_list.push_back(make_uniq<StarExpression>());
@@ -131,6 +145,7 @@ private:
 		statement.node = std::move(node);
 		auto binder = Binder::CreateBinder(context);
 		auto bound = binder->Bind(statement.Cast<SQLStatement>());
+		CollectCatalogs(*bound.plan, table.read_catalogs);
 		table.column_names = IdentifiersToStrings(bound.names);
 		table.column_types = bound.types;
 		for (idx_t i = 0; i < table.column_names.size(); i++) {
@@ -148,6 +163,8 @@ private:
 				Binder::BindSchemaOrCatalog(context, name);
 				auto &entry = Catalog::GetEntry(context, EntryLookupInfo(CatalogType::TABLE_ENTRY, name));
 				table.catalog_name = entry.ParentCatalog().GetName().GetIdentifierName();
+				// a view's own database: binding it only reaches the tables it reads
+				table.read_catalogs.insert(table.catalog_name);
 				table.schema_name = entry.ParentSchema().name.GetIdentifierName();
 				table.table_name = entry.name.GetIdentifierName();
 				auto qualified = make_uniq<BaseTableRef>();
