@@ -4,6 +4,7 @@
 #include "duckdb/catalog/entry_lookup_info.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/database_manager.hpp"
+#include "duckdb/common/case_insensitive_map.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "semantic_definition_exception.hpp"
@@ -289,12 +290,34 @@ bool ReattachStoredMaterialization(SemanticMaterialization &materialization,
 	return state.built;
 }
 
-vector<SemanticStoredMaterialization> RestoreSemanticMaterializations(ClientContext &context, SemanticModel &model) {
+//! The databases that can store materializations of `model`: its own database (the default storage), the databases its
+//! logical tables read, and those storing the materializations of `existing`. Searching a database opens a transaction
+//! in it, which for a DuckLake catalog means loading its snapshot and schema from the metadata database: searching
+//! every attached database made CREATE as slow as loading all of them.
+static case_insensitive_set_t SearchedCatalogs(const SemanticModel &model, optional_ptr<const SemanticModel> existing) {
+	case_insensitive_set_t result;
+	result.insert(model.Name().catalog);
+	for (auto &table : model.tables) {
+		result.insert(table.read_catalogs.begin(), table.read_catalogs.end());
+	}
+	if (existing) {
+		// a materialization of the replaced view that is not found again would be dropped as obsolete
+		for (auto &materialization : existing->materializations) {
+			result.insert(materialization->storage_catalog);
+		}
+	}
+	return result;
+}
+
+vector<SemanticStoredMaterialization> RestoreSemanticMaterializations(ClientContext &context, SemanticModel &model,
+                                                                      optional_ptr<const SemanticModel> existing) {
 	vector<SemanticStoredMaterialization> obsolete;
+	auto searched = SearchedCatalogs(model, existing);
 	Connection connection(*context.db);
 	connection.BeginTransaction();
 	for (auto &database : DatabaseManager::Get(context).GetDatabases(context)) {
-		if (database->IsSystem() || database->IsTemporary()) {
+		if (database->IsSystem() || database->IsTemporary() ||
+		    !searched.count(database->GetName().GetIdentifierName())) {
 			continue;
 		}
 		auto &catalog = database->GetCatalog();
