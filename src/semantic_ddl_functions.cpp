@@ -90,13 +90,14 @@ static unique_ptr<FunctionData> SemanticCreateBind(ClientContext &context, Table
 	auto &state = input.info->Cast<SemanticViewsFunctionInfo>().state;
 	auto result = make_uniq<SemanticCreateData>(state, SemanticViewRegistry::ResolveDDLName(context, definition->name));
 	result->on_conflict = EnumUtil::FromString<OnCreateConflict>(StringArgument(input, 1));
-	bool skip = result->on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT && state->registry.Get(result->name);
+	auto existing = state->registry.Get(result->name);
+	bool skip = result->on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT && existing;
 	if (!skip) {
 		BindSemanticViewChange(context, input.binder, SemanticQualifiedName(), result->name);
 		result->model = BuildSemanticModel(context, *definition, result->name);
 		// materializations stored for this view (e.g. before a restart) come back
 		// with it
-		result->obsolete = RestoreSemanticMaterializations(context, *result->model);
+		result->obsolete = RestoreSemanticMaterializations(context, *result->model, existing.get());
 	}
 	return std::move(result);
 }

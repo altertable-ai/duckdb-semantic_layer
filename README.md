@@ -753,9 +753,11 @@ and updates also read the deleted rows' old values from DuckLake's data files. S
 `__sv_materializations` recording every materialization stored in that database: its definition, tables, the
 snapshots it was built at and its last refresh, updated in the refresh's transaction. Semantic views live in memory,
 but their materializations survive restarts: re-creating the view (`CREATE`, `CREATE OR REPLACE`) brings back the
-materializations stored for it in every attached database, reattached to their tables. One whose aggregates changed
-with the new definition is rebuilt by its next refresh; one the new definition can no longer serve is dropped. Adding
-a materialization that is already stored with the same definition reattaches it too. `DROP SEMANTIC VIEW` and
+materializations stored for it in the databases it uses (its own, those its logical tables read, and those of the view
+it replaces), reattached to their tables. Other attached databases are not searched, as that would load the metadata
+of every attached DuckLake catalog. One whose aggregates changed with the new definition is rebuilt by its next
+refresh; one the new definition can no longer serve is dropped. Adding a materialization that is already stored with
+the same definition reattaches it too (also for one stored in a database the view does not use). `DROP SEMANTIC VIEW` and
 `DROP MATERIALIZATION` drop the tables and their records; renaming the view keeps them. A DuckLake catalog attached
 under another name is found again (materializations stored in in-memory databases are gone with them).
 
