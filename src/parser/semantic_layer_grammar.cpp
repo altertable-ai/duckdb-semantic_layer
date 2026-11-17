@@ -31,10 +31,12 @@ namespace duckdb {
 	DUCKDB_REGISTER_TRANSFORM_RESULT_TYPE(NAME, __VA_ARGS__)                                                           \
 	template <>                                                                                                        \
 	struct TypedTransformResult<__VA_ARGS__> : public TransformResultValue {                                           \
-		explicit TypedTransformResult(__VA_ARGS__ value_p) : value(std::move(value_p)) {                               \
+		explicit TypedTransformResult(__VA_ARGS__ value_p)                                                             \
+		    : TransformResultValue(TYPE_HASH), value(std::move(value_p)) {                                             \
 		}                                                                                                              \
 		TypedTransformResult(const TypedTransformResult &) = delete;                                                   \
 		TypedTransformResult &operator=(const TypedTransformResult &) = delete;                                        \
+		static constexpr uint64_t TYPE_HASH = TransformResultTypeHash<__VA_ARGS__>();                                  \
 		void *GetValuePointer(const char *type_name) override {                                                        \
 			auto expected = TransformResultTypeName<__VA_ARGS__>();                                                    \
 			return type_name == expected || std::strcmp(type_name, expected) == 0 ? &value : nullptr;                  \
