@@ -16,6 +16,9 @@ statement ok
 ATTACH '__TEST_DIR__/restore_catalogs_other.db' AS other;
 
 statement ok
+ATTACH '__TEST_DIR__/restore_catalogs_views.db' AS views;
+
+statement ok
 CREATE TABLE t (id INTEGER, amount INTEGER);
 
 statement ok
@@ -33,12 +36,17 @@ CREATE TABLE sub.w (id INTEGER, weight INTEGER);
 statement ok
 INSERT INTO sub.w VALUES (1, 7);
 
-# t lives in the view's database, u in src, and w is read by a query; other is not used by the view
+statement ok
+CREATE VIEW views.x AS SELECT * FROM sub.w;
+
+# t lives in the view's database, u in src, w is read by a query and x through a view stored in views; other is not
+# used by the view
 statement ok
 CREATE SEMANTIC VIEW v
-  TABLES (t AS t PRIMARY KEY (id), u AS src.u PRIMARY KEY (id), w AS (SELECT * FROM sub.w) PRIMARY KEY (id))
+  TABLES (t AS t PRIMARY KEY (id), u AS src.u PRIMARY KEY (id), w AS (SELECT * FROM sub.w) PRIMARY KEY (id),
+    x AS views.x PRIMARY KEY (id))
   RELATIONSHIPS (u (t_id) REFERENCES t)
-  METRICS (t.total AS SUM(amount), u.n AS COUNT(*), w.weights AS SUM(weight));
+  METRICS (t.total AS SUM(amount), u.n AS COUNT(*), w.weights AS SUM(weight), x.xs AS COUNT(*));
 
 statement ok
 ALTER SEMANTIC VIEW v ADD MATERIALIZATION in_own AS METRICS t.total;
@@ -50,14 +58,18 @@ statement ok
 ALTER SEMANTIC VIEW v ADD MATERIALIZATION in_sub IN sub AS METRICS w.weights;
 
 statement ok
+ALTER SEMANTIC VIEW v ADD MATERIALIZATION in_views IN views AS METRICS x.xs;
+
+statement ok
 ALTER SEMANTIC VIEW v ADD MATERIALIZATION in_other IN other AS METRICS t.total;
 
 # replacing a view also searches the databases storing its current materializations: none is dropped as obsolete
 statement ok
 CREATE OR REPLACE SEMANTIC VIEW v
-  TABLES (t AS t PRIMARY KEY (id), u AS src.u PRIMARY KEY (id), w AS (SELECT * FROM sub.w) PRIMARY KEY (id))
+  TABLES (t AS t PRIMARY KEY (id), u AS src.u PRIMARY KEY (id), w AS (SELECT * FROM sub.w) PRIMARY KEY (id),
+    x AS views.x PRIMARY KEY (id))
   RELATIONSHIPS (u (t_id) REFERENCES t)
-  METRICS (t.total AS SUM(amount), u.n AS COUNT(*), w.weights AS SUM(weight));
+  METRICS (t.total AS SUM(amount), u.n AS COUNT(*), w.weights AS SUM(weight), x.xs AS COUNT(*));
 
 query I
 SELECT name FROM (SHOW SEMANTIC MATERIALIZATIONS IN v) ORDER BY name;
@@ -66,6 +78,7 @@ in_other
 in_own
 in_src
 in_sub
+in_views
 
 restart
 
@@ -77,6 +90,9 @@ ATTACH '__TEST_DIR__/restore_catalogs_sub.db' AS sub;
 
 statement ok
 ATTACH '__TEST_DIR__/restore_catalogs_other.db' AS other;
+
+statement ok
+ATTACH '__TEST_DIR__/restore_catalogs_views.db' AS views;
 
 # a database the view does not use is not searched, even when its materialization metadata cannot be read
 statement ok
@@ -90,9 +106,10 @@ CREATE TABLE broken.__semantic_materializations.__sv_materializations (unexpecte
 
 statement ok
 CREATE SEMANTIC VIEW v
-  TABLES (t AS t PRIMARY KEY (id), u AS src.u PRIMARY KEY (id), w AS (SELECT * FROM sub.w) PRIMARY KEY (id))
+  TABLES (t AS t PRIMARY KEY (id), u AS src.u PRIMARY KEY (id), w AS (SELECT * FROM sub.w) PRIMARY KEY (id),
+    x AS views.x PRIMARY KEY (id))
   RELATIONSHIPS (u (t_id) REFERENCES t)
-  METRICS (t.total AS SUM(amount), u.n AS COUNT(*), w.weights AS SUM(weight));
+  METRICS (t.total AS SUM(amount), u.n AS COUNT(*), w.weights AS SUM(weight), x.xs AS COUNT(*));
 
 query I
 SELECT name FROM (SHOW SEMANTIC MATERIALIZATIONS IN v) ORDER BY name;
@@ -100,6 +117,7 @@ SELECT name FROM (SHOW SEMANTIC MATERIALIZATIONS IN v) ORDER BY name;
 in_own
 in_src
 in_sub
+in_views
 
 # the materialization stored in the unused database is kept, and adding it again reattaches it
 query I
@@ -120,7 +138,7 @@ SELECT count(*) FROM other.__semantic_materializations.__sv_materializations;
 ----
 1
 
-query III
-SELECT * FROM SEMANTIC_VIEW(v METRICS t.total, u.n, w.weights);
+query IIII
+SELECT * FROM SEMANTIC_VIEW(v METRICS t.total, u.n, w.weights, x.xs);
 ----
-15	3	7
+15	3	7	1

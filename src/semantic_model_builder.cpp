@@ -163,6 +163,8 @@ private:
 				Binder::BindSchemaOrCatalog(context, name);
 				auto &entry = Catalog::GetEntry(context, EntryLookupInfo(CatalogType::TABLE_ENTRY, name));
 				table.catalog_name = entry.ParentCatalog().GetName().GetIdentifierName();
+				// a view's own database: binding it only reaches the tables it reads
+				table.read_catalogs.insert(table.catalog_name);
 				table.schema_name = entry.ParentSchema().name.GetIdentifierName();
 				table.table_name = entry.name.GetIdentifierName();
 				auto qualified = make_uniq<BaseTableRef>();

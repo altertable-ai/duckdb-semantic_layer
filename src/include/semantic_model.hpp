@@ -32,7 +32,7 @@ struct SemanticTable {
 	string catalog_name;
 	string schema_name;
 	string table_name;
-	//! The databases the table reads: its own for a base table, those read through a view or a query otherwise
+	//! The databases the table reads: its own, and for a view or a query those of the tables they read
 	case_insensitive_set_t read_catalogs;
 	vector<string> column_names;
 	vector<LogicalType> column_types;
