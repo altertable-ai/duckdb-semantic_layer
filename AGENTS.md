@@ -13,7 +13,7 @@ Instructions for AI agents working in this repository.
   connection when the extension loads.
 - Semantic queries are expanded at bind time into plain DuckDB SQL ASTs (no custom operators).
 - Submodules:
-  - DuckDB (`./duckdb`) — pinned to tag `v2.0.0`
+  - DuckDB (`./duckdb`) — pinned to tag `v2.0.1`
   - Extension CI Tools (`./extension-ci-tools`) — branch `v2.0-cyanoptera`
 
 **IMPORTANT**: Never modify files in `./duckdb` or `./extension-ci-tools` unless explicitly instructed.

@@ -12,7 +12,7 @@ duckdb_extension_load(tpch)
 # Linked into the shell (./build/release/duckdb); loaded extensions are otherwise only built
 duckdb_extension_statically_link(semantic_layer tpch)
 
-# DuckLake (an upstream main commit that builds against DuckDB v2.0.0), for the incremental materialization tests and
+# DuckLake (an upstream main commit that builds against DuckDB v2.0.1), for the incremental materialization tests and
 # benchmarks. It needs roaring from vcpkg, so it is only built with vcpkg (CI, or VCPKG_TOOLCHAIN_PATH=... make);
 # without it the DuckLake tests are skipped.
 if (VCPKG_BUILD)
