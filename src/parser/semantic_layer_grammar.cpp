@@ -31,7 +31,8 @@ namespace duckdb {
 	DUCKDB_REGISTER_TRANSFORM_RESULT_TYPE(NAME, __VA_ARGS__)                                                           \
 	template <>                                                                                                        \
 	struct TypedTransformResult<__VA_ARGS__> : public TransformResultValue {                                           \
-		explicit TypedTransformResult(__VA_ARGS__ value_p) : value(std::move(value_p)) {                               \
+		explicit TypedTransformResult(__VA_ARGS__ value_p)                                                             \
+		    : TransformResultValue(TransformResultTypeHash<__VA_ARGS__>()), value(std::move(value_p)) {                \
 		}                                                                                                              \
 		TypedTransformResult(const TypedTransformResult &) = delete;                                                   \
 		TypedTransformResult &operator=(const TypedTransformResult &) = delete;                                        \
